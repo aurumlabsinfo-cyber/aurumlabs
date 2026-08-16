@@ -55,7 +55,7 @@ per sempre, perché l'agent che genera quel messaggio non leggeva le
 impostazioni.
 
 **Correzione**: gli agent ricevono le `Settings` e le usano.
-*Verifica*: test in `tests/test_agents_decision.py` (suite backend, 261 test).
+*Verifica*: test in `tests/test_agents_decision.py` (suite backend, 271 test).
 
 ### 1.4 Lo stesso agent inquinava la direzione
 
