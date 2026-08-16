@@ -300,7 +300,7 @@ See [BACKTEST.md](BACKTEST.md) for the walk-forward methodology and
 
 ## Tests
 
-Backend (267 tests):
+Backend (271 tests):
 
 ```bash
 cd backend

@@ -221,4 +221,4 @@ motore che guadagna:
   vinto: è l'unica prova che dice se quel cancello protegge o costa;
 * **il feed reale non è stato provato qui.** Questo container non raggiunge
   nessun exchange. Tutta la verifica è stata fatta su feed sintetico,
-  PostgreSQL reale e le suite di test (261 backend + 67 frontend).
+  PostgreSQL reale e le suite di test (271 backend + 67 frontend).

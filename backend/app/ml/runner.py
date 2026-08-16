@@ -183,6 +183,27 @@ async def _run_one_horizon(
     return out
 
 
+def _calibrator(fitted_estimator: Any) -> Any:
+    """Isotonic calibration wrapper around an already-fitted estimator.
+
+    scikit-learn moved this: `cv="prefit"` was deprecated in 1.6 in favour of
+    `FrozenEstimator` and removed in 1.8. Supporting both means the pinned
+    version and whatever an operator actually has installed both work.
+    """
+    from sklearn.calibration import CalibratedClassifierCV
+
+    try:
+        from sklearn.frozen import FrozenEstimator
+
+        return CalibratedClassifierCV(
+            FrozenEstimator(fitted_estimator), method="isotonic"
+        )
+    except ImportError:  # scikit-learn < 1.6
+        return CalibratedClassifierCV(
+            fitted_estimator, cv="prefit", method="isotonic"
+        )
+
+
 def _fit_with_calibration(
     settings: Settings, ds: Dataset, model_name: str, X
 ) -> tuple[Any, bool, dict[str, Any]]:
@@ -223,11 +244,9 @@ def _fit_with_calibration(
             "calibration": f"skipped: only {cal_rows} usable hold-out rows"
         }
 
-    from sklearn.calibration import CalibratedClassifierCV
-
     base = build(model_name)
     base.fit(X.iloc[:cut], train_y)
-    calibrated = CalibratedClassifierCV(base, cv="prefit", method="isotonic")
+    calibrated = _calibrator(base)
     calibrated.fit(X.iloc[cal_start:], cal_y)
     return calibrated, True, {
         "calibration": "isotonic on a purged hold-out tail",
