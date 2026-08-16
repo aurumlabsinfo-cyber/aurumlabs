@@ -121,6 +121,20 @@ and the persisted signal rows.
 The single current signal plus market state — the endpoint the card would use
 if you were not on the WebSocket.
 
+### `GET /diagnostics?top=12`
+**Why signals are, or are not, arriving.** Every gate counted since start and
+ranked by how often it blocked a decision, the emission rate, the thresholds in
+force, the feed state, and a `verdict` in plain words. Start here when the card
+sits on NO TRADE: the answer is usually the feed, not a threshold.
+
+### `GET /burst/session`
+AURUM BURST-15's operating window: remaining time, session P&L in stake units,
+trades taken, and why the window closed if it did. Reports the idle session
+when `SIGNAL_STRATEGY` is not `burst15`. See [BURST15.md](BURST15.md).
+
+### `POST /burst/session/start` 🔒 · `POST /burst/session/stop` 🔒
+Open a fresh window now, or stand down for the rest of the current one.
+
 ---
 
 ## Paper trading
@@ -190,6 +204,11 @@ for a verdict, and the last completed report.
 }
 ```
 Runs asynchronously; poll `GET /backtest`. `409` if one is already running.
+
+### `GET /burst/backtest?include_synthetic=false&payout=0.8`
+Replays BURST-15 over every recorded row — sessions, cooldown, stop-loss and
+take-profit included — and reports win rate with its confidence interval, EV
+per trade, session P&L and drawdown. Read-only.
 
 ### `GET /models`
 Available algorithms, the active model (with its out-of-distribution

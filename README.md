@@ -135,6 +135,31 @@ book desynchronised, spread too wide, latency too high, feed stale, anomaly
 detected, regime unknown, features incomplete, model out of distribution, or
 simply not enough edge. The card then shows **NO TRADE** with the reasons.
 
+If it shows NO TRADE for longer than you expect, do not start turning
+thresholds down. Ask the engine:
+
+```bash
+curl localhost:8000/diagnostics | jq '.verdict, .blocking_gates'
+```
+
+That ranks every gate by how often it actually fired and leads with the
+verdict — most often `NO MARKET DATA`, which is a connectivity problem no
+threshold can fix. The dashboard shows the same ranking under the NO TRADE
+card.
+
+---
+
+## Two strategies
+
+`SIGNAL_STRATEGY` selects which decision path produces signals:
+
+* **`ensemble`** (default) — the eight agents, their gates, and a trigger price
+  the market must come to before the countdown starts.
+* **`burst15`** — **AURUM BURST-15**: a 15-minute operating window that only
+  takes bursts of tape on a 5-second horizon, entering at the market one second
+  after the trigger rather than waiting for a level, with a session stop-loss
+  and take-profit that close the window early. See [BURST15.md](BURST15.md).
+
 ---
 
 ## Modes
@@ -268,12 +293,14 @@ See [BACKTEST.md](BACKTEST.md) for the walk-forward methodology and
 | [MODEL.md](MODEL.md) | Features, agents, decision engine, trigger sizing |
 | [SECURITY.md](SECURITY.md) | Secrets, rate limiting, threat model |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Docker, scaling, retention, monitoring |
+| [BURST15.md](BURST15.md) | The AURUM BURST-15 session strategy, live and offline |
+| [ANALISI.md](ANALISI.md) | 🇮🇹 Perché non arrivavano segnali, perché non imparava, cosa è cambiato |
 
 ---
 
 ## Tests
 
-Backend (141 tests):
+Backend (267 tests):
 
 ```bash
 cd backend
@@ -285,9 +312,10 @@ Order book state machine, feature causality, agents, NO-TRADE gating, the
 trigger/countdown lifecycle, statistics and break-even logic, walk-forward
 splitting, leakage detection, edge classification, reconnection, back-pressure,
 database failure handling, persistence of every table, the REST API and the
-WebSocket streams.
+WebSocket streams, the BURST-15 trigger and session rules, and that the
+configured proxy actually reaches the adapters.
 
-Frontend (50 tests):
+Frontend (67 tests):
 
 ```bash
 npm test
