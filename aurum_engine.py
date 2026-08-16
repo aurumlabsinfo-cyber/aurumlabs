@@ -5382,8 +5382,25 @@ def cmd_check(cfg: Config, args) -> int:
     return 0 if ok else 1
 
 
+def _open_existing(cfg: Config) -> Store:
+    """Apre il database per un comando di sola lettura.
+
+    SQLite crea allegramente un file vuoto se il percorso non esiste, e il
+    comando risponderebbe "zero segnali, zero trade" facendo credere che il
+    motore non abbia mai registrato niente. Quasi sempre significa solo che sei
+    in un'altra cartella rispetto a quella in cui gira il motore.
+    """
+    if cfg.db_path != ":memory:" and not os.path.exists(cfg.db_path):
+        raise SystemExit(
+            f"database non trovato: {os.path.abspath(cfg.db_path)}\n"
+            f"Il motore scrive nella cartella da cui lo lanci. Spostati li',\n"
+            f"oppure indica il percorso completo con --db /percorso/aurum.db"
+        )
+    return Store(cfg)
+
+
 def cmd_stats(cfg: Config, args) -> int:
-    store = Store(cfg)
+    store = _open_existing(cfg)
     trades = store.paper_trades()
     report = summarise(trades, cfg.payout, cfg.stake)
     report["calibration"] = calibration_report(trades)
@@ -5396,7 +5413,7 @@ def cmd_stats(cfg: Config, args) -> int:
 
 
 def cmd_backtest(cfg: Config, args) -> int:
-    store = Store(cfg)
+    store = _open_existing(cfg)
     report = train_and_validate(store, cfg, include_synthetic=args.include_synthetic)
     print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
     store.stop()
@@ -5404,7 +5421,7 @@ def cmd_backtest(cfg: Config, args) -> int:
 
 
 def cmd_burst(cfg: Config, args) -> int:
-    store = Store(cfg)
+    store = _open_existing(cfg)
     report = burst_replay(store, cfg, include_synthetic=args.include_synthetic,
                           payout=cfg.payout)
     print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
@@ -5414,7 +5431,7 @@ def cmd_burst(cfg: Config, args) -> int:
 
 def cmd_burst_grid(cfg: Config, args) -> int:
     """La stessa griglia dello script originale, su dati registrati."""
-    store = Store(cfg)
+    store = _open_existing(cfg)
     print(f"{'n5':>5}{'|r10|':>8}{'ofi':>5}{'trade':>8}{'win':>8}"
           f"{'EV':>9}{'PnL':>9}{'sess':>7}")
     for n5 in (10, 20, 40, 60, 100):
@@ -5438,7 +5455,7 @@ def cmd_burst_grid(cfg: Config, args) -> int:
 
 
 def cmd_shadow(cfg: Config, args) -> int:
-    store = Store(cfg)
+    store = _open_existing(cfg)
     print(json.dumps(shadow_report(store, args.include_synthetic), indent=2,
                      ensure_ascii=False, default=str))
     store.stop()
