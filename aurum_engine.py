@@ -3796,7 +3796,8 @@ def summarise(trades: list[dict], payout: float | None, stake: float = 1.0,
             dd = min(dd, equity - peak)
         out["max_drawdown_units"] = round(dd, 4)
     else:
-        out["note"] = ("Senza BINARY_PAYOUT il P&L monetario non e' definito. "
+        out["note"] = ("Payout non impostato: il P&L monetario non e' definito. "
+                       "Passalo con --payout 0.8 oppure PAYOUT=0.8. "
                        "Pareggio = 1 / (1 + payout).")
     return out
 
