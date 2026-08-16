@@ -36,6 +36,40 @@ it does not. It ships with no pre-baked model and no backtest results.
 
 ---
 
+## Un solo file, in locale
+
+Se vuoi solo farlo girare sulla tua macchina senza Docker, senza PostgreSQL e
+senza `pip install`, tutto il motore sta anche in un file solo:
+
+```bash
+python3 aurum_engine.py selftest        # verifica il file su se stesso
+python3 aurum_engine.py check           # il venue e' raggiungibile?
+python3 aurum_engine.py run --strategy burst15 --payout 0.8
+open http://localhost:8000              # dashboard
+```
+
+Solo libreria standard di Python (3.9+). Il database e' **SQLite**
+(`aurum.db`), il client WebSocket e il server HTTP sono scritti dentro il file,
+e l'apprendimento e' una regressione logistica implementata a mano — stessa
+pipeline: dataset causale, walk-forward con purga, classificazione dell'edge,
+attivazione solo se il verdetto regge.
+
+| Comando | Cosa fa |
+|---|---|
+| `run` | live su Binance/Coinbase, oppure `--source sim` (simulatore) o `--source csv` (replay) |
+| `check` | DNS, REST e WebSocket, con il motivo esatto se qualcosa non passa |
+| `stats` | statistiche del paper trading, calibrazione, Monte Carlo |
+| `backtest` | walk-forward su cio' che ha registrato |
+| `burst` / `burst-grid` | replay di BURST-15, sessioni incluse, e la griglia di soglie |
+| `shadow` | anche le finestre che NON sono state tradate |
+| `selftest` | 9 verifiche interne, nessuna rete richiesta |
+
+Cosa resta solo nel progetto completo: la ricerca di strategie con correzione
+per test multipli, l'importatore dell'archivio storico Binance, i modelli ad
+alberi e il frontend Next.js.
+
+---
+
 ## Quick start
 
 ```bash
@@ -295,6 +329,7 @@ See [BACKTEST.md](BACKTEST.md) for the walk-forward methodology and
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Docker, scaling, retention, monitoring |
 | [BURST15.md](BURST15.md) | The AURUM BURST-15 session strategy, live and offline |
 | [ANALISI.md](ANALISI.md) | 🇮🇹 Perché non arrivavano segnali, perché non imparava, cosa è cambiato |
+| [aurum_engine.py](aurum_engine.py) | Lo stesso motore in un unico file, SQLite, zero dipendenze |
 
 ---
 

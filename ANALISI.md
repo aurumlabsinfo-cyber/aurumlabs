@@ -187,7 +187,44 @@ cooldown e limiti rispettati.
 
 ---
 
-## 4. Come verificare sulla tua macchina
+## 4. Tutto in un file solo: `aurum_engine.py`
+
+Stesso motore, una sola dipendenza: Python. Database **SQLite** invece di
+PostgreSQL, client WebSocket e server HTTP scritti dentro il file, e
+l'apprendimento come regressione logistica implementata a mano.
+
+```bash
+python3 aurum_engine.py selftest                      # 9 verifiche interne
+python3 aurum_engine.py check                         # il venue risponde?
+python3 aurum_engine.py run --strategy burst15 --payout 0.8
+python3 aurum_engine.py run --source sim              # senza rete
+python3 aurum_engine.py run --source csv --csv trades.csv
+python3 aurum_engine.py backtest                      # walk-forward
+python3 aurum_engine.py burst                         # replay BURST-15
+python3 aurum_engine.py shadow                        # finestre non tradate
+```
+
+Contiene tutto quanto sopra: gli 8 agenti con i cancelli corretti, BURST-15 con
+la sessione, l'order book sequenziato, ~50 feature causali, il paper trading
+con trigger e countdown lato motore, la diagnostica dei cancelli, il
+riaddestramento automatico con calibrazione, statistiche e calibrazione,
+dashboard su `http://localhost:8000`, e il supporto proxy su REST **e**
+WebSocket.
+
+Verificato: `selftest` supera 9/9 (framing WebSocket con frammentazione e ping,
+sequenza dell'order book, feature, regole di BURST-15, coerenza delle soglie,
+database, apprendimento con calibrazione e guardia OOD, statistica, motore
+end-to-end). Su 30 minuti di dati replayati: 18.000 righe di feature, 80 trade
+su carta, 1.800 finestre shadow, e il ciclo di apprendimento che addestra,
+valida walk-forward, calibra su una coda separata e attiva il modello.
+
+Non c'e' dentro: la ricerca di strategie con correzione per test multipli,
+l'importatore dell'archivio Binance, i modelli ad alberi e il frontend Next.js.
+Quelli restano nel progetto completo.
+
+---
+
+## 5. Come verificare sulla tua macchina
 
 ```bash
 cp .env.example .env          # poi: SIGNAL_STRATEGY, BINARY_PAYOUT, eventuale HTTP_PROXY_URL
@@ -205,7 +242,7 @@ finché quel punto non è risolto.
 
 ---
 
-## 5. Cosa NON è stato dimostrato
+## 6. Cosa NON è stato dimostrato
 
 Va detto chiaramente, perché è la differenza fra un motore che funziona e un
 motore che guadagna:

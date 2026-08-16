@@ -52,3 +52,9 @@ __pycache__/
 backend/models/*.joblib
 .coverage
 htmlcov/
+
+# Database locale del motore a file singolo
+aurum.db
+aurum.db-wal
+aurum.db-shm
+*.db
