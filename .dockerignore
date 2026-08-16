@@ -1,0 +1,16 @@
+node_modules
+.next
+.git
+.github
+backend/.venv
+backend/**/__pycache__
+backend/.pytest_cache
+backend/.ruff_cache
+backend/models
+**/*.joblib
+.env
+.env.*
+!.env.example
+npm-debug.log*
+coverage
+ui-check.mjs

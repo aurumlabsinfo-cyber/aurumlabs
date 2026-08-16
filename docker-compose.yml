@@ -1,0 +1,78 @@
+## BTC 5-Second Quant Engine - full stack.
+##
+##   cp .env.example .env   (edit it, then)   docker compose up -d --build
+##
+## PAPER TRADING ONLY. No service in this file can place an order anywhere.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-btcquant}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Not published to the host by default: the database is reachable only on
+    # the compose network. Uncomment to inspect it locally with psql.
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    command:
+      # A tick feed is write-heavy; give the WAL some room.
+      - postgres
+      - -c
+      - max_connections=100
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - synchronous_commit=off
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-btcquant}
+      ENV: ${ENV:-prod}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      EXCHANGES: ${EXCHANGES:-binance_spot}
+      SYMBOL: ${SYMBOL:-BTCUSDT}
+      ALLOW_SYNTHETIC_SOURCE: ${ALLOW_SYNTHETIC_SOURCE:-false}
+      PERSIST_FEATURES: ${PERSIST_FEATURES:-true}
+      PERSIST_BOOK_UPDATES: ${PERSIST_BOOK_UPDATES:-false}
+      PERFORMANCE_METRICS_INTERVAL_S: ${PERFORMANCE_METRICS_INTERVAL_S:-300}
+      SIGNAL_HORIZON_S: ${SIGNAL_HORIZON_S:-5.0}
+      SIGNAL_MIN_CONFIDENCE: ${SIGNAL_MIN_CONFIDENCE:-0.60}
+      BINARY_PAYOUT: ${BINARY_PAYOUT:-}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      MODEL_DIR: /app/models
+    volumes:
+      - models:/app/models
+    ports:
+      - "${API_PORT:-8000}:8000"
+
+  frontend:
+    build:
+      context: .
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://localhost:8000}
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+
+volumes:
+  pgdata:
+  models:

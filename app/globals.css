@@ -1,0 +1,116 @@
+@import "tailwindcss";
+
+/* A trading surface is read at a glance, in a dark room, under stress.
+   One accent per direction, everything else neutral. */
+:root {
+  --background: #06070a;
+  --surface: #0d1017;
+  --surface-2: #141926;
+  --border: #212939;
+  --foreground: #e8edf7;
+  --muted: #8b95ab;
+  --up: #16d97e;
+  --down: #ff4d5e;
+  --neutral: #6b7689;
+  --warn: #ffb020;
+  --info: #4d9dff;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-border-soft: var(--border);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-up: var(--up);
+  --color-down: var(--down);
+  --color-neutral: var(--neutral);
+  --color-warn: var(--warn);
+  --color-info: var(--info);
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas,
+    monospace;
+}
+
+html,
+body {
+  background: var(--background);
+  color: var(--foreground);
+  /* System stack only: no webfont fetch, so the dashboard renders instantly
+     and works on an air-gapped host. */
+  font-family:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Tabular figures stop prices from jittering as digits change. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+}
+
+.panel-2 {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+}
+
+.label {
+  color: var(--muted);
+  font-size: 0.6875rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+@keyframes pulse-ring {
+  0% {
+    box-shadow: 0 0 0 0 currentColor;
+    opacity: 0.55;
+  }
+  70% {
+    box-shadow: 0 0 0 18px transparent;
+    opacity: 0;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+    opacity: 0;
+  }
+}
+
+.pulse::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  animation: pulse-ring 1.4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  pointer-events: none;
+}
+
+@keyframes flash-in {
+  from {
+    transform: scale(0.86);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.flash-in {
+  animation: flash-in 220ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pulse::after,
+  .flash-in {
+    animation: none;
+  }
+}
