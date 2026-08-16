@@ -22,7 +22,7 @@ import {
   formatPercent,
   formatPrice,
 } from "@/lib/format";
-import type { LiveSignal } from "@/lib/types";
+import type { Diagnostics, LiveSignal } from "@/lib/types";
 
 function toneFor(signal: LiveSignal | null): {
   color: string;
@@ -61,7 +61,8 @@ function ResultBadge({ signal }: { signal: LiveSignal }) {
 }
 
 export function SignalCard() {
-  const { signal, tick, hello, agents, clockOffsetMs, connected } = useEngine();
+  const { signal, tick, hello, agents, diagnostics, clockOffsetMs, connected } =
+    useEngine();
   const { secondsLeft, remainingMs, running } = useCountdown(
     signal,
     clockOffsetMs,
@@ -111,7 +112,14 @@ export function SignalCard() {
 
       {/* ------------------------------------------------------- direction */}
       {!signal || signal.direction === "NO_TRADE" ? (
-        <NoTradeBlock reasons={agents?.no_trade_reasons ?? []} />
+        <NoTradeBlock
+          reasons={
+            agents?.no_trade_reasons ??
+            diagnostics?.last_decision_reasons ??
+            []
+          }
+          diagnostics={diagnostics}
+        />
       ) : (
         <>
           <div className="mt-6 flex items-center justify-center gap-4">
@@ -258,7 +266,17 @@ function DistanceBar({
   );
 }
 
-function NoTradeBlock({ reasons }: { reasons: string[] }) {
+function NoTradeBlock({
+  reasons,
+  diagnostics,
+}: {
+  reasons: string[];
+  diagnostics: Diagnostics | null;
+}) {
+  // The instantaneous reasons change ten times a second. What an operator
+  // actually needs is which gate has been binding, and for how long nothing
+  // has come out - so both are shown, the persistent one first.
+  const top = diagnostics?.blocking_gates?.slice(0, 3) ?? [];
   return (
     <div className="mt-8 flex flex-col items-center text-center">
       <div className="text-4xl font-black tracking-tight text-neutral sm:text-6xl">
@@ -268,14 +286,42 @@ function NoTradeBlock({ reasons }: { reasons: string[] }) {
         Nessun segnale forzato. Il motore opera solo quando i dati lo
         consentono.
       </p>
+      {diagnostics && (
+        <p className="mt-2 text-[11px] text-muted">
+          {diagnostics.signals_emitted} segnali in{" "}
+          {formatDuration(diagnostics.uptime_s * 1000)} ·{" "}
+          {diagnostics.decisions_evaluated} finestre valutate
+        </p>
+      )}
+      {top.length > 0 && (
+        <div className="mt-4 w-full max-w-md text-left">
+          <div className="label mb-1">Cosa blocca, nel tempo</div>
+          <ul className="space-y-1 text-[11px] text-muted">
+            {top.map((g) => (
+              <li
+                key={g.gate}
+                className="panel-2 flex items-baseline justify-between gap-3 px-2 py-1"
+              >
+                <span className="truncate">{g.gate}</span>
+                <span className="tnum shrink-0 text-warn">
+                  {formatPercent(g.share_of_decisions)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       {reasons.length > 0 && (
-        <ul className="mt-4 w-full max-w-md space-y-1 text-left text-[11px] text-muted">
-          {reasons.slice(0, 5).map((r) => (
-            <li key={r} className="panel-2 px-2 py-1">
-              · {r}
-            </li>
-          ))}
-        </ul>
+        <div className="mt-3 w-full max-w-md text-left">
+          <div className="label mb-1">Ultima finestra</div>
+          <ul className="space-y-1 text-[11px] text-muted">
+            {reasons.slice(0, 5).map((r) => (
+              <li key={r} className="panel-2 px-2 py-1">
+                · {r}
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
     </div>
   );

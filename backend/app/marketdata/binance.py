@@ -20,12 +20,10 @@ from __future__ import annotations
 import asyncio
 import json
 
-import httpx
-import websockets
-
 from app.core.clock import now_ms
 from app.core.logging_conf import get_logger
 from app.marketdata.base import Capability, Emit, ExchangeAdapter
+from app.marketdata.net import http_client, ws_connect
 from app.marketdata.types import (
     BookTicker,
     DepthSnapshot,
@@ -60,17 +58,15 @@ class BinanceSpotAdapter(ExchangeAdapter):
         depth_speed_ms: int = 100,
         rest_timeout_s: float = 10.0,
         stale_timeout_s: float = 10.0,
+        proxy: str | None = None,
     ) -> None:
         super().__init__(symbol)
         self.ws_base = ws_base.rstrip("/")
         self.rest_base = rest_base.rstrip("/")
         self.depth_speed_ms = depth_speed_ms
         self.stale_timeout_s = stale_timeout_s
-        self._http = httpx.AsyncClient(
-            base_url=self.rest_base,
-            timeout=rest_timeout_s,
-            headers={"User-Agent": "btc-5s-quant-engine/1.0"},
-        )
+        self.proxy = proxy
+        self._http = http_client(self.rest_base, rest_timeout_s, proxy)
 
     # ------------------------------------------------------------ streaming
     def stream_names(self) -> list[str]:
@@ -82,8 +78,9 @@ class BinanceSpotAdapter(ExchangeAdapter):
         return f"{self.ws_base}/stream?streams={'/'.join(self.stream_names())}"
 
     async def _stream_once(self, emit: Emit) -> None:
-        async with websockets.connect(
+        async with ws_connect(
             self.ws_url,
+            proxy=self.proxy,
             ping_interval=20,
             ping_timeout=20,
             close_timeout=5,
@@ -250,17 +247,15 @@ class BinanceFuturesAdapter(ExchangeAdapter):
         rest_timeout_s: float = 10.0,
         stale_timeout_s: float = 15.0,
         open_interest_interval_s: float = 30.0,
+        proxy: str | None = None,
     ) -> None:
         super().__init__(symbol)
         self.ws_base = ws_base.rstrip("/")
         self.rest_base = rest_base.rstrip("/")
         self.stale_timeout_s = stale_timeout_s
         self.open_interest_interval_s = open_interest_interval_s
-        self._http = httpx.AsyncClient(
-            base_url=self.rest_base,
-            timeout=rest_timeout_s,
-            headers={"User-Agent": "btc-5s-quant-engine/1.0"},
-        )
+        self.proxy = proxy
+        self._http = http_client(self.rest_base, rest_timeout_s, proxy)
         self._oi_task: asyncio.Task | None = None
 
     def stream_names(self) -> list[str]:
@@ -274,8 +269,9 @@ class BinanceFuturesAdapter(ExchangeAdapter):
     async def _stream_once(self, emit: Emit) -> None:
         self._oi_task = asyncio.create_task(self._poll_open_interest(emit))
         try:
-            async with websockets.connect(
-                self.ws_url, ping_interval=20, ping_timeout=20, close_timeout=5
+            async with ws_connect(
+                self.ws_url, proxy=self.proxy, ping_interval=20,
+                ping_timeout=20, close_timeout=5,
             ) as ws:
                 self.state.connected = True
                 self.state.connected_since = now_ms()

@@ -8,6 +8,7 @@
 
 import type {
   AgentsMessage,
+  Diagnostics,
   FeatureVector,
   Health,
   Hello,
@@ -34,6 +35,7 @@ export interface EngineState {
   health: Health | null;
   orderbook: OrderBookSnapshot | null;
   features: FeatureVector | null;
+  diagnostics: Diagnostics | null;
   lastEvent: { event: string; ts: number; signal: LiveSignal } | null;
 }
 
@@ -52,6 +54,7 @@ export const INITIAL_STATE: EngineState = {
   health: null,
   orderbook: null,
   features: null,
+  diagnostics: null,
   lastEvent: null,
 };
 
@@ -105,10 +108,12 @@ export function reduceMessage(
         health: Health;
         orderbook: OrderBookSnapshot;
         features: FeatureVector | null;
+        diagnostics?: Diagnostics | null;
       };
       next.health = data.health;
       next.orderbook = data.orderbook;
       next.features = data.features;
+      next.diagnostics = data.diagnostics ?? prev.diagnostics;
       break;
     }
     case "orderbook":

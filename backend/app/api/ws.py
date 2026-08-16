@@ -278,6 +278,10 @@ async def ws_dashboard(ws: WebSocket) -> None:
                             "health": await svc.health(),
                             "orderbook": svc.market.book.snapshot_dict(levels=12),
                             "features": svc.features.latest,
+                            # Ranked gate counts, so the dashboard can say WHY
+                            # nothing is being emitted instead of only that
+                            # nothing is.
+                            "diagnostics": svc.signals.diagnostics(top=5),
                         },
                     }
                 )

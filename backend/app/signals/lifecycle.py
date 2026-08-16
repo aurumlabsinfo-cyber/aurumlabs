@@ -15,6 +15,8 @@ Rules that matter:
 from __future__ import annotations
 
 import asyncio
+import re
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
@@ -27,6 +29,7 @@ from app.core.logging_conf import get_logger
 from app.db import repository as repo
 from app.db.repository import BatchWriter
 from app.marketdata.engine import MarketDataEngine
+from app.signals.burst import BurstStrategy
 from app.signals.decision import Decision, DecisionEngine, new_signal_id
 
 log = get_logger(__name__)
@@ -45,6 +48,16 @@ class SignalStatus(str, Enum):
 
 TERMINAL = {SignalStatus.WIN, SignalStatus.LOSS, SignalStatus.TIE,
             SignalStatus.CANCELLED}
+
+#: Numbers inside a block reason are the measurement, not the category. They are
+#: collapsed so the diagnostics counter answers "what keeps stopping us" rather
+#: than listing ten thousand distinct one-off strings.
+_NUMBERS = re.compile(r"[-+]?\d[\d_.,]*")
+
+
+def gate_key(reason: str) -> str:
+    """Normalise a no-trade reason into a countable category."""
+    return _NUMBERS.sub("N", reason).strip()
 
 
 @dataclass
@@ -78,6 +91,11 @@ class LiveSignal:
     features: dict[str, Any] = field(default_factory=dict)
     agents: dict[str, Any] = field(default_factory=dict)
     settle_delay_ms: int | None = None
+    #: "TRIGGER" - wait for price to touch `trigger_price`.
+    #: "DELAY"   - enter `entry_delay_ms` after creation, at the market.
+    entry_mode: str = "TRIGGER"
+    entry_delay_ms: int = 0
+    strategy: str = "ensemble"
 
     def to_dict(self, server_ts: int | None = None) -> dict[str, Any]:
         d = asdict(self)
@@ -119,12 +137,26 @@ class SignalEngine:
         self.last_decision: Decision | None = None
         self.last_signal_ts: int = 0
         self._last_shadow_ts: int = 0
+        self._last_no_trade_row_ts: int = 0
+        self._last_no_trade_key: tuple[str, ...] = ()
         self.counters = {
             "decisions": 0, "signals": 0, "no_trade": 0, "triggered": 0,
             "expired": 0, "cancelled": 0, "wins": 0, "losses": 0, "ties": 0,
         }
+        #: How often each gate blocked a decision, since start. This is the
+        #: answer to "why am I not getting signals", and it is cheap: one
+        #: counter increment per reason per evaluated window.
+        self.gate_counter: Counter[str] = Counter()
+        self.started_at = now_ms()
+        #: BURST-15 owns its own session state; built regardless of the active
+        #: strategy so /burst/session can report "not running" instead of 404.
+        self.burst = BurstStrategy(settings)
         self._tasks: list[asyncio.Task] = []
         self._running = False
+
+    @property
+    def strategy_name(self) -> str:
+        return self.settings.signal_strategy
 
     # ------------------------------------------------------------- lifecycle
     async def start(self) -> None:
@@ -159,11 +191,16 @@ class SignalEngine:
             sub.close()
 
     def evaluate(self, feature_vector: dict[str, Any]) -> Decision:
-        decision = self.decisions.decide(
-            feature_vector, self.market.market_snapshot(), self.market.health()
+        market_state = self.market.market_snapshot()
+        health = self.market.health()
+        engine = (
+            self.burst if self.strategy_name == "burst15" else self.decisions
         )
+        decision = engine.decide(feature_vector, market_state, health)
         self.counters["decisions"] += 1
         self.last_decision = decision
+        for reason in decision.no_trade_reasons:
+            self.gate_counter[gate_key(reason)] += 1
         self._persist_agents(decision, signal_id=None)
         self.bus.publish(
             Topic.AGENTS,
@@ -180,7 +217,7 @@ class SignalEngine:
 
         if not decision.is_trade:
             self.counters["no_trade"] += 1
-            self._record_signal_row(decision, None)
+            self._record_no_trade_row(decision)
             self._publish_shadow(
                 decision, fv=feature_vector, emitted=False,
                 blocked=decision.no_trade_reasons,
@@ -188,11 +225,17 @@ class SignalEngine:
             return decision
 
         if len(self.active) >= self.settings.signal_max_concurrent:
+            self.gate_counter["max concurrent"] += 1
             self._publish_shadow(
                 decision, fv=feature_vector, emitted=False, blocked=["max concurrent"]
             )
             return decision
-        if decision.ts - self.last_signal_ts < self.settings.signal_cooldown_ms:
+        # BURST-15 runs its own cooldown per session; applying the ensemble's on
+        # top would silently shorten or lengthen the strategy's own rule.
+        if self.strategy_name != "burst15" and (
+            decision.ts - self.last_signal_ts < self.settings.signal_cooldown_ms
+        ):
+            self.gate_counter["cooldown"] += 1
             self._publish_shadow(
                 decision, fv=feature_vector, emitted=False, blocked=["cooldown"]
             )
@@ -265,16 +308,25 @@ class SignalEngine:
             edge=decision.edge,
             regime=decision.regime.value,
             created_at=ts,
-            expires_wait_at=ts + int(self.settings.signal_wait_timeout_s * 1000),
+            expires_wait_at=(
+                ts + decision.entry_delay_ms
+                if decision.entry_mode == "DELAY"
+                else ts + int(self.settings.signal_wait_timeout_s * 1000)
+            ),
             data_quality=decision.data_quality,
             model_id=decision.model_id,
             is_synthetic=self.market.is_synthetic,
             features=feature_vector.get("features", {}),
             agents={a.agent: a.to_dict() for a in decision.agents},
+            entry_mode=decision.entry_mode,
+            entry_delay_ms=decision.entry_delay_ms,
+            strategy=self.strategy_name,
         )
         self.active[sid] = sig
         self.last_signal_ts = decision.ts
         self.counters["signals"] += 1
+        if self.strategy_name == "burst15":
+            self.burst.on_entry(sid, decision.ts)
         self._record_signal_row(decision, sid)
         self._persist_agents(decision, signal_id=sid)
         self._write_paper_trade(sig)
@@ -319,7 +371,14 @@ class SignalEngine:
             if sig is None:
                 continue
             if sig.status is SignalStatus.WAITING:
-                if price is not None and self._touched(sig, price):
+                if sig.entry_mode == "DELAY":
+                    # Time-based entry: the clock, not a price level, decides.
+                    if ts >= sig.created_at + sig.entry_delay_ms:
+                        if price is None:
+                            self._cancel(sig, ts, "no price at the scheduled entry")
+                        else:
+                            self._on_trigger(sig, price, ts)
+                elif price is not None and self._touched(sig, price):
                     self._on_trigger(sig, price, ts)
                 elif ts >= sig.expires_wait_at:
                     self._cancel(sig, ts, "trigger not reached within wait window")
@@ -394,6 +453,9 @@ class SignalEngine:
 
     def _finish(self, sig: LiveSignal) -> None:
         self.active.pop(sig.signal_id, None)
+        if sig.strategy == "burst15":
+            # Session P&L, the stop-loss and the take-profit all move here.
+            self.burst.on_settled(sig.signal_id, sig.result, sig.settled_at)
         self.history.append(sig)
         if len(self.history) > 1000:
             self.history = self.history[-1000:]
@@ -423,6 +485,25 @@ class SignalEngine:
     ) -> None:
         payload = {"event": event, "signal": sig.to_dict(), **(extra or {})}
         self.bus.publish(Topic.SIGNAL, payload)
+
+    def _record_no_trade_row(self, decision: Decision) -> None:
+        """Heartbeat row for a NO TRADE window - not one per evaluation.
+
+        At the default 100ms cadence the old behaviour wrote ~864k rows a day
+        into `signals`, all of them saying nothing happened. That is what filled
+        the batch writer's queue and made the real signals impossible to find.
+        The learning record is `shadow_decisions`, which is written on its own
+        (much slower) cadence, so nothing is lost by throttling here.
+        """
+        key = tuple(sorted({gate_key(r) for r in decision.no_trade_reasons}))
+        interval = self.settings.no_trade_row_interval_ms
+        if key == self._last_no_trade_key and (
+            decision.ts - self._last_no_trade_row_ts < interval
+        ):
+            return
+        self._last_no_trade_key = key
+        self._last_no_trade_row_ts = decision.ts
+        self._record_signal_row(decision, None)
 
     def _record_signal_row(self, decision: Decision, signal_id: str | None) -> None:
         self.writer.add(
@@ -534,13 +615,75 @@ class SignalEngine:
         ts = now_ms()
         return {
             "server_ts": ts,
+            "strategy": self.strategy_name,
             "active": [s.to_dict(ts) for s in self.active.values()],
             "last_settled": [s.to_dict(ts) for s in self.history[-20:]][::-1],
             "counters": dict(self.counters),
             "last_decision": (
                 self.last_decision.to_dict() if self.last_decision else None
             ),
+            "burst_session": (
+                self.burst.session.to_dict(ts)
+                if self.strategy_name == "burst15" and self.burst.session
+                else None
+            ),
             "is_synthetic": self.market.is_synthetic,
+        }
+
+    def diagnostics(self, top: int = 12) -> dict[str, Any]:
+        """Why signals are or are not arriving, in one object.
+
+        Built for the question every operator asks first. `blocking_gates` is
+        ranked by how often each gate fired, so the binding constraint is the
+        top row rather than something to be guessed at from a single snapshot.
+        """
+        ts = now_ms()
+        decisions = max(self.counters["decisions"], 1)
+        gates = [
+            {
+                "gate": key,
+                "count": count,
+                "share_of_decisions": round(count / decisions, 4),
+            }
+            for key, count in self.gate_counter.most_common(top)
+        ]
+        emitted = self.counters["signals"]
+        uptime_s = max((ts - self.started_at) / 1000.0, 1e-9)
+        return {
+            "server_ts": ts,
+            "strategy": self.strategy_name,
+            "uptime_s": round(uptime_s, 1),
+            "decisions_evaluated": self.counters["decisions"],
+            "signals_emitted": emitted,
+            "signals_per_hour": round(emitted / uptime_s * 3600.0, 2),
+            "emission_rate": round(emitted / decisions, 5),
+            "blocking_gates": gates,
+            "binding_gate": gates[0]["gate"] if gates else None,
+            "last_decision_reasons": (
+                self.last_decision.no_trade_reasons if self.last_decision else []
+            ),
+            "thresholds": {
+                "signal_min_agreement": self.settings.signal_min_agreement,
+                "signal_min_confidence": self.settings.signal_min_confidence,
+                "signal_min_edge": self.settings.signal_min_edge,
+                "effective_min_confidence": round(
+                    self.settings.effective_min_confidence, 4
+                ),
+                "min_data_quality": self.settings.min_data_quality,
+                "max_spread_bps": self.settings.max_spread_bps,
+                "min_expected_move_ticks": self.settings.min_expected_move_ticks,
+                "max_zero_move_fraction": self.settings.max_zero_move_fraction,
+                "anomaly_max_severity": self.settings.anomaly_max_severity,
+            },
+            "burst": (
+                self.burst.status() if self.strategy_name == "burst15" else None
+            ),
+            "note": (
+                "A gate firing often is not automatically wrong. Use GET "
+                "/shadow to check whether the windows a gate rejected would "
+                "have won: that is the only evidence that says whether it is "
+                "protecting you or costing you."
+            ),
         }
 
     def current_signal(self) -> dict[str, Any] | None:

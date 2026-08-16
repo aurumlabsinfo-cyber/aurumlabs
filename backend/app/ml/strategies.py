@@ -92,6 +92,40 @@ def liquidation_pressure(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     return _sigmoid(pressure, 2.0), np.where(has_data, np.tanh(np.abs(pressure)), 0.0)
 
 
+def burst15(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """AURUM BURST-15's entry rule, scored like every other candidate.
+
+    The session layer (cooldown, trade cap, stop-loss) is deliberately absent:
+    those manage risk, they do not predict direction, and folding them in here
+    would mix the two questions. Use `app.ml.burst_backtest` for the full
+    session simulation.
+    """
+    from app.config import get_settings
+
+    try:
+        s = get_settings()
+        n5_min, r10_min, need_agree = (
+            s.burst_n5_min, s.burst_r10_min_bps, s.burst_require_ofi_agree,
+        )
+    except Exception:  # noqa: BLE001 - research must run without an environment
+        n5_min, r10_min, need_agree = 40, 0.5, True
+
+    n5 = np.nan_to_num(_col(df, "trade_count_5s"), nan=0.0)
+    r10 = _col(df, "return_10000ms")
+    ofi = np.nan_to_num(_col(df, "ofi_notional_5s"), nan=0.0)
+    has_r10 = ~np.isnan(r10)
+    r10 = np.nan_to_num(r10, nan=0.0)
+
+    active = has_r10 & (n5 >= n5_min) & (np.abs(r10) >= r10_min) & (r10 != 0)
+    if need_agree:
+        active &= np.sign(ofi) == np.sign(r10)
+    # Direction is the sign of the 10s move; the magnitude only scales how
+    # loudly the rule says it.
+    prob = np.where(r10 > 0, 1.0, 0.0)
+    conf = np.where(active, np.tanh(np.abs(r10) / max(r10_min * 2.0, 1e-9)), 0.0)
+    return prob, conf
+
+
 def ensemble(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     parts = [
         (order_flow(df), 1.8), (order_book_imbalance(df), 1.6), (momentum(df), 1.1),
@@ -114,6 +148,7 @@ STRATEGIES: dict[str, StrategyFn] = {
     "breakout": breakout,
     "volatility_expansion": volatility_expansion,
     "liquidation_pressure": liquidation_pressure,
+    "burst15": burst15,
     "ensemble": ensemble,
 }
 

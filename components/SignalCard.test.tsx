@@ -119,6 +119,37 @@ describe("SignalCard", () => {
     expect(screen.getByText(/spread too wide/)).toBeDefined();
   });
 
+  it("ranks the gates that have been blocking, not just the last window", () => {
+    renderCard({
+      signal: null,
+      agents: null,
+      diagnostics: {
+        strategy: "ensemble",
+        uptime_s: 600,
+        decisions_evaluated: 6000,
+        signals_emitted: 0,
+        signals_per_hour: 0,
+        emission_rate: 0,
+        binding_gate: "agent agreement N below N",
+        blocking_gates: [
+          {
+            gate: "agent agreement N below N",
+            count: 4800,
+            share_of_decisions: 0.8,
+          },
+          { gate: "market regime unknown", count: 600, share_of_decisions: 0.1 },
+        ],
+        last_decision_reasons: ["market regime unknown"],
+      },
+    });
+    expect(screen.getByText("NO TRADE")).toBeDefined();
+    expect(screen.getByText("Cosa blocca, nel tempo")).toBeDefined();
+    expect(screen.getByText(/agent agreement/)).toBeDefined();
+    expect(screen.getByText("80%")).toBeDefined();
+    // With no agent frame yet, the last window still comes from diagnostics.
+    expect(screen.getAllByText(/market regime unknown/).length).toBeGreaterThan(0);
+  });
+
   it("shows direction, trigger, duration and confidence while WAITING", () => {
     renderCard({ signal: signal() });
     expect(screen.getByText("GIÙ")).toBeDefined();

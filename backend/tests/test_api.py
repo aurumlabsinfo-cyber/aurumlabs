@@ -207,6 +207,64 @@ def test_unknown_settings_key_is_rejected(client):
     assert r.status_code == 400
 
 
+def test_diagnostics_explains_why_nothing_is_emitted(client):
+    """The endpoint that answers "why am I not getting signals"."""
+    body = client.get("/diagnostics").json()
+    assert body["strategy"] in ("ensemble", "burst15")
+    assert "verdict" in body and body["verdict"]
+    assert isinstance(body["blocking_gates"], list)
+    assert body["decisions_evaluated"] >= 0
+    # The thresholds actually in force, so a reader never has to guess which
+    # of min_confidence / min_edge is the binding one.
+    assert "effective_min_confidence" in body["thresholds"]
+    assert "data_quality" in body["feed"]
+
+
+def test_burst_session_reports_even_when_the_strategy_is_idle(client):
+    from app.config import get_settings
+
+    body = client.get("/burst/session").json()
+    assert body["strategy"] == "burst15"
+    assert body["config"]["session_s"] > 0
+    assert body["active_strategy"] == get_settings().signal_strategy
+    if body["active_strategy"] != "burst15":
+        assert "idle" in body["strategy_note"]
+    # The payout caveat is always present, whichever strategy is running.
+    assert "PAYOUT UNKNOWN" in body["note"]
+
+
+def test_boolean_settings_understand_the_word_false(client):
+    """`bool("false")` is True, which would enable what you asked to disable."""
+    from app.config import get_settings
+
+    key = get_settings().admin_api_key
+    if not key:
+        pytest.skip("ADMIN_API_KEY not configured in this environment")
+    r = client.patch(
+        "/settings", json={"key": "burst_require_ofi_agree", "value": "false"},
+        headers={"X-API-Key": key},
+    )
+    assert r.status_code == 200
+    assert r.json()["updated"]["burst_require_ofi_agree"] is False
+    client.patch(
+        "/settings", json={"key": "burst_require_ofi_agree", "value": "true"},
+        headers={"X-API-Key": key},
+    )
+
+
+def test_an_unknown_strategy_is_rejected(client):
+    from app.config import get_settings
+
+    key = get_settings().admin_api_key
+    if not key:
+        pytest.skip("ADMIN_API_KEY not configured in this environment")
+    r = client.patch(
+        "/settings", json={"key": "signal_strategy", "value": "wishful_thinking"},
+        headers={"X-API-Key": key},
+    )
+    assert r.status_code == 400
+
+
 def test_security_headers_are_present(client):
     r = client.get("/health/live")
     assert r.headers["X-Content-Type-Options"] == "nosniff"

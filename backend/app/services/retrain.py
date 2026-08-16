@@ -80,7 +80,20 @@ class RetrainService:
     async def run_once(self) -> dict[str, Any]:
         """One collect -> validate -> maybe activate cycle."""
         s = self.settings
-        counts = await repo.table_counts()
+        try:
+            counts = await repo.table_counts()
+        except Exception as exc:  # noqa: BLE001 - a DB outage is not a crash
+            # The service used to be started only when the database answered at
+            # boot, so a database that came up thirty seconds late meant the
+            # engine never learned again until it was restarted. Now the loop
+            # keeps running and simply reports why this cycle did nothing.
+            self.last_run_ts = now_ms()
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            self.last_result = {
+                "skipped": "database unavailable",
+                "error": self.last_error,
+            }
+            return self.last_result
         readiness = dataset_readiness(
             counts.get("features", 0), counts.get("market_ticks", 0), s.ml_min_samples
         )

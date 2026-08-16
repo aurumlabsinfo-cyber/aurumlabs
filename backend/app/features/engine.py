@@ -29,7 +29,9 @@ from app.marketdata.types import MarketTick, Trade
 
 log = get_logger(__name__)
 
-RETURN_HORIZONS_MS = (100, 250, 500, 1000, 2000, 3000, 5000)
+#: 10s is here because AURUM BURST-15 triggers on it (see app/signals/burst.py);
+#: everything else in this tuple predates it.
+RETURN_HORIZONS_MS = (100, 250, 500, 1000, 2000, 3000, 5000, 10000)
 FLOW_WINDOWS_MS = (1000, 5000, 30000)
 
 #: Minute-scale windows, for horizons measured in minutes rather than seconds.
@@ -235,6 +237,16 @@ class FeatureEngine:
             f[f"trade_count_{tag}"] = flow["count"]
             f[f"aggressive_buy_notional_{tag}"] = flow["buy_notional"]
             f[f"aggressive_sell_notional_{tag}"] = flow["sell_notional"]
+            # Order-flow imbalance weighted by notional rather than by base
+            # quantity. One 10 BTC print and 200 dust prints are the same
+            # number of trades and very different information; BURST-15 reads
+            # this one.
+            notional_total = flow["buy_notional"] + flow["sell_notional"]
+            f[f"ofi_notional_{tag}"] = (
+                (flow["buy_notional"] - flow["sell_notional"]) / notional_total
+                if notional_total > 0
+                else 0.0
+            )
         buys, sells = self.trades.consecutive()
         f["consecutive_buys"] = float(buys)
         f["consecutive_sells"] = float(sells)

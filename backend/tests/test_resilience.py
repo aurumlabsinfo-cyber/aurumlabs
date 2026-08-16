@@ -221,3 +221,30 @@ def test_ingest_survives_malformed_messages(settings):
     engine._on_message(object())  # unknown type: ignored
     engine._on_message(None)
     assert engine.counters["tickers"] == 0
+
+
+# --------------------------------------------------------------------- proxy
+def test_proxy_setting_reaches_the_adapters():
+    """HTTP_PROXY_URL used to be declared and read by nothing.
+
+    An operator whose network cannot reach the venue directly would set it,
+    restart, and get an engine that received no data and never said why.
+    """
+    from app.config import Settings
+    from app.marketdata.registry import build_adapter
+
+    s = Settings(
+        exchanges="binance_spot", http_proxy_url="http://127.0.0.1:3128",
+        allow_synthetic_source=True,
+    )
+    for name in ("binance_spot", "binance_futures", "coinbase"):
+        adapter = build_adapter(name, s)
+        assert adapter.proxy == "http://127.0.0.1:3128", name
+
+
+def test_ws_connect_refuses_to_silently_ignore_a_proxy(monkeypatch):
+    from app.marketdata import net
+
+    monkeypatch.setattr(net, "ws_supports_proxy", lambda: False)
+    with pytest.raises(RuntimeError, match="too old"):
+        net.ws_connect("wss://example.invalid", proxy="http://127.0.0.1:3128")

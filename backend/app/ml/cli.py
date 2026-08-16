@@ -208,6 +208,69 @@ async def cmd_shadow(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_burst(args: argparse.Namespace) -> int:
+    """Replay AURUM BURST-15 - sessions, cooldown, stop-loss - on recorded data."""
+    from app.ml.burst_backtest import run_from_db
+
+    settings = get_settings()
+    if args.n5 is not None:
+        settings.burst_n5_min = args.n5
+    if args.r10 is not None:
+        settings.burst_r10_min_bps = args.r10
+    if args.no_ofi:
+        settings.burst_require_ofi_agree = False
+    report = await run_from_db(
+        settings, include_synthetic=args.include_synthetic, payout=args.payout
+    )
+    if args.out:
+        with open(args.out, "w") as fh:
+            json.dump(report, fh, indent=2, default=str)
+        print(f"report written to {args.out}\n")
+    if args.summary:
+        _print({k: v for k, v in report.items() if k != "sessions"})
+    else:
+        _print(report)
+    return 0
+
+
+async def cmd_burst_grid(args: argparse.Namespace) -> int:
+    """Sweep the trigger thresholds, the way the original script's `grid` did."""
+    from app.ml.burst_backtest import simulate
+    from app.ml.dataset import load_raw
+
+    settings = get_settings()
+    features, ticks = await load_raw(
+        settings.symbol, include_synthetic=args.include_synthetic
+    )
+    if features.empty:
+        _print({"error": "no recorded data. Import or record first."})
+        return 1
+
+    print(f"{'n5':>5}{'|r10|':>8}{'ofi':>5}{'trades':>8}{'win':>8}"
+          f"{'EV':>9}{'PnL':>9}{'sessions':>10}")
+    for n5 in (10, 20, 40, 60, 100):
+        for r10 in (0.2, 0.5, 1.0, 2.0):
+            for agree in (True, False):
+                settings.burst_n5_min = n5
+                settings.burst_r10_min_bps = r10
+                settings.burst_require_ofi_agree = agree
+                rep = simulate(features, ticks, settings, payout=args.payout)
+                if rep.get("trades", 0) < args.min_trades:
+                    continue
+                print(
+                    f"{n5:5d}{r10:8.1f}{'yes' if agree else 'no':>5}"
+                    f"{rep['trades']:8d}{rep['win_rate_decided'] or 0:8.3f}"
+                    f"{rep['ev_per_trade_units']:+9.4f}{rep['pnl_units']:+9.1f}"
+                    f"{rep['sessions']['count']:10d}"
+                )
+    print(
+        "\nA grid is a search: the best row here is the maximum of many random "
+        "numbers unless it survives `app.ml.cli search`, which corrects for "
+        "exactly that."
+    )
+    return 0
+
+
 async def cmd_montecarlo(args: argparse.Namespace) -> int:
     from app.db.repository import fetch_all_paper_trades
 
@@ -233,6 +296,8 @@ COMMANDS = {
     "strategies": cmd_strategies,
     "montecarlo": cmd_montecarlo,
     "shadow": cmd_shadow,
+    "burst": cmd_burst,
+    "burst-grid": cmd_burst_grid,
 }
 
 
@@ -288,6 +353,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="hit rate over EVERY evaluated window, emitted or gated out",
     )
     sh.add_argument("--include-synthetic", action="store_true")
+
+    bu = sub.add_parser(
+        "burst", help="replay AURUM BURST-15 (sessions and all) on recorded data"
+    )
+    bu.add_argument("--n5", type=int, help="override BURST_N5_MIN")
+    bu.add_argument("--r10", type=float, help="override BURST_R10_MIN_BPS")
+    bu.add_argument("--no-ofi", action="store_true",
+                    help="do not require order flow to agree with the move")
+    bu.add_argument("--payout", type=float, default=None)
+    bu.add_argument("--include-synthetic", action="store_true")
+    bu.add_argument("--out", help="write the full JSON report here")
+    bu.add_argument("--summary", action="store_true")
+
+    bg = sub.add_parser(
+        "burst-grid", help="sweep the BURST-15 thresholds over recorded data"
+    )
+    bg.add_argument("--payout", type=float, default=None)
+    bg.add_argument("--min-trades", type=int, default=50)
+    bg.add_argument("--include-synthetic", action="store_true")
 
     m = sub.add_parser("montecarlo", help="risk analysis of recorded paper trades")
     m.add_argument("--payout", type=float, default=None)

@@ -44,6 +44,11 @@ class Decision:
     model_id: str | None = None
     model_prob_up: float | None = None
     calibrated: bool = False
+    #: How the trade is entered. "TRIGGER" waits for price to touch
+    #: `trigger_price`; "DELAY" enters `entry_delay_ms` after the signal at
+    #: whatever the market is then (this is what BURST-15 does).
+    entry_mode: str = "TRIGGER"
+    entry_delay_ms: int = 0
     detail: dict[str, Any] = field(default_factory=dict)
     #: Which way the aggregate leaned, before the gates were applied. Survives
     #: even when `direction` is NO_TRADE, so a rejected window is still a
@@ -71,6 +76,8 @@ class Decision:
             "reference_price": self.reference_price,
             "trigger_price": self.trigger_price,
             "horizon_s": self.horizon_s,
+            "entry_mode": self.entry_mode,
+            "entry_delay_ms": self.entry_delay_ms,
             "no_trade_reasons": self.no_trade_reasons,
             "lean": self.lean.value,
             "lean_confidence": round(self.lean_confidence, 4),
@@ -93,7 +100,7 @@ class DecisionEngine:
         performance_provider: Any = None,
     ) -> None:
         self.settings = settings
-        self.agents = agents if agents is not None else build_agents()
+        self.agents = agents if agents is not None else build_agents(settings)
         self.regime_agent = next(
             (a for a in self.agents if isinstance(a, MarketRegimeAgent)),
             MarketRegimeAgent(),
@@ -153,9 +160,20 @@ class DecisionEngine:
         latency = f.get("latency_ms")
         if latency is not None and latency > s.max_latency_ms:
             reasons.append(f"latency {latency:.0f}ms above limit {s.max_latency_ms:.0f}ms")
+        # Anomalies: a hard one vetoes alone, soft ones only once they stack up
+        # past ANOMALY_MAX_SEVERITY. A single one-sided book print is normal
+        # market behaviour, not a reason to stop trading for the day.
         anomaly = by_name.get("anomaly")
         if anomaly and anomaly.extra.get("anomaly_detected"):
-            reasons.append("anomaly: " + anomaly.reason)
+            hard = anomaly.extra.get("hard_anomalies") or []
+            severity = float(anomaly.extra.get("severity") or 0.0)
+            if hard:
+                reasons.append("anomaly: " + "; ".join(hard))
+            elif severity > s.anomaly_max_severity:
+                reasons.append(
+                    f"anomaly severity {severity:.2f} above "
+                    f"{s.anomaly_max_severity:.2f}: {anomaly.reason}"
+                )
         if regime is Regime.UNKNOWN:
             reasons.append("market regime unknown")
         missing = [
@@ -218,15 +236,22 @@ class DecisionEngine:
         confidence = max(directional, 1 - directional)
         mass = p_up + p_down
 
-        if mass < s.signal_min_confidence:
+        # Two distinct questions, two distinct knobs:
+        #   mass       - do the agents agree enough to claim the outcome at all?
+        #   confidence - given that they do, how one-sided is the call?
+        # Both used to be compared against SIGNAL_MIN_CONFIDENCE. Requiring
+        # `agreement x mean confidence >= 0.60` from eight independent noisy
+        # agents is close to unreachable on live data, which is the single
+        # biggest reason the engine could run for hours without emitting.
+        min_conf = s.effective_min_confidence
+        if mass < s.signal_min_agreement:
             reasons.append(
-                f"agent agreement {mass:.2f} below {s.signal_min_confidence:.2f}"
+                f"agent agreement {mass:.2f} below {s.signal_min_agreement:.2f}"
             )
-        if edge < s.signal_min_edge:
-            reasons.append(f"edge {edge:.3f} below minimum {s.signal_min_edge:.3f}")
-        if confidence < s.signal_min_confidence:
+        if confidence < min_conf:
             reasons.append(
-                f"confidence {confidence:.2f} below {s.signal_min_confidence:.2f}"
+                f"confidence {confidence:.2f} below {min_conf:.2f} "
+                f"(edge {edge:.3f} vs minimum {s.signal_min_edge:.3f})"
             )
 
         direction = Direction.NO_TRADE
@@ -267,6 +292,12 @@ class DecisionEngine:
                 "weights": weights_used,
                 "agreement_mass": round(mass, 4),
                 "sigma_horizon_bps": f.get("sigma_horizon_bps"),
+                "thresholds": {
+                    "min_agreement": s.signal_min_agreement,
+                    "min_confidence": round(min_conf, 4),
+                    "min_edge": s.signal_min_edge,
+                },
+                "strategy": "ensemble",
             },
         )
 

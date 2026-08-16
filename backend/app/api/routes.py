@@ -177,6 +177,122 @@ async def current_signal() -> dict[str, Any]:
     }
 
 
+@router.get("/diagnostics", tags=["signals"])
+async def diagnostics(top: int = Query(12, ge=1, le=50)) -> dict[str, Any]:
+    """Why signals are - or are not - arriving.
+
+    One call answers the first question every operator has. It ranks the gates
+    by how often each one blocked a decision since start, so the binding
+    constraint is the top row instead of something inferred from whatever the
+    last 100ms window happened to say.
+    """
+    svc = get_services()
+    quality = svc.market.data_quality()
+    report = svc.signals.diagnostics(top=top)
+    report["feed"] = {
+        "source": svc.market.source.value,
+        "is_synthetic": svc.market.is_synthetic,
+        "feed_age_ms": svc.market.feed_age_ms,
+        "book_synced": svc.market.book.synced,
+        "book_desync_reason": svc.market.book.desync_reason,
+        "data_quality": quality,
+        "adapters": {
+            name: {"connected": a.state.connected, "last_error": a.state.last_error}
+            for name, a in svc.market.adapters.items()
+        },
+    }
+    # The most common cause of "no signals" is not a gate at all: it is a feed
+    # that never arrived. Say so first when that is what is happening.
+    if svc.market.last_tick is None:
+        report["verdict"] = (
+            "NO MARKET DATA. The engine has never received a tick, so every "
+            "window is correctly NO TRADE. Check /health and the adapter "
+            "errors above before touching any threshold."
+        )
+    elif not svc.market.book.synced and "DEPTH_DIFF" in {
+        c.value.upper() for c in svc.market.primary.capabilities
+    }:
+        report["verdict"] = (
+            "ORDER BOOK NOT SYNCHRONISED "
+            f"({svc.market.book.desync_reason}). Every window is NO TRADE "
+            "until the REST snapshot succeeds - check that the venue's REST "
+            "endpoint is reachable (HTTP_PROXY_URL if it is not)."
+        )
+    elif not quality.get("warmup_complete"):
+        report["verdict"] = (
+            f"WARMING UP ({svc.market.uptime_s:.0f}s of "
+            f"{svc.settings.min_warmup_seconds:.0f}s). No signal is emitted "
+            "during warm-up by design."
+        )
+    elif report["signals_emitted"] == 0 and report["binding_gate"]:
+        report["verdict"] = (
+            f"No signal yet. The gate that fired most is "
+            f"'{report['binding_gate']}' "
+            f"({report['blocking_gates'][0]['share_of_decisions']:.0%} of "
+            "windows). Check /shadow before loosening it: a gate that rejects "
+            "losing windows is doing its job."
+        )
+    else:
+        report["verdict"] = (
+            f"{report['signals_emitted']} signals emitted "
+            f"({report['signals_per_hour']:.1f}/hour)."
+        )
+    return report
+
+
+# ------------------------------------------------------------------- burst-15
+@router.get("/burst/session", tags=["signals"])
+async def burst_session() -> dict[str, Any]:
+    """State of the AURUM BURST-15 operating window."""
+    svc = get_services()
+    status = svc.signals.burst.status()
+    status["active_strategy"] = svc.settings.signal_strategy
+    if svc.settings.signal_strategy != "burst15":
+        # Added alongside `note`, never over it: the payout caveat is the more
+        # important of the two and must not be swallowed.
+        status["strategy_note"] = (
+            "BURST-15 is not the active strategy: set SIGNAL_STRATEGY=burst15 "
+            "(or PATCH /settings) to run it. The session below is idle."
+        )
+    return status
+
+
+@router.post(
+    "/burst/session/start", tags=["signals"], dependencies=[Depends(require_admin)]
+)
+async def burst_session_start() -> dict[str, Any]:
+    """Open a fresh 15-minute window now, discarding the current one."""
+    svc = get_services()
+    svc.signals.burst.close_session("closed by operator")
+    session = svc.signals.burst.open_session()
+    return {"opened": session.to_dict(), "strategy": svc.settings.signal_strategy}
+
+
+@router.post(
+    "/burst/session/stop", tags=["signals"], dependencies=[Depends(require_admin)]
+)
+async def burst_session_stop() -> dict[str, Any]:
+    """Stand down for the rest of the current window."""
+    svc = get_services()
+    svc.signals.burst.close_session("closed by operator")
+    return {"session": svc.signals.burst.status()["session"]}
+
+
+@router.get("/burst/backtest", tags=["research"])
+async def burst_backtest(
+    include_synthetic: bool = False, payout: float | None = None
+) -> dict[str, Any]:
+    """Replay BURST-15 over everything recorded so far, sessions included."""
+    from app.ml.burst_backtest import run_from_db
+
+    svc = get_services()
+    if not svc.db_ready:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    return await run_from_db(
+        svc.settings, include_synthetic=include_synthetic, payout=payout
+    )
+
+
 @router.get("/paper-trading", tags=["paper"])
 async def paper_trading(
     limit: int = Query(100, ge=1, le=1000),
@@ -416,8 +532,20 @@ async def deactivate_model() -> dict[str, Any]:
 # ---------------------------------------------------------------- settings
 MUTABLE_SETTINGS = {
     "signal_enabled": bool,
+    "signal_strategy": str,
     "signal_min_confidence": float,
     "signal_min_edge": float,
+    "signal_min_agreement": float,
+    "anomaly_max_severity": float,
+    "min_expected_move_ticks": float,
+    "max_zero_move_fraction": float,
+    "burst_n5_min": int,
+    "burst_r10_min_bps": float,
+    "burst_require_ofi_agree": bool,
+    "burst_cooldown_ms": int,
+    "burst_max_trades_session": int,
+    "burst_stop_loss_units": float,
+    "burst_take_profit_units": float,
     "signal_cooldown_ms": int,
     "signal_max_concurrent": int,
     "signal_horizon_s": float,
@@ -472,11 +600,32 @@ async def patch_settings(patch: SettingsPatch) -> dict[str, Any]:
         )
     caster = MUTABLE_SETTINGS[patch.key]
     try:
-        value = None if patch.value is None else caster(patch.value)
+        value = None if patch.value is None else _cast(caster, patch.value)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"invalid value: {exc}") from exc
+    if patch.key == "signal_strategy" and value not in ("ensemble", "burst15"):
+        raise HTTPException(
+            status_code=400,
+            detail="signal_strategy must be 'ensemble' or 'burst15'",
+        )
     setattr(svc.settings, patch.key, value)
     return {"updated": {patch.key: value}}
+
+
+def _cast(caster: type, value: Any) -> Any:
+    """Cast a patched value, with a boolean that understands "false".
+
+    `bool("false")` is True, which would silently turn a request to disable
+    something into a request to enable it.
+    """
+    if caster is bool and isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            return True
+        if lowered in ("false", "0", "no", "off"):
+            return False
+        raise ValueError(f"'{value}' is not a boolean")
+    return caster(value)
 
 
 @router.post("/admin/purge-synthetic", tags=["system"], dependencies=[Depends(require_admin)])

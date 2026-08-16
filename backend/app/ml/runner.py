@@ -183,13 +183,68 @@ async def _run_one_horizon(
     return out
 
 
+def _fit_with_calibration(
+    settings: Settings, ds: Dataset, model_name: str, X
+) -> tuple[Any, bool, dict[str, Any]]:
+    """Fit the model, calibrated when there is enough data to do it honestly.
+
+    An uncalibrated model is blended into the live ensemble at 0.3 weight
+    instead of 0.5, and `calibrated` was hard-coded False - so no amount of
+    retraining could ever promote a model. Calibration here is fitted on a
+    held-out TAIL of the series, separated from the training rows by one
+    horizon plus the embargo, exactly like the walk-forward folds. Calibrating
+    on the training rows would produce a confident-looking model that has
+    learned its own residuals.
+
+    Returns (fitted estimator, calibrated?, note).
+    """
+    import numpy as np
+
+    y = ds.y.to_numpy()
+    ts = ds.ts.to_numpy()
+    n = len(y)
+    if not settings.calibrate_models or n < 2000:
+        model = build(model_name)
+        model.fit(X, y)
+        return model, False, {"calibration": "skipped: not enough rows"}
+
+    cut = int(n * 0.8)
+    gap_ms = int((ds.horizon_s + settings.ml_embargo_s) * 1000)
+    cal_start = int(np.searchsorted(ts, ts[cut - 1] + gap_ms, "left"))
+    cal_rows = n - cal_start
+    train_y = y[:cut]
+    cal_y = y[cal_start:]
+    # Isotonic regression needs both classes and a real sample to be worth
+    # anything; below that, an uncalibrated model is the honest answer.
+    if cal_rows < 500 or len(set(cal_y.tolist())) < 2 or len(set(train_y.tolist())) < 2:
+        model = build(model_name)
+        model.fit(X, y)
+        return model, False, {
+            "calibration": f"skipped: only {cal_rows} usable hold-out rows"
+        }
+
+    from sklearn.calibration import CalibratedClassifierCV
+
+    base = build(model_name)
+    base.fit(X.iloc[:cut], train_y)
+    calibrated = CalibratedClassifierCV(base, cv="prefit", method="isotonic")
+    calibrated.fit(X.iloc[cal_start:], cal_y)
+    return calibrated, True, {
+        "calibration": "isotonic on a purged hold-out tail",
+        "train_rows": cut,
+        "calibration_rows": cal_rows,
+        "purge_gap_ms": gap_ms,
+    }
+
+
 async def _fit_and_save(
     settings: Settings, ds: Dataset, model_name: str, horizon_report: dict
 ) -> dict[str, Any]:
     """Refit on all available data and persist, with training-distribution stats."""
     X = impute(ds.X)
-    model = build(model_name)
-    model.fit(X, ds.y.to_numpy())
+    model, calibrated, calibration_note = _fit_with_calibration(
+        settings, ds, model_name, X
+    )
     stats = {
         col: {
             "mean": float(X[col].mean()),
@@ -207,11 +262,12 @@ async def _fit_and_save(
         feature_names=list(X.columns),
         feature_stats=stats,
         horizon_s=ds.horizon_s,
-        calibrated=False,
+        calibrated=calibrated,
         metadata={
             "edge": horizon_report.get("edge"),
             "symbol": settings.symbol,
             "rows": len(ds),
+            **calibration_note,
         },
     )
 
@@ -259,6 +315,8 @@ async def _fit_and_save(
         "model_id": model_id,
         "path": path,
         "rows": len(ds),
+        "calibrated": calibrated,
+        **calibration_note,
         "recorded_in_db": recorded,
     }
 

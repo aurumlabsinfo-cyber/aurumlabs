@@ -12,12 +12,10 @@ from __future__ import annotations
 import asyncio
 import json
 
-import httpx
-import websockets
-
 from app.core.clock import now_ms
 from app.core.logging_conf import get_logger
 from app.marketdata.base import Capability, Emit, ExchangeAdapter
+from app.marketdata.net import http_client, ws_connect
 from app.marketdata.types import BookTicker, Trade
 
 log = get_logger(__name__)
@@ -44,24 +42,23 @@ class CoinbaseAdapter(ExchangeAdapter):
         rest_base: str = "https://api.exchange.coinbase.com",
         rest_timeout_s: float = 10.0,
         stale_timeout_s: float = 20.0,
+        proxy: str | None = None,
     ) -> None:
         super().__init__(symbol)
         self.product_id = _to_product(symbol)
         self.ws_base = ws_base
         self.stale_timeout_s = stale_timeout_s
-        self._http = httpx.AsyncClient(
-            base_url=rest_base.rstrip("/"),
-            timeout=rest_timeout_s,
-            headers={"User-Agent": "btc-5s-quant-engine/1.0"},
-        )
+        self.proxy = proxy
+        self._http = http_client(rest_base.rstrip("/"), rest_timeout_s, proxy)
         self._seq = 0
 
     def stream_names(self) -> list[str]:
         return [f"ticker:{self.product_id}", f"matches:{self.product_id}"]
 
     async def _stream_once(self, emit: Emit) -> None:
-        async with websockets.connect(
-            self.ws_base, ping_interval=20, ping_timeout=20, close_timeout=5
+        async with ws_connect(
+            self.ws_base, proxy=self.proxy, ping_interval=20,
+            ping_timeout=20, close_timeout=5,
         ) as ws:
             await ws.send(
                 json.dumps(

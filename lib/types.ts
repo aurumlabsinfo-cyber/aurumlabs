@@ -136,6 +136,18 @@ export interface Health {
   signals: Record<string, number>;
 }
 
+export interface Diagnostics {
+  strategy: string;
+  uptime_s: number;
+  decisions_evaluated: number;
+  signals_emitted: number;
+  signals_per_hour: number;
+  emission_rate: number;
+  binding_gate: string | null;
+  blocking_gates: { gate: string; count: number; share_of_decisions: number }[];
+  last_decision_reasons: string[];
+}
+
 export interface Hello {
   symbol: string;
   horizon_s: number;

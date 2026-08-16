@@ -156,22 +156,37 @@ class VolatilityAgent(Agent):
         # decides whether the bet is live is whether price is expected to move
         # at all: measured on real data, 32% of 5-second windows ended exactly
         # where they started.
+        #
+        # Both limits come from the settings. They used to be literals here,
+        # which meant an operator loosening MIN_EXPECTED_MOVE_TICKS still got
+        # "expected move too small to be exploitable" forever.
+        min_ticks = self.setting("min_expected_move_ticks", 2.0)
+        max_flat = self.setting("max_zero_move_fraction", 0.35)
         expected_ticks = ctx.features.get("expected_move_ticks")
         zero_move = ctx.features.get("zero_move_fraction")
-        moves_enough = expected_ticks is None or expected_ticks >= 2.0
-        rarely_flat = zero_move is None or zero_move <= 0.35
+        moves_enough = expected_ticks is None or expected_ticks >= min_ticks
+        rarely_flat = zero_move is None or zero_move <= max_flat
         tradable = edge_ratio > 0.8 and moves_enough and rarely_flat
         confidence = min(0.9, edge_ratio / 3.0) if tradable else 0.0
-        direction_hint = ctx.f("return_1000ms", 0.0)
-        score = squash(direction_hint, 4.0) * 0.3 if tradable else 0.0
+        # No direction, ever. This agent answers "is any bet worth taking",
+        # and a score here leaked a momentum opinion into the aggregate with
+        # this agent's weight behind it - the one thing its docstring says it
+        # does not do.
+        score = 0.0
         reason = (
             f"vol5s {v5:.2f}bps vs spread {spread:.2f}bps (ratio {edge_ratio:.2f}), "
             f"vol regime {ratio:.2f}x"
         )
         if not moves_enough:
-            reason += f"; expected move {expected_ticks:.1f} ticks is too small"
+            reason += (
+                f"; expected move {expected_ticks:.1f} ticks is below the "
+                f"{min_ticks:g}-tick minimum"
+            )
         if not rarely_flat:
-            reason += f"; {zero_move:.0%} of recent windows had no move at all"
+            reason += (
+                f"; {zero_move:.0%} of recent windows had no move at all "
+                f"(limit {max_flat:.0%})"
+            )
         out = self.emit(
             ctx, score, confidence, reason,
             used + ["expected_move_ticks", "zero_move_fraction"],
@@ -307,10 +322,28 @@ class MarketRegimeAgent(Agent):
 
 
 class AnomalyDetector(Agent):
-    """Never gives a direction. It can only veto."""
+    """Never gives a direction. It can only veto.
+
+    Findings are split into HARD and SOFT. A hard one describes a broken or
+    dangerous market picture and vetoes on its own. A soft one is a warning
+    sign that is perfectly common on a real venue - a momentarily one-sided
+    book, a burst of prints - and only vetoes once several stack up
+    (ANOMALY_MAX_SEVERITY). Treating every soft finding as a veto is why the
+    engine could sit at NO TRADE through an entirely normal session.
+    """
 
     name = "anomaly"
     weight = 0.0
+
+    #: Anomalies that veto on their own, matched by prefix.
+    HARD_PREFIXES = (
+        "invalid spread", "abnormal spread", "price spike",
+        "order book desynchronised", "data quality", "feed latency",
+    )
+
+    @classmethod
+    def _is_hard(cls, anomaly: str) -> bool:
+        return anomaly.startswith(cls.HARD_PREFIXES)
 
     def _evaluate(self, ctx: AgentContext) -> AgentOutput:
         anomalies: list[str] = []
@@ -357,6 +390,7 @@ class AnomalyDetector(Agent):
             anomalies.append(f"data quality {ctx.data_quality:.2f}")
 
         severity = min(1.0, len(anomalies) / 3.0)
+        hard = [a for a in anomalies if self._is_hard(a)]
         return AgentOutput(
             agent=self.name,
             direction=Direction.NO_TRADE,
@@ -367,20 +401,25 @@ class AnomalyDetector(Agent):
                            "liquidity_removal_ask", "trade_intensity_1s", "latency_ms"],
             timestamp=ctx.ts,
             data_quality=ctx.data_quality,
-            extra={"anomalies": anomalies, "anomaly_detected": bool(anomalies)},
+            extra={
+                "anomalies": anomalies,
+                "anomaly_detected": bool(anomalies),
+                "hard_anomalies": hard,
+                "severity": round(severity, 3),
+            },
         )
 
 
-def build_agents() -> list[Agent]:
+def build_agents(settings: Any = None) -> list[Agent]:
     return [
-        PriceActionAgent(),
-        OrderBookAgent(),
-        OrderFlowAgent(),
-        VolatilityAgent(),
-        MomentumAgent(),
-        MeanReversionAgent(),
-        MarketRegimeAgent(),
-        AnomalyDetector(),
+        PriceActionAgent(settings),
+        OrderBookAgent(settings),
+        OrderFlowAgent(settings),
+        VolatilityAgent(settings),
+        MomentumAgent(settings),
+        MeanReversionAgent(settings),
+        MarketRegimeAgent(settings),
+        AnomalyDetector(settings),
     ]
 
 

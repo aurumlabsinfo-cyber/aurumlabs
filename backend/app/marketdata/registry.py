@@ -21,6 +21,7 @@ def _binance_spot(s: Settings) -> ExchangeAdapter:
         depth_speed_ms=s.orderbook_stream_speed_ms,
         rest_timeout_s=s.rest_timeout_s,
         stale_timeout_s=s.ws_stale_timeout_s,
+        proxy=s.http_proxy_url,
     )
 
 
@@ -30,6 +31,7 @@ def _binance_futures(s: Settings) -> ExchangeAdapter:
         ws_base=s.binance_futures_ws_base,
         rest_base=s.binance_futures_rest_base,
         rest_timeout_s=s.rest_timeout_s,
+        proxy=s.http_proxy_url,
     )
 
 
@@ -39,6 +41,7 @@ def _coinbase(s: Settings) -> ExchangeAdapter:
         ws_base=s.coinbase_ws_base,
         rest_base=s.coinbase_rest_base,
         rest_timeout_s=s.rest_timeout_s,
+        proxy=s.http_proxy_url,
     )
 
 

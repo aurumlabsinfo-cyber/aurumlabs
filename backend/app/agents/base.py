@@ -81,6 +81,17 @@ class Agent(abc.ABC):
     #: Prior weight in the ensemble. Microstructure agents outrank indicators.
     weight: float = 1.0
 
+    def __init__(self, settings: Any = None) -> None:
+        #: Optional `app.config.Settings`. Agents that gate on an operator knob
+        #: read it from here; without it they fall back to the same defaults.
+        #: Before this existed, VolatilityAgent hard-coded 2 ticks and 35%, so
+        #: MIN_EXPECTED_MOVE_TICKS and MAX_ZERO_MOVE_FRACTION were ignored by
+        #: the very agent whose job they describe.
+        self.settings = settings
+
+    def setting(self, name: str, default: Any) -> Any:
+        return getattr(self.settings, name, default) if self.settings else default
+
     @abc.abstractmethod
     def _evaluate(self, ctx: AgentContext) -> AgentOutput:
         ...

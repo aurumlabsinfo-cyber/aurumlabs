@@ -42,6 +42,13 @@ class Settings(BaseSettings):
     persist_features: bool = True
     persist_book_updates: bool = False  # very high volume: off by default
     book_snapshot_interval_s: int = 30
+    #: A NO TRADE decision is evaluated every FEATURE_INTERVAL_MS (10/s by
+    #: default). Writing one `signals` row for each of them is ~864k rows a day
+    #: of pure "nothing happened", which is what saturated the batch writer and
+    #: buried the real signals in the table. The learning record lives in
+    #: `shadow_decisions`, so here we only keep a heartbeat: one row per
+    #: interval, plus one whenever the set of blocking reasons changes.
+    no_trade_row_interval_ms: int = 5000
     # How often a snapshot of paper-trading performance is written to
     # `performance_metrics`, building a history of how the edge evolves.
     performance_metrics_interval_s: int = 300
@@ -102,9 +109,27 @@ class Settings(BaseSettings):
 
     # -------------------------------------------------------------- signals
     signal_enabled: bool = True
+    #: Which decision path produces signals.
+    #:   "ensemble" - the eight agents + gates in app/signals/decision.py
+    #:   "burst15"  - the AURUM BURST-15 session strategy (app/signals/burst.py)
+    signal_strategy: Literal["ensemble", "burst15"] = "ensemble"
     signal_horizon_s: float = 5.0
-    signal_min_confidence: float = 0.60
-    signal_min_edge: float = 0.04  # |P(up) - 0.5| required
+    #: Directional confidence required: P(chosen side). Confidence is exactly
+    #: 0.5 + edge, so the effective gate is
+    #: max(signal_min_confidence, 0.5 + signal_min_edge). Keep the two in step -
+    #: previously they disagreed (0.60 vs 0.04) and the edge knob did nothing.
+    signal_min_confidence: float = 0.55
+    signal_min_edge: float = 0.05  # |P(up) - 0.5| required
+    #: How much of the outcome space the agents are jointly willing to claim
+    #: (agreement x mean confidence). This measures CONSENSUS, not direction, so
+    #: it gets its own knob: reusing signal_min_confidence for it meant asking
+    #: eight noisy agents to agree at 60% before any signal could ever exist.
+    signal_min_agreement: float = 0.35
+    #: The anomaly detector scores severity as (anomalies found) / 3, capped at
+    #: 1.0. Veto above this. At 0.5 a single soft anomaly (one-sided book, a
+    #: volume burst) no longer blocks the whole engine; two do. Hard failures
+    #: (book desync, latency, data quality) are gated separately and always.
+    anomaly_max_severity: float = 0.5
     signal_cooldown_ms: int = 3000
     signal_max_concurrent: int = 1
     signal_wait_timeout_s: float = 30.0
@@ -114,6 +139,28 @@ class Settings(BaseSettings):
     trigger_max_bps: float = 8.0
     trigger_price_source: Literal["mid", "last", "micro"] = "mid"
     tick_size: float = 0.01
+
+    # ------------------------------------------------- AURUM BURST-15 strategy
+    # A 15-minute operating window that only takes tape bursts on a 5-second
+    # horizon. See BURST15.md. Active when SIGNAL_STRATEGY=burst15.
+    burst_n5_min: int = 40              # trades in the last 5s (live tape)
+    burst_r10_min_bps: float = 0.5      # minimum 10-second move
+    burst_require_ofi_agree: bool = True
+    burst_entry_delay_ms: int = 1000    # entry is time-based, not a price touch
+    burst_session_s: int = 900          # the operating window itself
+    burst_cooldown_ms: int = 6000
+    burst_max_trades_session: int = 40
+    burst_stop_loss_units: float = -6.0   # closes the session
+    burst_take_profit_units: float = 15.0  # closes the session
+    burst_max_staleness_ms: int = 2000
+    burst_min_data_quality: float = 0.75
+    #: Used ONLY for the session's own stop-loss/take-profit arithmetic when
+    #: BINARY_PAYOUT is unset. It never reaches the reported P&L, which keeps
+    #: saying PAYOUT UNKNOWN rather than inventing a number.
+    burst_assumed_payout: float = 0.8
+    #: Open the next session automatically when one ends. Off = one session,
+    #: then the engine stands down until POST /burst/session/start.
+    burst_auto_restart: bool = True
 
     # ------------------------------------------------- learning from every window
     #: Record the engine's lean on EVERY evaluated window, not only the ones
@@ -128,10 +175,17 @@ class Settings(BaseSettings):
     #: Re-run the validated pipeline on a schedule and activate the result -
     #: but only when its walk-forward edge classifies as PROVEN or PROMISING.
     #: A run that concludes NO ROBUST EDGE leaves the live engine untouched.
-    auto_retrain_enabled: bool = False
+    #: On by default: "the engine learns on its own" is a property of the
+    #: product, and shipping it off meant it never learned at all.
+    auto_retrain_enabled: bool = True
     retrain_interval_s: float = 3600.0
     retrain_initial_delay_s: float = 900.0
     retrain_splits: int = 5
+    #: Fit a probability calibrator (isotonic, on held-out folds) alongside the
+    #: classifier. An uncalibrated model is blended into the ensemble at 0.3
+    #: weight instead of 0.5, so without this the model is permanently a
+    #: second-class citizen no matter how good it gets.
+    calibrate_models: bool = True
 
     # ------------------------------------------------------- paper trading
     # Binary-option payout. `None` => UNKNOWN => no monetary P&L is reported.
@@ -202,6 +256,17 @@ class Settings(BaseSettings):
     @property
     def horizon_ms(self) -> int:
         return int(self.signal_horizon_s * 1000)
+
+    @property
+    def effective_min_confidence(self) -> float:
+        """The directional confidence a signal must actually reach.
+
+        Confidence is `0.5 + edge` by construction, so the two knobs describe
+        one quantity from two directions. Taking the max makes whichever is
+        stricter the binding one and stops either from being dead config -
+        the old defaults (0.60 / 0.04) meant the edge knob could never bind.
+        """
+        return max(self.signal_min_confidence, 0.5 + self.signal_min_edge)
 
     @property
     def exchange_list(self) -> list[str]:

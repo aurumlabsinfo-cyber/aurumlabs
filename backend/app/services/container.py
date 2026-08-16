@@ -73,9 +73,11 @@ class Services:
         await self.signals.start()
         await self.market.start()
         # Retraining reads only what has already been recorded, so it is
-        # started last and never gates the feed coming up.
-        if self.db_ready:
-            await self.retrain.start()
+        # started last and never gates the feed coming up. It is started even
+        # when the database is down right now: the loop re-checks on every
+        # cycle, so a database that comes up late no longer costs the engine
+        # its ability to learn until the next restart.
+        await self.retrain.start()
         self._started = True
         log.info(
             "services.started",
