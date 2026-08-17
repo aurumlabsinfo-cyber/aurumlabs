@@ -267,7 +267,7 @@ niente.** Il capitale del ciclo bruciato e' perso. Quello che i cicli danno e'
 una misura onesta - quanti se ne bruciano, quanto durano, se durano di piu' man
 mano che il motore impara - non una seconda possibilita' sulla stessa puntata.
 
-Verificato: `selftest` supera 12/12 (portafoglio con azzeramento, studio e
+Verificato: `selftest` supera 13/13 (portafoglio con azzeramento, studio e
 ciclo nuovo, aggregazione OHLC e API della dashboard,
 framing WebSocket con frammentazione e ping, sequenza dell'order book, feature,
 regole di BURST-15, coerenza delle soglie, database, apprendimento con
@@ -394,6 +394,55 @@ mercato. Dicono che la macchina emette, entra, chiude e conta correttamente.
 di confidenza 44%-69% e p-value 0,35 contro il lancio di una moneta, cioe'
 esattamente cio' che ci si aspetta dal caso. Il vantaggio, se c'e', si misura
 sui tuoi dati reali con `backtest` e `shadow`.
+
+---
+
+## 4-ter. «Le operazioni non vengono registrate, e non impara»
+
+Due segnalazioni, una causa comune e una separata.
+
+### Lo schema del database non veniva aggiornato
+
+`CREATE TABLE IF NOT EXISTS` **non tocca una tabella che esiste gia'**. Un
+`aurum.db` scritto da una versione precedente conservava lo schema vecchio, e
+`paper_trades` non aveva `entry_mode`, `stake_amount`, `pnl_money`,
+`balance_after`. Ogni INSERT falliva.
+
+E falliva in modo totale: `flush()` scriveva l'intero lotto - tick, feature,
+segnali, operazioni, registro di cassa - dentro un unico `try`. Una sola tabella
+rotta faceva saltare tutto il resto del lotto, che veniva scartato. Silenziosamente,
+per sempre.
+
+Riprodotto: con un database di una versione precedente, dopo due minuti di
+esecuzione `paper_trades` aveva **0 righe**. Nessuna operazione registrata,
+quindi niente storico, niente statistiche, niente saldo che si muove.
+
+Due correzioni:
+
+* **migrazione all'avvio.** Lo schema atteso viene confrontato con quello vero
+  (`PRAGMA table_info`) e le colonne mancanti vengono aggiunte con
+  `ALTER TABLE`. Il motore stampa quante ne ha aggiunte;
+* **ogni tabella ha il suo `try`.** Un guasto su una non puo' piu' far perdere
+  le righe delle altre, e la dashboard mostra righe perse, ultimo errore del
+  database e numero di operazioni salvate.
+
+Dopo la correzione, sullo stesso database vecchio: colonne aggiunte, operazioni
+registrate con puntata, esito in denaro e saldo risultante.
+
+### L'apprendimento sembrava fermo
+
+Non era fermo: era **muto**, e in parte contava male.
+
+* Il riquadro diceva «attivo · 0 cicli · verdetto —» per venti minuti, che si
+  legge esattamente come «non funziona». Ora mostra i **dati raccolti sul totale
+  necessario**, il **tempo al prossimo studio**, e una barra di avanzamento;
+* il cancello dei dati contava **tutte** le righe di feature, mentre
+  l'addestramento esclude quelle sintetiche: sul simulatore diceva «dati
+  sufficienti» e poi addestrava su un dataset vuoto. Ora conta le righe come le
+  contera' l'addestramento;
+* e quando la sorgente e' il simulatore il contatore resta a zero **per scelta**
+  - dati generati da un modello non possono dimostrare un edge - quindi il
+  riquadro adesso lo dice invece di sembrare bloccato.
 
 ---
 

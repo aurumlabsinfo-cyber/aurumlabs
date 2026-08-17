@@ -49,6 +49,11 @@ python3 aurum_engine.py run --payout 0.8   # OPERAZIONI DA 1 MINUTO
 open http://localhost:8002              # dashboard
 ```
 
+Un `aurum.db` scritto da una versione precedente viene **aggiornato
+all'avvio**: le colonne mancanti vengono aggiunte e il motore lo dice in
+console. Senza, ogni INSERT sulle colonne nuove falliva e le operazioni non
+venivano registrate affatto.
+
 `config` stampa la versione come prima riga: e' la domanda che viene per prima
 quando qualcosa non torna. Se vedi `"horizon_s": 5.0` o `"http_port": 8000`
 stai eseguendo una **copia vecchia**, non una configurazione sbagliata. Se la
@@ -84,7 +89,7 @@ attivazione solo se il verdetto regge.
 | `diagnose` | perche' non arrivano segnali, in italiano, senza browser |
 | `mercato` | quante finestre finiscono dove sono partite, orizzonte per orizzonte |
 | `wallet` | saldo, cicli, regole di puntata e registro di cassa |
-| `selftest` | 12 verifiche interne, nessuna rete richiesta |
+| `selftest` | 13 verifiche interne, nessuna rete richiesta |
 
 La dashboard su `:8002` e' servita dallo stesso file: **portafoglio** con saldo,
 puntata, curva del capitale e ciclo in corso; grafico a candele sempre in vista

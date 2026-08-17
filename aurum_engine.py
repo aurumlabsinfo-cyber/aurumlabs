@@ -549,7 +549,57 @@ class Store:
         self._conn = self._connect()
         with self._write_lock:
             self._conn.executescript(SCHEMA)
+            self.migrated = self._migrate()
             self._conn.commit()
+
+    #: Colonne attese in ogni tabella. `COLUMNS` copre quelle scritte a blocchi;
+    #: `paper_trades` viene scritta con un upsert e ha la sua lista.
+    PAPER_COLUMNS: tuple[str, ...] = (
+        "signal_id", "ts", "symbol", "strategy", "direction", "status",
+        "entry_mode", "reference_price", "trigger_price", "entry_price",
+        "expiry_price", "confidence", "edge", "regime", "horizon_s",
+        "triggered_at", "expires_at", "settled_at", "result", "pnl_units",
+        "payout", "stake", "stake_amount", "pnl_money", "balance_after",
+        "data_quality", "features", "is_synthetic",
+    )
+
+    #: Tipo di ogni colonna aggiungibile. SQLite non lo deduce da solo in un
+    #: ALTER TABLE, e sbagliarlo renderebbe la colonna inutilizzabile.
+    _COLUMN_TYPES: dict[str, str] = {
+        "entry_mode": "TEXT", "stake_amount": "REAL", "pnl_money": "REAL",
+        "balance_after": "REAL", "latency_ms": "REAL", "is_synthetic": "INTEGER",
+        "book_synced": "INTEGER", "model_id": "TEXT", "data_quality": "REAL",
+        "regime": "TEXT", "detail": "TEXT", "no_trade_reasons": "TEXT",
+    }
+
+    def _migrate(self) -> list[str]:
+        """Aggiunge le colonne che mancano a un database gia' esistente.
+
+        `CREATE TABLE IF NOT EXISTS` non tocca una tabella che c'e' gia': un
+        `aurum.db` scritto da una versione precedente conserva lo schema
+        vecchio, e ogni INSERT con una colonna nuova fallisce. Il guasto era
+        silenzioso e totale - le operazioni non venivano registrate affatto -
+        quindi qui lo schema viene allineato all'avvio invece di dare per
+        scontato che combaci.
+        """
+        wanted: dict[str, tuple[str, ...]] = dict(COLUMNS)
+        wanted["paper_trades"] = self.PAPER_COLUMNS
+        added: list[str] = []
+        for table, cols in wanted.items():
+            try:
+                have = {r["name"] for r in
+                        self._conn.execute(f"PRAGMA table_info({table})")}
+            except sqlite3.Error:
+                continue
+            if not have:                      # la tabella non c'e': SCHEMA l'ha creata
+                continue
+            for col in cols:
+                if col in have:
+                    continue
+                kind = self._COLUMN_TYPES.get(col, "REAL")
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
+                added.append(f"{table}.{col}")
+        return added
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30.0)
@@ -625,16 +675,24 @@ class Store:
         if not batches and not papers:
             return
 
+        # Ogni tabella ha il suo try. Prima un solo INSERT rotto - una colonna
+        # che manca in un database vecchio - faceva fallire l'intero flush e
+        # buttava via anche tutto il resto del lotto, per sempre e in silenzio.
         with self._write_lock:
             cur = self._conn.cursor()
+            failures: list[str] = []
             for table, rows in batches.items():
                 cols = COLUMNS[table]
                 sql = (
                     f"INSERT INTO {table} ({','.join(cols)}) "
                     f"VALUES ({','.join('?' * len(cols))})"
                 )
-                cur.executemany(sql, rows)
-                self.stats["written"] += len(rows)
+                try:
+                    cur.executemany(sql, rows)
+                    self.stats["written"] += len(rows)
+                except sqlite3.Error as exc:
+                    failures.append(f"{table}: {exc}")
+                    self.stats["dropped"] += len(rows)
             for row in papers:
                 keys = list(row)
                 sql = (
@@ -643,9 +701,17 @@ class Store:
                     f"ON CONFLICT(signal_id) DO UPDATE SET "
                     + ", ".join(f"{k}=excluded.{k}" for k in keys if k != "signal_id")
                 )
-                cur.execute(sql, [row[k] for k in keys])
-                self.stats["written"] += 1
+                try:
+                    cur.execute(sql, [row[k] for k in keys])
+                    self.stats["written"] += 1
+                except sqlite3.Error as exc:
+                    failures.append(f"paper_trades: {exc}")
+                    self.stats["dropped"] += 1
             self._conn.commit()
+            if failures:
+                self.stats["failures"] += len(failures)
+                self.last_error = failures[0]
+                self.healthy = False
         self.healthy = True
 
     # ----------------------------------------------------------------- lettura
@@ -659,6 +725,21 @@ class Store:
             ):
                 out[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             return out
+        finally:
+            conn.close()
+
+    def feature_rows(self, include_synthetic: bool = True) -> int:
+        """Righe di feature UTILIZZABILI per imparare.
+
+        Contarle tutte quando l'addestramento poi esclude il simulatore
+        significa dire "dati sufficienti" e ritrovarsi con un dataset vuoto.
+        """
+        conn = self.reader()
+        try:
+            sql = "SELECT COUNT(*) FROM features"
+            if not include_synthetic:
+                sql += " WHERE is_synthetic = 0"
+            return conn.execute(sql).fetchone()[0]
         finally:
             conn.close()
 
@@ -5130,6 +5211,11 @@ class Retrainer:
         self.last_run_ts: int | None = None
         self.last_result: dict[str, Any] | None = None
         self.last_error: str | None = None
+        #: Quando partira' il primo studio, e quante righe servono ancora. Senza
+        #: questo il riquadro diceva "attivo · 0 cicli · verdetto —" per venti
+        #: minuti, che si legge esattamente come "non funziona".
+        self.next_run_at: int | None = None
+        self.usable_rows: int | None = None
 
     def start(self) -> None:
         if not self.cfg.auto_retrain:
@@ -5145,16 +5231,31 @@ class Retrainer:
         # Mai riaddestrare subito all'avvio: non c'e' niente di nuovo da
         # imparare nei primi secondi.
         deadline = time.time() + self.cfg.retrain_initial_delay_s
-        while self._running and time.time() < deadline:
-            time.sleep(0.5)
+        self.next_run_at = now_ms() + int(self.cfg.retrain_initial_delay_s * 1000)
+        self._wait(deadline)
         while self._running:
             try:
                 self.run_once()
             except Exception as exc:  # noqa: BLE001 - il ciclo non muore mai
                 self.last_error = f"{type(exc).__name__}: {exc}"
             deadline = time.time() + self.cfg.retrain_interval_s
-            while self._running and time.time() < deadline:
-                time.sleep(0.5)
+            self.next_run_at = now_ms() + int(self.cfg.retrain_interval_s * 1000)
+            self._wait(deadline)
+
+    def _wait(self, deadline: float) -> None:
+        """Aspetta, ma tenendo aggiornato quante righe ci sono.
+
+        E' l'unica cosa che si muove fra uno studio e l'altro: senza, la
+        dashboard non ha niente da mostrare e sembra ferma."""
+        next_count = 0.0
+        while self._running and time.time() < deadline:
+            if time.time() >= next_count:
+                next_count = time.time() + 15.0
+                try:
+                    self.usable_rows = self.store.feature_rows(False)
+                except Exception:  # noqa: BLE001 - e' solo un contatore
+                    pass
+            time.sleep(0.5)
 
     def run_once(self, include_synthetic: bool | None = None) -> dict[str, Any]:
         cfg = self.cfg
@@ -5162,13 +5263,19 @@ class Retrainer:
             include_synthetic if include_synthetic is not None
             else False
         )
-        counts = self.store.counts()
-        if counts.get("features", 0) < cfg.ml_min_samples:
+        rows = self.store.feature_rows(include_synthetic)
+        self.usable_rows = rows
+        if rows < cfg.ml_min_samples:
             self.last_run_ts = now_ms()
             self.last_result = {
-                "skipped": "dati insufficienti",
-                "feature_rows": counts.get("features", 0),
+                "skipped": (f"dati insufficienti: {rows} righe utilizzabili su "
+                            f"{cfg.ml_min_samples} necessarie"),
+                "feature_rows": rows,
                 "needed": cfg.ml_min_samples,
+                "note": ("Le righe del simulatore non contano: la ricerca "
+                         "dell'edge le esclude, quindi contarle qui direbbe "
+                         "'pronto' su un dataset vuoto."
+                         if not include_synthetic else None),
             }
             return self.last_result
 
@@ -5218,6 +5325,22 @@ class Retrainer:
             "runs": self.runs, "activations": self.activations,
             "last_run_ts": self.last_run_ts, "last_result": self.last_result,
             "last_error": self.last_error,
+            "next_run_at": self.next_run_at,
+            "next_run_in_s": (max(0, (self.next_run_at - now_ms()) // 1000)
+                              if self.next_run_at else None),
+            "rows_needed": self.cfg.ml_min_samples,
+            "rows_usable": self.usable_rows,
+            "first_run_delay_s": round(self.cfg.retrain_initial_delay_s),
+            # Sul simulatore le righe utilizzabili restano zero PER SCELTA:
+            # dati generati da un modello non possono dimostrare un edge. Senza
+            # dirlo, un contatore fermo a 0 si legge come un guasto.
+            "blocked_reason": (
+                "Sorgente SIMULATA: le sue righe sono escluse dalla ricerca "
+                "dell'edge, quindi il contatore resta a zero per scelta. "
+                "Serve un feed vero (--source binance) perche' il motore "
+                "possa imparare."
+                if self.cfg.source == "sim" else None
+            ),
             "policy": ("Riaddestra su ogni finestra registrata, non solo sui "
                        "segnali emessi, e attiva solo un modello il cui edge "
                        "walk-forward risulta DIMOSTRATO o PROMETTENTE."),
@@ -6363,15 +6486,30 @@ function tickSlow(){
         ? '<div class="muted" style="font-size:10.5px;margin-top:8px">sotto il pareggio '
           + 'del payout: vincere piu\' della meta\' delle volte non basta</div>' : '');
 
+      // Prima del primo studio non c'e' un verdetto da mostrare: c'e' una
+      // raccolta dati in corso. Mostrare quella - righe e minuti che mancano -
+      // invece di un trattino e' la differenza fra "sta lavorando" e "e' rotto".
       var lr = rt.last_result || {};
+      var need = rt.rows_needed || 0, have = rt.rows_usable;
+      var prog = (have!==null&&have!==undefined&&need)
+        ? Math.min(100, have/need*100) : null;
       $("learn").innerHTML = kv([
         ["Automatico", rt.enabled ? "attivo" : "spento", rt.enabled?"up":"muted"],
+        ["Dati raccolti", (have!==null&&have!==undefined)
+          ? have.toLocaleString("it-IT")+" / "+need.toLocaleString("it-IT")+" righe"
+          : "—"],
+        ["Prossimo studio", rt.next_run_in_s!==null&&rt.next_run_in_s!==undefined
+          ? sec(rt.next_run_in_s*1000) : "—"],
         ["Cicli eseguiti", String(rt.runs)],
         ["Modelli attivati", String(rt.activations)],
-        ["Ultimo verdetto", lr.edge || lr.skipped || "—"],
+        ["Ultimo verdetto", lr.edge || lr.skipped || "in attesa del primo studio"],
         ["Modello attivo", (hl.components.model.detail.model_id || "nessuno")],
         ["Calibrato", hl.components.model.detail.calibrated ? "si" : "no"],
-      ]) + (lr.note ? '<div class="muted" style="font-size:10.5px;margin-top:8px">'
+      ]) + (prog!==null && !rt.blocked_reason
+        ? '<div class="prog" style="margin-top:8px"><i style="width:'+prog+'%"></i></div>' : '')
+        + (rt.blocked_reason ? '<div class="warn" style="font-size:10.5px;margin-top:8px">'
+        + esc(rt.blocked_reason) + '</div>' : '')
+        + (lr.note ? '<div class="muted" style="font-size:10.5px;margin-top:8px">'
         + esc(lr.note) + '</div>' : '');
 
       var c = hl.components;
@@ -6384,9 +6522,15 @@ function tickSlow(){
           ? Math.round(hl.market.feed_age_ms)+"ms" : "—"],
         ["Latenza p95", hl.market.latency_p95_ms!==null&&hl.market.latency_p95_ms!==undefined
           ? Math.round(hl.market.latency_p95_ms)+"ms" : "—"],
-        ["Database", (db.counts.market_ticks||0).toLocaleString("it-IT")+" tick"],
+        ["Database", (db.counts.market_ticks||0).toLocaleString("it-IT")+" tick",
+          db.writer.healthy===false ? "down" : ""],
         ["Righe scritte", (db.writer.written||0).toLocaleString("it-IT")],
-      ]);
+        ["Righe perse", (db.writer.dropped||0).toLocaleString("it-IT"),
+          db.writer.dropped ? "warn" : "muted"],
+        ["Operazioni salvate", (db.counts.paper_trades||0).toLocaleString("it-IT")],
+      ]) + (db.writer.last_error
+        ? '<div class="warn" style="font-size:10.5px;margin-top:8px">database: '
+          + esc(db.writer.last_error) + '</div>' : '');
 
       renderHistory(hist);
     }).catch(function(){});
@@ -6539,9 +6683,12 @@ def make_http_server(engine: "Engine"):
             if path == "/config":
                 return {k: v for k, v in cfg.to_dict().items()},
             if path == "/db":
+                st = engine.store
                 return {"path": cfg.db_path,
-                        "counts": engine.store.counts() if engine.store else {},
-                        "writer": engine.store.stats if engine.store else {}},
+                        "counts": st.counts() if st else {},
+                        "writer": ({**st.stats, "healthy": st.healthy,
+                                    "last_error": st.last_error,
+                                    "migrated": st.migrated} if st else {})},
             return {"error": "endpoint sconosciuto", "try": [
                 "/", "/health", "/diagnostics", "/market", "/signals",
                 "/signals/current", "/burst/session", "/statistics", "/shadow",
@@ -6625,6 +6772,10 @@ class Engine:
 
     def start(self) -> None:
         self.store.start()
+        if self.store.migrated:
+            self._log(f"database aggiornato: aggiunte {len(self.store.migrated)} "
+                      f"colonne mancanti ({', '.join(self.store.migrated[:4])}"
+                      f"{'...' if len(self.store.migrated) > 4 else ''})")
         self._running = True
         if self.cfg.http_port:
             # Se la porta e' occupata si prova la successiva invece di partire
@@ -7568,6 +7719,58 @@ def cmd_selftest(cfg: Config, args) -> int:
                 f"{counts['features']} feature, {counts['shadow_decisions']} shadow, "
                 f"replay {replay['trades']} trade")
 
+    # -------------------------------- database di una versione precedente
+    def t_migration() -> str:
+        """Un `aurum.db` vecchio deve continuare a funzionare.
+
+        `CREATE TABLE IF NOT EXISTS` non tocca una tabella esistente: con lo
+        schema di prima, ogni INSERT su una colonna nuova falliva e - poiche'
+        il flush era un unico blocco - buttava via anche tutto il resto. Il
+        risultato era che le operazioni non venivano registrate affatto.
+        """
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "vecchio.db")
+        old_schema = """
+        CREATE TABLE paper_trades (
+            signal_id TEXT PRIMARY KEY, ts INTEGER NOT NULL, symbol TEXT,
+            strategy TEXT, direction TEXT, status TEXT, reference_price REAL,
+            trigger_price REAL, entry_price REAL, expiry_price REAL,
+            confidence REAL, edge REAL, regime TEXT, horizon_s REAL,
+            triggered_at INTEGER, expires_at INTEGER, settled_at INTEGER,
+            result TEXT, pnl_units REAL, payout REAL, stake REAL,
+            data_quality REAL, features TEXT, is_synthetic INTEGER);
+        """
+        conn = sqlite3.connect(path)
+        conn.executescript(old_schema)
+        conn.commit()
+        conn.close()
+
+        c = Config(db_path=path, payout=0.8)
+        store = Store(c)
+        assert store.migrated, "nessuna colonna aggiunta a uno schema vecchio"
+        assert any(m.endswith(".stake_amount") for m in store.migrated), store.migrated
+        store.start()
+        # Una scrittura che con lo schema vecchio sarebbe fallita in silenzio.
+        store.upsert_paper_trade({
+            "signal_id": "vecchio1", "ts": 1, "symbol": "BTCUSDT",
+            "direction": UP, "status": WIN, "result": WIN, "entry_mode": "MARKET",
+            "stake_amount": 25.0, "pnl_money": 20.0, "balance_after": 520.0,
+        })
+        # E un lotto misto: se una tabella si rompe, le altre devono passare.
+        store.add("market_ticks", Tick(ts=1, exchange="t", symbol="X",
+                                       bid_price=1.0, bid_qty=1.0, ask_price=2.0,
+                                       ask_qty=1.0).row())
+        store.flush()
+        rows = store.paper_trades()
+        counts = store.counts()
+        store.stop()
+        assert len(rows) == 1, f"operazione non registrata: {counts}"
+        assert rows[0]["stake_amount"] == 25.0 and rows[0]["pnl_money"] == 20.0, rows[0]
+        assert rows[0]["entry_mode"] == "MARKET", rows[0]
+        assert counts["market_ticks"] == 1, counts
+        return (f"{len(store.migrated)} colonne aggiunte, operazione registrata "
+                f"con puntata ed esito in denaro")
+
     # ------------------------------------------ il prodotto da un minuto
     def t_one_minute() -> str:
         """I tre difetti segnalati, su un replay a un minuto vero.
@@ -7813,6 +8016,7 @@ def cmd_selftest(cfg: Config, args) -> int:
     check("statistica", t_stats)
     check("motore end-to-end", t_engine)
     check("prodotto a 1 minuto (segnali, conti, annullate)", t_one_minute)
+    check("database di una versione precedente (migrazione)", t_migration)
 
     print(f"\nAURUM ENGINE {VERSION} - selftest\n")
     failed = 0
