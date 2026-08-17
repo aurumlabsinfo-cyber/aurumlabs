@@ -139,7 +139,12 @@ class Config:
     max_latency_ms: float = 750.0
     max_feed_gap_ms: float = 2000.0
     min_data_quality: float = 0.75
-    min_warmup_s: float = 60.0
+    #: Negativo = ricavato dalla finestra di volatilita': il riscaldamento
+    #: finisce quando il motore ha abbastanza storia per MISURARE l'orizzonte
+    #: (sigma, finestre ferme, movimento atteso). Prima di allora quei cancelli
+    #: non hanno dati e si limitano a non bloccare: e' onesto, ma significa
+    #: operare senza le protezioni che contano.
+    min_warmup_s: float = -1.0
     max_zero_move_fraction: float = 0.35
     #: Quanto puo' muoversi il prezzo e contare comunque come "fermo".
     #: DEVE combaciare con il regolamento: il motore chiama PAREGGIO solo se
@@ -154,7 +159,10 @@ class Config:
     # -------------------------------------------------------------- segnali
     strategy: str = "ensemble"       # ensemble | burst15
     signal_enabled: bool = True
-    horizon_s: float = 5.0
+    #: 0 = ricavato dalla strategia: 60s per l'ensemble (il prodotto da un
+    #: minuto), 5s per BURST-15, che e' una strategia da 5 secondi per
+    #: costruzione e con un orizzonte da un minuto non sarebbe piu' se stessa.
+    horizon_s: float = 0.0
     #: Consenso fra gli agenti: accordo x confidenza media. E' una grandezza
     #: diversa dalla confidenza direzionale e ha una sua manopola.
     min_agreement: float = 0.35
@@ -165,9 +173,20 @@ class Config:
     #: L'anomaly detector calcola la gravita' come (rilievi)/3. I rilievi HARD
     #: vietano da soli; quelli soft solo oltre questa soglia.
     anomaly_max_severity: float = 0.5
-    cooldown_ms: int = 3000
+    cooldown_ms: int = 0            # 0 = ricavato dall'orizzonte
     max_concurrent: int = 1
-    wait_timeout_s: float = 30.0
+    #: Come si entra.
+    #:   "market"  - subito, al prezzo corrente. NON puo' essere annullato.
+    #:   "trigger" - solo se il prezzo tocca un livello entro la finestra
+    #:               d'attesa; se non lo tocca, l'operazione e' ANNULLATA.
+    #: Il trigger serviva a strappare un ingresso migliore, ma su un orizzonte
+    #: da un minuto costava piu' operazioni annullate di quanto rendesse: e' la
+    #: causa principale delle "troppe operazioni cancellate". Ora il default e'
+    #: l'ingresso a mercato, e il trigger resta disponibile per chi lo vuole.
+    entry_mode: str = "market"      # market | trigger
+    #: Ritardo volontario fra decisione e ingresso (0 = subito).
+    entry_delay_ms: int = 0
+    wait_timeout_s: float = 0.0     # 0 = ricavato dall'orizzonte
     trigger_sigma_k: float = 0.35
     trigger_min_ticks: float = 1.0
     trigger_max_bps: float = 8.0
@@ -240,14 +259,63 @@ class Config:
     csv_path: str | None = None
     sim_seed: int | None = None
 
+    #: Orizzonte di default per strategia, in secondi.
+    HORIZON_BY_STRATEGY = {"ensemble": 60.0, "burst15": 5.0}
+
     def __post_init__(self) -> None:
         # Le finestre che dipendono dall'orizzonte crescono con lui, a meno che
         # non siano state scelte esplicitamente altrove.
+        #
+        # `_derived` ricorda quali valori li ha decisi il motore: cosi' un
+        # `--strategy burst15` o un `--horizon 60` applicato DOPO la costruzione
+        # li ricalcola davvero, mentre un valore scelto a mano resta il tuo.
+        derived: set[str] = getattr(self, "_derived", set())
+        if self.horizon_s <= 0 or "horizon_s" in derived:
+            self.horizon_s = self.HORIZON_BY_STRATEGY.get(self.strategy, 60.0)
+            derived.add("horizon_s")
+        self._derived = derived
         h = self.horizon_s
         self.tick_buffer_s = max(self.tick_buffer_s, int(h * 4))
         self.trade_buffer_s = max(self.trade_buffer_s, int(h * 4))
-        self.volatility_window_s = max(self.volatility_window_s, h * 2)
+        # La sigma dell'orizzonte si stima su finestre lunghe un orizzonte: con
+        # un lookback di sole 2 volte l'orizzonte restano ~10 campioni, troppo
+        # pochi perche' il numero significhi qualcosa. Tre volte ne da' ~20.
+        self.volatility_window_s = max(self.volatility_window_s, h * 3)
         self.ml_embargo_s = max(self.ml_embargo_s, h * 2)
+        # Attesa del trigger e cooldown vivono sulla scala dell'orizzonte: un
+        # tempo fisso di 30s e' meta' della finestra a 60s e sei volte la
+        # finestra a 5s. Lasciarli fissi era la seconda causa delle operazioni
+        # annullate. 0 significa "decidilo tu dall'orizzonte".
+        #
+        if self.wait_timeout_s <= 0 or "wait_timeout_s" in derived:
+            self.wait_timeout_s = max(2.0, h * 0.5)
+            derived.add("wait_timeout_s")
+        if self.cooldown_ms <= 0 or "cooldown_ms" in derived:
+            self.cooldown_ms = max(500, int(h * 1000 * 0.25))
+            derived.add("cooldown_ms")
+
+        if self.min_warmup_s < 0 or "min_warmup_s" in derived:
+            self.min_warmup_s = max(60.0, self.volatility_window_s)
+            derived.add("min_warmup_s")
+
+        # Quante righe servono perche' la CALIBRAZIONE sia possibile.
+        # `fit_final_model` tiene da parte l'ultimo 20% come coda, ne butta via
+        # orizzonte + embargo per la purga, e vuole almeno 500 righe residue.
+        # Con un orizzonte da un minuto la purga vale 1800 righe: con le 5000
+        # righe di prima la coda restava vuota e il modello usciva SEMPRE non
+        # calibrato - cioe' pesato meno nella decisione, per sempre. Il minimo
+        # si ricava dalla stessa aritmetica invece di essere una costante che
+        # va bene solo a 5 secondi.
+        step_ms = max(1, self.feature_interval_ms)
+        purge_rows = (h + self.ml_embargo_s) * 1000.0 / step_ms
+        self.ml_min_samples = max(self.ml_min_samples,
+                                  int((purge_rows + 500) / 0.2) + 1000)
+        # E il primo tentativo va programmato quando quelle righe ci sono
+        # davvero, altrimenti il primo giro di studio e' sprecato in partenza.
+        self.retrain_initial_delay_s = max(
+            self.retrain_initial_delay_s, self.ml_min_samples * step_ms / 1000.0 * 1.1
+        )
+        self._derived = derived
 
     @property
     def horizon_ms(self) -> int:
@@ -273,13 +341,20 @@ class Config:
     @classmethod
     def from_env(cls) -> "Config":
         cfg = cls()
-        for name, value in vars(cfg).items():
+        for name, value in list(vars(cfg).items()):
+            if name.startswith("_"):
+                continue
             raw = os.environ.get(name.upper())
             if raw is None or raw == "":
                 continue
-            setattr(cfg, name, _coerce(raw, value))
+            cfg.set_explicit(name, _coerce(raw, value))
         cfg.__post_init__()
         return cfg
+
+    def set_explicit(self, name: str, value: Any) -> None:
+        """Imposta un valore SCELTO: non verra' piu' ricavato dall'orizzonte."""
+        setattr(self, name, value)
+        getattr(self, "_derived", set()).discard(name)
 
 
 def _coerce(raw: str, current: Any) -> Any:
@@ -2404,6 +2479,12 @@ class FeatureEngine:
         # ------------------------------------------------------------- meta
         f["latency_ms"] = tick.latency_ms
         f["book_synced"] = book.synced
+        # Distinzione necessaria: "il book c'e' ed e' rotto" e' un guasto, "il
+        # feed non manda il book" e' un limite dichiarato della sorgente. Senza
+        # questo flag il replay da CSV - che il book non ce l'ha per costruzione
+        # - veniva bloccato al 100% dal cancello del book e non emetteva mai un
+        # segnale, rendendo impossibile validare offline la strategia.
+        f["book_expected"] = bool(self.market.feed.supports_depth)
         f["data_quality"] = quality["score"]
         f["history_span_ms"] = self.mid.span_ms()
         f["tick_count"] = len(self.mid)
@@ -2519,12 +2600,20 @@ class AgentOutput:
 
 
 class Ctx:
-    def __init__(self, ts: int, features: dict, quality: float, book_synced: bool):
+    def __init__(self, ts: int, features: dict, quality: float, book_synced: bool,
+                 book_expected: bool = True):
         self.ts = ts
         self.features = features
         self.data_quality = quality
         self.book_synced = book_synced
+        #: Il feed dichiara di mandare la profondita'. Se non la manda, il book
+        #: mancante non e' un guasto e non deve valere come anomalia.
+        self.book_expected = book_expected
         self.regime = UNKNOWN
+
+    @property
+    def book_broken(self) -> bool:
+        return self.book_expected and not self.book_synced
 
     def f(self, name: str, default: Any = None) -> Any:
         v = self.features.get(name, default)
@@ -2594,7 +2683,7 @@ class OrderBookAgent(Agent):
     name, weight = "order_book", 1.6
 
     def _evaluate(self, ctx: Ctx) -> AgentOutput:
-        if not ctx.book_synced:
+        if ctx.book_broken:
             return self.abstain("book non sincronizzato")
         if not ctx.has("depth_imbalance_5"):
             return self.abstain("profondita' non disponibile")
@@ -2813,7 +2902,7 @@ class AnomalyDetector(Agent):
         latency = f.get("latency_ms")
         if latency is not None and latency > 1000:
             anomalies.append(f"latenza del feed {latency:.0f}ms")
-        if not ctx.book_synced:
+        if ctx.book_broken:
             anomalies.append("book desincronizzato")
         if ctx.data_quality < 0.5:
             anomalies.append(f"qualita' dati {ctx.data_quality:.2f}")
@@ -2919,9 +3008,10 @@ class DecisionEngine:
         quality = health.get("data_quality", {})
         dq = float(quality.get("score", 0.0))
         book_synced = bool(f.get("book_synced"))
+        book_expected = bool(f.get("book_expected", True))
         ref_price = market.get("price") or f.get("mid") or 0.0
 
-        ctx = Ctx(ts, f, dq, book_synced)
+        ctx = Ctx(ts, f, dq, book_synced, book_expected)
         regime, regime_conf, regime_reason = self.regime_agent.classify(ctx)
         ctx.regime = regime
         outputs = [a.evaluate(ctx) for a in self.agents]
@@ -2938,7 +3028,7 @@ class DecisionEngine:
         for r in quality.get("reasons", []):
             if r not in reasons:
                 reasons.append(r)
-        if not book_synced:
+        if ctx.book_broken:
             reasons.append("book non sincronizzato")
         spread_bps = f.get("spread_bps")
         if spread_bps is None:
@@ -2964,8 +3054,13 @@ class DecisionEngine:
                 )
         if regime == UNKNOWN:
             reasons.append("regime di mercato sconosciuto")
-        missing = [k for k in ("return_1000ms", "volume_imbalance_1s",
-                               "depth_imbalance_5") if f.get(k) is None]
+        # La profondita' e' obbligatoria solo se il feed la manda: su una
+        # sorgente senza book (replay da CSV) pretenderla significa non
+        # decidere mai.
+        needed = ["return_1000ms", "volume_imbalance_1s"]
+        if book_expected:
+            needed.append("depth_imbalance_5")
+        missing = [k for k in needed if f.get(k) is None]
         if missing:
             reasons.append(f"feature incomplete: {', '.join(missing)}")
 
@@ -3028,12 +3123,21 @@ class DecisionEngine:
 
         direction = NO_TRADE
         trigger = None
+        entry_mode, entry_delay_ms = "MARKET", 0
         if not reasons and ref_price > 0:
             direction = UP if directional > 0.5 else DOWN
-            trigger = self._trigger_price(direction, ref_price, f)
-            if trigger is None:
-                reasons.append("trigger non dimensionabile: manca la volatilita'")
-                direction = NO_TRADE
+            if cfg.entry_mode == "trigger":
+                entry_mode = "TRIGGER"
+                trigger = self._trigger_price(direction, ref_price, f)
+                if trigger is None:
+                    reasons.append("trigger non dimensionabile: manca la volatilita'")
+                    direction = NO_TRADE
+            else:
+                # Ingresso a mercato: il prezzo di riferimento E' l'ingresso.
+                # Nessuna attesa, quindi nessuna operazione annullata perche'
+                # "il trigger non e' stato toccato".
+                entry_delay_ms = max(0, int(cfg.entry_delay_ms))
+                entry_mode = "DELAY" if entry_delay_ms > 0 else "MARKET"
 
         return Decision(
             ts=ts, symbol=vector.get("symbol", cfg.symbol),
@@ -3044,7 +3148,8 @@ class DecisionEngine:
             trigger_price=trigger, horizon_s=cfg.horizon_s,
             no_trade_reasons=reasons, agents=outputs, data_quality=dq,
             model_id=model_id, model_prob_up=model_prob, calibrated=calibrated,
-            strategy="ensemble",
+            strategy="ensemble", entry_mode=entry_mode,
+            entry_delay_ms=entry_delay_ms,
             lean=UP if directional > 0.5 else DOWN, lean_confidence=confidence,
             detail={
                 "regime_reason": regime_reason,
@@ -3578,7 +3683,8 @@ class SignalEngine:
             prob_up=decision.prob_up, prob_down=decision.prob_down,
             edge=decision.edge, regime=decision.regime, created_at=ts,
             expires_wait_at=(
-                ts + decision.entry_delay_ms if decision.entry_mode == "DELAY"
+                ts + decision.entry_delay_ms
+                if decision.entry_mode in ("DELAY", "MARKET")
                 else ts + int(self.cfg.wait_timeout_s * 1000)
             ),
             entry_mode=decision.entry_mode, entry_delay_ms=decision.entry_delay_ms,
@@ -3596,6 +3702,15 @@ class SignalEngine:
         self._record_signal_row(decision, sid)
         self._write_paper(sig)
         self._emit("signal_created", sig)
+        # Ingresso a mercato: si entra qui, adesso, al prezzo su cui e' stata
+        # presa la decisione. Non c'e' finestra d'attesa da mancare, quindi non
+        # c'e' operazione da annullare.
+        if sig.entry_mode == "MARKET":
+            price = self._price() or decision.reference_price
+            if price and price > 0:
+                self._trigger(sig, price, ts)
+            else:
+                self._cancel(sig, ts, "nessun prezzo al momento dell'ingresso")
         return sig
 
     # -------------------------------------------------------------- monitor
@@ -3610,7 +3725,7 @@ class SignalEngine:
             if sig is None:
                 continue
             if sig.status == WAITING:
-                if sig.entry_mode == "DELAY":
+                if sig.entry_mode in ("DELAY", "MARKET"):
                     # Ingresso a tempo: decide l'orologio, non un livello.
                     if ts >= sig.created_at + sig.entry_delay_ms:
                         if price is None:
@@ -3889,6 +4004,19 @@ class SignalEngine:
             "emission_rate": round(emitted / decisions, 5),
             "blocking_gates": gates,
             "binding_gate": gates[0]["gate"] if gates else None,
+            # Il ciclo di vita, non solo l'emissione: un motore che emette e poi
+            # annulla non e' un motore che opera.
+            "lifecycle": {
+                "entered": self.counters["triggered"],
+                "settled": (self.counters["wins"] + self.counters["losses"]
+                            + self.counters["ties"]),
+                "cancelled": self.counters["cancelled"],
+                "cancelled_rate": round(
+                    self.counters["cancelled"] / emitted, 4) if emitted else None,
+                "horizon_s": self.cfg.horizon_s,
+                "entry_mode": self.cfg.entry_mode,
+                "cooldown_ms": self.cfg.cooldown_ms,
+            },
             "last_decision_reasons": (
                 self.last_decision.no_trade_reasons if self.last_decision else []
             ),
@@ -3949,15 +4077,47 @@ def summarise(trades: list[dict], payout: float | None, stake: float = 1.0,
     ties = sum(1 for t in settled if t["result"] == TIE)
     decided = wins + losses
     cancelled = sum(1 for t in trades if t.get("result") == CANCELLED)
+    open_now = len(trades) - len(settled) - cancelled
 
+    # Ogni segnale sta in UNA sola casella. Se questi numeri non tornano, e' un
+    # difetto di contabilita', non un dettaglio di presentazione: era proprio
+    # qui che vincite e perdite sembravano non quadrare.
     out: dict[str, Any] = {
         "signals": len(trades), "settled": len(settled), "cancelled": cancelled,
+        "open": max(0, open_now),
         "wins": wins, "losses": losses, "ties": ties, "decided": decided,
+        "accounting_ok": len(settled) + cancelled + max(0, open_now) == len(trades)
+        and wins + losses + ties == len(settled),
+        "cancelled_rate": round(cancelled / len(trades), 4) if trades else None,
         "tie_fraction": round(ties / len(settled), 4) if settled else None,
         "win_rate_decided": round(wins / decided, 4) if decided else None,
         "no_trade_windows": no_trade_count,
         "payout_status": "NOTO" if payout is not None else "PAYOUT SCONOSCIUTO",
     }
+    # Denaro vero del portafoglio: sommato dalle righe, non ricalcolato da una
+    # puntata media. E' lo STESSO numero che mostra il portafoglio, cosi' non
+    # ci sono due contabilita' che si contraddicono a schermo.
+    money = [t for t in settled if t.get("pnl_money") is not None]
+    if money:
+        staked = sum(float(t.get("stake_amount") or 0.0) for t in money)
+        realised = sum(float(t["pnl_money"]) for t in money)
+        equity = peak = dd = 0.0
+        for t in sorted(money, key=lambda r: r.get("settled_at") or r["ts"]):
+            equity += float(t["pnl_money"])
+            peak = max(peak, equity)
+            dd = min(dd, equity - peak)
+        out["money"] = {
+            "max_drawdown": round(dd, 2),
+            "trades": len(money),
+            "staked": round(staked, 2),
+            "pnl": round(realised, 2),
+            "won": round(sum(float(t["pnl_money"]) for t in money
+                             if t["result"] == WIN), 2),
+            "lost": round(-sum(float(t["pnl_money"]) for t in money
+                               if t["result"] == LOSS), 2),
+            "avg_stake": round(staked / len(money), 2),
+            "roi_pct": round(realised / staked * 100.0, 2) if staked else None,
+        }
     if decided:
         lo, hi = wilson_interval(wins, decided)
         out["win_rate_ci95"] = [round(lo, 4), round(hi, 4)]
@@ -4267,10 +4427,29 @@ class Wallet:
         self.exposure += stake
         self.opened += 1
 
+    def release(self, signal_id: str) -> None:
+        """Libera la puntata di un segnale che NON e' mai entrato a mercato.
+
+        Un'operazione annullata non e' un'operazione: non ha un esito, non
+        muove il saldo e non deve comparire nel conteggio. Prima passava da
+        `settle` e scriveva una riga TRADE da zero euro, cosi' il portafoglio
+        diceva "40 operazioni" dove le vincite e le perdite ne contavano 28 -
+        due conteggi diversi della stessa cosa, ed e' il motivo per cui
+        vincite e perdite sembravano non tornare.
+        """
+        stake = self._reserved.pop(signal_id, None)
+        if stake is None:
+            return
+        self.exposure = max(0.0, self.exposure - stake)
+        self.opened = max(0, self.opened - 1)
+
     def settle(self, signal_id: str, result: str | None,
                ts: int | None = None) -> float | None:
         """Applica l'esito, scrive la riga di registro, e chiude il ciclo se il
         conto e' finito. Ritorna il movimento in valuta."""
+        if result == CANCELLED or result is None:
+            self.release(signal_id)
+            return None
         stake = self._reserved.pop(signal_id, None)
         if not self.active or stake is None:
             return None
@@ -4281,7 +4460,7 @@ class Wallet:
         elif result == LOSS:
             amount = -stake
         else:
-            amount = 0.0   # TIE o CANCELLED: la puntata torna al suo posto
+            amount = 0.0   # PAREGGIO: la puntata torna al suo posto
 
         ts = ts or now_ms()
         day = self._day(ts)
@@ -5940,14 +6119,17 @@ function renderSignal(s, d){
   var up = sig.direction === "UP";
   var cls = up ? "up" : "down";
   var rem = sig.remaining_ms, wait = sig.wait_remaining_ms;
+  var atMarket = sig.entry_mode !== "TRIGGER";
+  var entryLabel = sig.entry_mode==="MARKET" ? " · ingresso a mercato"
+    : (sig.entry_mode==="DELAY" ? " · ingresso a tempo" : " · ingresso al tocco");
   $("sig-sub").textContent = (sig.strategy||"") + " · orizzonte " + sig.horizon_s + "s"
-    + (sig.entry_mode==="DELAY" ? " · ingresso a tempo" : " · ingresso al tocco");
+    + entryLabel;
   var html = '<div class="sig"><div class="arrow '+cls+'">'
     + (up ? "&#8593; SU" : "&#8595; GIU&#768;") + '</div></div>'
     + '<div class="cells">'
     + '<div class="cell"><div class="k">'
-      + (sig.entry_mode==="DELAY" ? "Riferimento" : "Trigger") + '</div>'
-      + '<div class="v tnum">$'+num(sig.entry_mode==="DELAY"?sig.reference_price:sig.trigger_price)+'</div></div>'
+      + (atMarket ? "Riferimento" : "Trigger") + '</div>'
+      + '<div class="v tnum">$'+num(atMarket?sig.reference_price:sig.trigger_price)+'</div></div>'
     + '<div class="cell"><div class="k">Ingresso</div><div class="v tnum">'
       + (sig.entry_price ? "$"+num(sig.entry_price) : "—") + '</div></div>'
     + '<div class="cell"><div class="k">Confidenza</div><div class="v tnum">'
@@ -5961,7 +6143,7 @@ function renderSignal(s, d){
       + '<div class="muted" style="font-size:11px">countdown guidato dal motore</div></div>';
   } else if(wait !== null && wait !== undefined){
     html += '<div class="count"><div class="muted">'
-      + (sig.entry_mode==="DELAY" ? "ingresso a mercato fra " : "in attesa del trigger · ")
+      + (atMarket ? "ingresso a mercato fra " : "in attesa del trigger · ")
       + sec(wait) + '</div></div>';
   }
   if(sig.result){
@@ -6149,19 +6331,35 @@ function tickSlow(){
     .then(function(r){
       var st=r[0], rt=r[1], hl=r[2], hist=r[3], db=r[4], wal=r[5];
       renderWallet(wal);
+      // Ogni segnale sta in una casella sola: chiusi + annullati + aperti =
+      // segnali. Se `accounting_ok` e' falso il riquadro lo dice, invece di
+      // mostrare numeri che non si sommano.
+      var cur = (wal && wal.currency) || "EUR";
+      var mo = st.money;
       $("perf").innerHTML = kv([
         ["Segnali", String(st.signals)],
-        ["Chiusi", String(st.settled)],
+        ["Chiusi con esito", String(st.settled)],
+        ["Annullati", String(st.cancelled)
+          + (st.cancelled_rate!==null&&st.cancelled_rate!==undefined
+             ? " ("+pct(st.cancelled_rate)+")" : ""),
+          st.cancelled_rate>0.15 ? "warn" : "muted"],
+        ["Aperti ora", String(st.open||0)],
         ["V / P / =", st.wins+" / "+st.losses+" / "+st.ties],
         ["Win rate", st.win_rate_decided!==null&&st.win_rate_decided!==undefined
           ? pct(st.win_rate_decided) : "—"],
         ["IC 95%", st.win_rate_ci95 ? pct(st.win_rate_ci95[0])+" – "+pct(st.win_rate_ci95[1]) : "—"],
         ["Pareggio richiesto", st.breakeven_win_rate!==undefined
           ? pct(st.breakeven_win_rate) : st.payout_status],
-        ["P&L", st.pnl_units!==undefined ? (st.pnl_units>=0?"+":"")+st.pnl_units.toFixed(2)+"u" : "—",
-          st.pnl_units>0?"up":(st.pnl_units<0?"down":"")],
-        ["Drawdown max", st.max_drawdown_units!==undefined ? st.max_drawdown_units.toFixed(2)+"u" : "—"],
-      ]) + (st.above_breakeven===false
+        ["Puntato", mo ? mo.staked.toFixed(2)+" "+cur : "—"],
+        ["P&L reale", mo ? (mo.pnl>=0?"+":"")+mo.pnl.toFixed(2)+" "+cur
+          + (mo.roi_pct!==null ? " ("+(mo.roi_pct>=0?"+":"")+mo.roi_pct.toFixed(1)+"%)" : "")
+          : "—", mo && mo.pnl>0?"up":(mo && mo.pnl<0?"down":"")],
+        ["Drawdown max", mo ? mo.max_drawdown.toFixed(2)+" "+cur
+          : (st.max_drawdown_units!==undefined ? st.max_drawdown_units.toFixed(2)+"u" : "—")],
+      ]) + (st.accounting_ok===false
+        ? '<div class="warn" style="font-size:10.5px;margin-top:8px">i conti non '
+          + 'quadrano: segnali != chiusi + annullati + aperti</div>' : '')
+        + (st.above_breakeven===false
         ? '<div class="muted" style="font-size:10.5px;margin-top:8px">sotto il pareggio '
           + 'del payout: vincere piu\' della meta\' delle volte non basta</div>' : '');
 
@@ -6553,9 +6751,10 @@ class Engine:
             return
         arrow = "^ SU" if sig.direction == UP else "v GIU"
         if event == "signal_created":
-            entry = (f"ingresso fra {sig.entry_delay_ms}ms"
-                     if sig.entry_mode == "DELAY"
-                     else f"trigger {sig.trigger_price:.2f}")
+            entry = {
+                "MARKET": "ingresso a mercato",
+                "DELAY": f"ingresso fra {sig.entry_delay_ms}ms",
+            }.get(sig.entry_mode, f"trigger {sig.trigger_price:.2f}")
             self._log(f"SEGNALE {arrow}  rif {sig.reference_price:.2f}  {entry}  "
                       f"conf {sig.confidence:.0%}")
         elif event == "trade_active":
@@ -6842,6 +7041,18 @@ def cmd_diagnose(cfg: Config, args) -> int:
     print(f"  qualita' dati     : {q.get('score')}")
     for note in q.get("notes", []):
         print(f"                      nota: {note}")
+
+    lc = d.get("lifecycle") or {}
+    if lc:
+        rate = lc.get("cancelled_rate")
+        print(f"  orizzonte         : {lc.get('horizon_s')}s · ingresso "
+              f"{lc.get('entry_mode')} · cooldown {lc.get('cooldown_ms')}ms")
+        print(f"  ciclo di vita     : {lc.get('entered')} entrate · "
+              f"{lc.get('settled')} chiuse · {lc.get('cancelled')} annullate"
+              + (f" ({rate:.0%})" if rate is not None else ""))
+        if rate is not None and rate > 0.15:
+            print("                      ^ troppe: con --entry market non "
+                  "dovrebbero essercene")
 
     gates = d.get("blocking_gates") or []
     if gates:
@@ -7221,7 +7432,10 @@ def cmd_selftest(cfg: Config, args) -> int:
             rows.append([signal, noise])
             ys.append(1 if signal + 0.4 * noise > 0 else 0)
             tss.append(t0 + i * 100)
-        cfg_ml = Config(ml_epochs=12)
+        # Orizzonte esplicito: il dataset e' costruito a 5s, e la purga di
+        # calibrazione vale orizzonte + embargo. Con l'orizzonte del prodotto
+        # (60s) la coda di calibrazione verrebbe purgata via del tutto.
+        cfg_ml = Config(ml_epochs=12, horizon_s=5.0)
         ds = Dataset(rows, ys, tss, [100.0] * len(rows), [100.0] * len(rows),
                      ["signal", "noise"], 5.0)
         report = run_walk_forward(ds, cfg_ml, 3)
@@ -7313,6 +7527,85 @@ def cmd_selftest(cfg: Config, args) -> int:
         return (f"{counters['signals']} segnali, {settled} esiti, "
                 f"{counts['features']} feature, {counts['shadow_decisions']} shadow, "
                 f"replay {replay['trades']} trade")
+
+    # ------------------------------------------ il prodotto da un minuto
+    def t_one_minute() -> str:
+        """I tre difetti segnalati, su un replay a un minuto vero.
+
+        1. arrivano segnali;
+        2. vincite e perdite quadrano - con se stesse, col registro e col saldo;
+        3. le operazioni annullate sono l'eccezione, non la regola.
+        """
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        csv_path = os.path.join(tmp, "m1.csv")
+        rng = random.Random(23)
+        t0 = 1_700_000_000_000
+        price, drift = 100_000.0, 0.0
+        with open(csv_path, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["ts", "price", "quantity", "aggressor"])
+            for i in range(9000):          # 15 minuti a 10 blocchi/s
+                drift = 0.985 * drift + rng.gauss(0, 0.30)
+                price = max(1.0, price + drift * 0.8 + rng.gauss(0, 1.2))
+                price = round(price, 2)
+                for _ in range(rng.randint(3, 10)):
+                    w.writerow([t0 + i * 100, price, 0.05,
+                                "BUY" if rng.random() < 0.5 + 0.15 * math.tanh(drift)
+                                else "SELL"])
+
+        saved_clock = _clock
+        try:
+            c = Config(source="csv", csv_path=csv_path, strategy="ensemble",
+                       db_path=os.path.join(tmp, "m1.db"), payout=0.8,
+                       http_port=0, quiet=True, auto_retrain=False,
+                       min_warmup_s=90.0, wallet_start=500.0,
+                       stake_amount=10.0, feature_interval_ms=100)
+            assert c.horizon_s == 60.0, f"orizzonte di default: {c.horizon_s}"
+            assert c.entry_mode == "market", "ingresso di default"
+            engine = Engine(c)
+            engine.run()
+            counters = dict(engine.signals.counters)
+            wallet = engine.signals.wallet
+            balance, closed = wallet.balance, wallet.closed
+            store = Store(c)
+            trades = store.paper_trades()
+            ledger = store.ledger(limit=10_000)
+            rep = summarise(trades, c.payout, c.stake)
+            store.stop()
+        finally:
+            set_clock(saved_clock)
+
+        # 1. i segnali arrivano
+        assert counters["signals"] >= 5, f"pochi segnali: {counters}"
+        assert rep["decided"] >= 5, f"pochi esiti decisi: {rep}"
+
+        # 2. la contabilita' quadra su tutti e tre i piani
+        assert rep["accounting_ok"], f"i conti non tornano: {rep}"
+        assert rep["wins"] + rep["losses"] + rep["ties"] == rep["settled"]
+        trade_rows = [r for r in ledger if r["kind"] == "TRADE"]
+        assert len(trade_rows) == rep["settled"], (
+            f"registro {len(trade_rows)} righe contro {rep['settled']} esiti: "
+            "un'operazione annullata non deve finire nel registro")
+        assert closed == rep["settled"], (
+            f"il portafoglio conta {closed} operazioni contro {rep['settled']}")
+        expected = round(500.0 + rep["money"]["pnl"], 2)
+        assert abs(balance - expected) < 0.01, (
+            f"saldo {balance} contro {expected} ricavato dalle operazioni")
+        assert abs(wallet.exposure) < 0.01, f"esposizione residua {wallet.exposure}"
+
+        # 3. le operazioni annullate sono l'eccezione. L'unica ammessa e' quella
+        #    ancora aperta quando il replay finisce: non e' un difetto, e'
+        #    l'archivio che si esaurisce.
+        assert counters["cancelled"] <= 1, f"troppe annullate: {counters}"
+        assert all(t["entry_mode"] == "MARKET" for t in trades), \
+            "l'ingresso a mercato non e' stato usato"
+        assert all(t["entry_price"] for t in trades
+                   if t["result"] != CANCELLED), "esito senza prezzo d'ingresso"
+        return (f"{counters['signals']} segnali, {rep['wins']}V/{rep['losses']}S/"
+                f"{rep['ties']}P, {counters['cancelled']} annullate "
+                f"({rep['cancelled_rate']:.0%}), saldo {balance:.2f} = "
+                f"registro ({len(trade_rows)} righe)")
 
     # ----------------------------------------------------- grafico e API
     def t_ui() -> str:
@@ -7476,6 +7769,7 @@ def cmd_selftest(cfg: Config, args) -> int:
     check("apprendimento (walk-forward, calibrazione, OOD)", t_learning)
     check("statistica", t_stats)
     check("motore end-to-end", t_engine)
+    check("prodotto a 1 minuto (segnali, conti, annullate)", t_one_minute)
 
     print(f"\nAURUM ENGINE {VERSION} - selftest\n")
     failed = 0
@@ -7511,12 +7805,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="aurum_engine.py",
         description=f"AURUM ENGINE {VERSION} - motore completo, un file solo, "
-                    f"solo carta.",
+                    f"solo carta. Default: operazioni da 1 minuto, ingresso a "
+                    f"mercato, portafoglio da 500 con puntate da 10.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""esempi:
   %(prog)s check                          il venue e' raggiungibile?
-  %(prog)s run                            live su Binance, dashboard su :8000
-  %(prog)s run --strategy burst15 --payout 0.8
+  %(prog)s run --payout 0.8               OPERAZIONI DA 1 MINUTO (default),
+                                          live su Binance, dashboard su :8000
+  %(prog)s run --strategy burst15 --payout 0.8   variante a 5 secondi
+  %(prog)s run --entry trigger            ingresso al tocco (puo' annullarsi)
   %(prog)s run --source sim               simulatore, senza rete
   %(prog)s run --source csv --csv trades.csv
   %(prog)s run --proxy http://127.0.0.1:3128
@@ -7538,6 +7835,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--payout", type=float,
                    help="payout del broker, es. 0.8. Senza, nessun P&L monetario")
     p.add_argument("--stake", type=float)
+    p.add_argument("--entry", choices=["market", "trigger"],
+                   help="market = ingresso subito (mai annullato); "
+                        "trigger = solo se il prezzo tocca un livello")
+    p.add_argument("--cooldown", type=float,
+                   help="pausa fra un segnale e il successivo, in secondi")
     p.add_argument("--capital", type=float, help="capitale iniziale del portafoglio")
     p.add_argument("--currency", help="valuta mostrata, es. EUR")
     p.add_argument("--stake-mode", choices=["fixed", "percent"],
@@ -7583,11 +7885,15 @@ def apply_args(cfg: Config, args) -> Config:
         if value is not None:
             setattr(cfg, name, value)
     if args.horizon is not None:
-        cfg.horizon_s = args.horizon
+        cfg.set_explicit("horizon_s", args.horizon)
     if args.payout is not None:
         cfg.payout = args.payout
     if args.stake is not None:
         cfg.stake = args.stake
+    if getattr(args, "entry", None):
+        cfg.entry_mode = args.entry
+    if getattr(args, "cooldown", None) is not None:
+        cfg.set_explicit("cooldown_ms", int(args.cooldown * 1000))
     for attr, name in (("capital", "wallet_start"), ("currency", "wallet_currency"),
                        ("stake_mode", "stake_mode"), ("stake_amount", "stake_amount"),
                        ("stake_percent", "stake_percent"),
@@ -7599,7 +7905,7 @@ def apply_args(cfg: Config, args) -> Config:
     if args.port is not None:
         cfg.http_port = args.port
     if args.warmup is not None:
-        cfg.min_warmup_s = args.warmup
+        cfg.set_explicit("min_warmup_s", args.warmup)
     if args.n5 is not None:
         cfg.burst_n5_min = args.n5
     if args.r10 is not None:

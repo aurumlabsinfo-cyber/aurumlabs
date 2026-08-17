@@ -44,9 +44,21 @@ senza `pip install`, tutto il motore sta anche in un file solo:
 ```bash
 python3 aurum_engine.py selftest        # verifica il file su se stesso
 python3 aurum_engine.py check           # il venue e' raggiungibile?
-python3 aurum_engine.py run --strategy burst15 --payout 0.8
+python3 aurum_engine.py run --payout 0.8   # OPERAZIONI DA 1 MINUTO
 open http://localhost:8000              # dashboard
 ```
+
+Il default e' il **prodotto da un minuto**: orizzonte 60s, ingresso a mercato,
+portafoglio da 500 EUR con puntate da 10. Le finestre che dipendono
+dall'orizzonte (attesa, cooldown, volatilita', riscaldamento, minimo di righe
+per l'apprendimento) si ricavano dall'orizzonte, quindi cambiarlo con
+`--horizon` cambia davvero tutta la macchina, non solo la scadenza.
+
+**Ingresso a mercato, non al tocco.** Si entra al prezzo su cui e' stata presa
+la decisione, subito: non c'e' una finestra d'attesa da mancare, quindi non c'e'
+operazione da annullare. Il vecchio ingresso al tocco resta disponibile con
+`--entry trigger`, ma su un minuto costava piu' operazioni annullate di quanto
+rendesse. `diagnose` mostra la quota di annullate e avvisa se supera il 15%.
 
 Solo libreria standard di Python (3.9+). Il database e' **SQLite**
 (`aurum.db`), il client WebSocket e il server HTTP sono scritti dentro il file,
@@ -65,7 +77,7 @@ attivazione solo se il verdetto regge.
 | `diagnose` | perche' non arrivano segnali, in italiano, senza browser |
 | `mercato` | quante finestre finiscono dove sono partite, orizzonte per orizzonte |
 | `wallet` | saldo, cicli, regole di puntata e registro di cassa |
-| `selftest` | 11 verifiche interne, nessuna rete richiesta |
+| `selftest` | 12 verifiche interne, nessuna rete richiesta |
 
 La dashboard su `:8000` e' servita dallo stesso file: **portafoglio** con saldo,
 puntata, curva del capitale e ciclo in corso; grafico a candele sempre in vista

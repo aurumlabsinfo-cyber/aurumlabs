@@ -194,9 +194,10 @@ PostgreSQL, client WebSocket e server HTTP scritti dentro il file, e
 l'apprendimento come regressione logistica implementata a mano.
 
 ```bash
-python3 aurum_engine.py selftest                      # 9 verifiche interne
+python3 aurum_engine.py selftest                      # 12 verifiche interne
 python3 aurum_engine.py check                         # il venue risponde?
-python3 aurum_engine.py run --strategy burst15 --payout 0.8
+python3 aurum_engine.py run --payout 0.8              # 1 MINUTO (default)
+python3 aurum_engine.py run --strategy burst15 --payout 0.8   # 5 secondi
 python3 aurum_engine.py run --source sim              # senza rete
 python3 aurum_engine.py run --source csv --csv trades.csv
 python3 aurum_engine.py backtest                      # walk-forward
@@ -266,7 +267,7 @@ niente.** Il capitale del ciclo bruciato e' perso. Quello che i cicli danno e'
 una misura onesta - quanti se ne bruciano, quanto durano, se durano di piu' man
 mano che il motore impara - non una seconda possibilita' sulla stessa puntata.
 
-Verificato: `selftest` supera 11/11 (portafoglio con azzeramento, studio e
+Verificato: `selftest` supera 12/12 (portafoglio con azzeramento, studio e
 ciclo nuovo, aggregazione OHLC e API della dashboard,
 framing WebSocket con frammentazione e ping, sequenza dell'order book, feature,
 regole di BURST-15, coerenza delle soglie, database, apprendimento con
@@ -280,6 +281,119 @@ valida walk-forward, calibra su una coda separata e attiva il modello.
 Non c'e' dentro: la ricerca di strategie con correzione per test multipli,
 l'importatore dell'archivio Binance, i modelli ad alberi e il frontend Next.js.
 Quelli restano nel progetto completo.
+
+---
+
+## 4-bis. Il prodotto da un minuto: tre difetti, tre correzioni
+
+Segnalati tre problemi sulle versioni a 5 secondi e a 1 minuto: **non arrivano i
+segnali**, **vincite e perdite non tornano**, **troppe operazioni annullate**.
+Sono tre difetti distinti con tre cause distinte.
+
+### a. Troppe operazioni annullate
+
+Un segnale nasceva come ordine *al tocco*: veniva fissato un livello di trigger
+e, se il prezzo non lo toccava entro una finestra d'attesa, l'operazione era
+**annullata**. Tre cose non tornavano.
+
+* Il trigger era dimensionato sulla volatilita' dell'**orizzonte** (60s) ma
+  doveva essere raggiunto entro la finestra d'**attesa**: due finestre diverse,
+  una per la misura e una per la scadenza.
+* La finestra d'attesa era fissa a 30 secondi e il cooldown a 3: meta'
+  dell'orizzonte a un minuto, **sei volte** l'orizzonte a cinque secondi. Sono
+  tempi che devono vivere sulla scala dell'orizzonte, e ora si ricavano da lui
+  (`wait_timeout_s = orizzonte/2`, `cooldown = orizzonte/4`), inclusi i casi in
+  cui `--horizon` viene applicato dopo la costruzione della configurazione.
+* Soprattutto: su un minuto il trigger costava piu' di quanto rendesse.
+
+Il default e' ora l'**ingresso a mercato**: si entra al prezzo su cui e' stata
+presa la decisione, subito. Non c'e' finestra da mancare, quindi non c'e' niente
+da annullare. `--entry trigger` riporta il comportamento di prima.
+
+Misurato su un replay da 60 minuti a orizzonte 60s: stesso archivio, stessa
+configurazione, cambia solo `--entry`.
+
+| | `--entry trigger` | `--entry market` (default) |
+|---|---|---|
+| segnali emessi | 60 | 57 |
+| entrate a mercato | 43 | 57 |
+| annullate | 17 (**28,3%**) | 1 (**1,8%**) |
+
+Con il trigger, quasi una decisione su tre non diventava mai un'operazione: il
+motore aveva deciso, aveva impegnato la puntata, e poi il prezzo non passava dal
+livello. L'unica annullata rimasta con l'ingresso a mercato e' l'operazione
+ancora aperta quando l'archivio finisce - non e' un difetto, e' il replay che si
+esaurisce.
+
+### b. Vincite e perdite che non tornano
+
+C'erano **due contabilita' che si contraddicevano a schermo**.
+
+* Un'operazione **annullata** passava comunque da `Wallet.settle()`: scriveva una
+  riga di registro da zero euro e incrementava il contatore delle operazioni.
+  Il portafoglio contava percio' operazioni che non erano mai entrate a mercato,
+  e il suo totale non combaciava con vincite + perdite + pareggi.
+  Ora un segnale annullato **rilascia** la puntata e basta: nessuna riga di
+  registro, nessun conteggio, perche' non e' successo niente.
+* Il riquadro delle statistiche mostrava il P&L in *unita' di puntata* (con
+  `stake` = 1) mentre il portafoglio lo mostrava in euro (puntata 10): due
+  numeri diversi per la stessa cosa, uno accanto all'altro. Ora il denaro viene
+  **sommato dalle righe delle operazioni** - la puntata vera di quella
+  operazione, l'esito vero in euro - quindi e' per costruzione lo stesso numero
+  che mostra il portafoglio.
+
+Le statistiche espongono anche `accounting_ok`: segnali = chiusi + annullati +
+aperti, e chiusi = vincite + perdite + pareggi. Se non torna, la dashboard lo
+dice invece di mostrare numeri che non si sommano.
+
+Verificato sul replay da 60 minuti: 57 segnali = 56 chiusi + 1 annullato + 0
+aperti; 56 righe di registro; saldo 516,00 = 500 + 16 (il P&L sommato dalle
+operazioni); esposizione residua 0; drawdown identico nei due riquadri.
+
+### c. Non arrivano i segnali
+
+Tre cause, oltre alla misura delle finestre ferme gia' corretta al punto 1.
+
+* **Un feed senza book bloccava tutto.** Il cancello del book chiedeva un
+  order book sincronizzato *anche a sorgenti che il book non lo mandano affatto*
+  (il replay da CSV). Risultato: 15.000 finestre valutate, 15.000 NO TRADE,
+  **zero segnali**, e nessun modo di validare la strategia offline. Ora la
+  distinzione e' esplicita: «il book c'e' ed e' rotto» blocca, «il feed non manda
+  il book» fa astenere gli agenti che ne hanno bisogno e lascia decidere gli
+  altri.
+* **L'orizzonte di default era 5 secondi.** Ora e' 60 per l'ensemble - il
+  prodotto richiesto - e resta 5 per BURST-15, che a un minuto non sarebbe piu'
+  se stessa. Con l'orizzonte si muovono anche buffer, finestra di volatilita',
+  riscaldamento, attesa, cooldown ed embargo.
+* **Il riscaldamento finiva prima che i cancelli avessero dati.** La sigma
+  dell'orizzonte si misura su finestre lunghe un orizzonte: con 60 secondi di
+  riscaldamento e una finestra di volatilita' di 180, «movimento atteso» e
+  «finestre piatte» restavano non misurabili per due minuti. Ora il
+  riscaldamento dura quanto la finestra di volatilita', cosi' quando finisce
+  quei numeri esistono davvero.
+
+Sul replay da 60 minuti con i default di produzione: **57 segnali**, uno al
+minuto circa, con il cancello dominante che e' «massimo di segnali
+contemporanei» - cioe' c'e' gia' un'operazione aperta. E' il profilo di un
+motore che opera, non di uno fermo.
+
+### d. E l'apprendimento, a un minuto
+
+La calibrazione tiene da parte l'ultimo 20% delle righe e ne butta via orizzonte
++ embargo per la purga. A 60 secondi la purga vale 1.800 righe: con il minimo di
+5.000 righe di prima la coda restava **vuota**, e il modello usciva sempre *non
+calibrato* - cioe' pesato meno nella decisione, per sempre. Il minimo ora si
+ricava dalla stessa aritmetica (12.500 righe a un minuto) e il primo tentativo
+di studio viene programmato quando quelle righe ci sono davvero.
+
+### Cosa NON dicono questi numeri
+
+Le misure qui sopra sono state fatte su **dati generati da un modello**, non su
+mercato. Dicono che la macchina emette, entra, chiude e conta correttamente.
+**Non** dicono che vince: sullo stesso replay il win rate e' 57% con intervallo
+di confidenza 44%-69% e p-value 0,35 contro il lancio di una moneta, cioe'
+esattamente cio' che ci si aspetta dal caso. Il vantaggio, se c'e', si misura
+sui tuoi dati reali con `backtest` e `shadow`.
 
 ---
 
