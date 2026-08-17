@@ -141,6 +141,13 @@ class Config:
     min_data_quality: float = 0.75
     min_warmup_s: float = 60.0
     max_zero_move_fraction: float = 0.35
+    #: Quanto puo' muoversi il prezzo e contare comunque come "fermo".
+    #: DEVE combaciare con il regolamento: il motore chiama PAREGGIO solo se
+    #: uscita == ingresso, quindi qui zero. Con mezzo tick (il valore di prima)
+    #: ogni movimento di un tick su un solo lato del book - il caso piu' comune
+    #: su BTCUSDT, dove lo spread e' quasi sempre un tick - veniva contato come
+    #: finestra ferma, e il cancello bloccava mercati che si stavano muovendo.
+    zero_move_tolerance: float = 0.0
     min_expected_move_ticks: float = 2.0
     min_l1_notional: float = 500.0
 
@@ -2365,7 +2372,7 @@ class FeatureEngine:
         lookback = int(cfg.volatility_window_s * 1000)
         f["sigma_horizon_bps"] = self.mid.sigma_over(cfg.horizon_ms, lookback)
         f["zero_move_fraction"] = self.mid.zero_move_fraction(
-            cfg.horizon_ms, lookback, tolerance=cfg.tick_size / 2.0
+            cfg.horizon_ms, lookback, tolerance=cfg.zero_move_tolerance
         )
         f["expected_move_ticks"] = (
             f["sigma_horizon_bps"] / 10_000.0 * tick.mid / cfg.tick_size
@@ -6706,6 +6713,101 @@ def _open_existing(cfg: Config) -> Store:
     return Store(cfg)
 
 
+def cmd_market(cfg: Config, args) -> int:
+    """Il TUO mercato e' negoziabile su questo orizzonte? Misurato, non assunto.
+
+    Prende i tick che il motore ha registrato e, per ogni orizzonte, conta
+    quante finestre finiscono esattamente dove sono partite - che su
+    un'opzione binaria e' il fatto economico dominante. Lo calcola con la
+    regola del motore (pareggio = uscita uguale a ingresso) e, per confronto,
+    con la vecchia tolleranza di mezzo tick.
+    """
+    store = _open_existing(cfg)
+    conn = store.reader()
+    try:
+        rows = conn.execute(
+            "SELECT ts, mid FROM market_ticks ORDER BY ts ASC"
+        ).fetchall()
+        trades = conn.execute("SELECT COUNT(*), MIN(ts), MAX(ts) FROM trades").fetchone()
+    finally:
+        conn.close()
+    store.stop()
+
+    if len(rows) < 100:
+        print(f"Solo {len(rows)} tick registrati: troppo pochi per misurare "
+              f"qualcosa. Lascia girare il motore.")
+        return 1
+
+    tick_ts = [r["ts"] for r in rows]
+    tick_mid = [r["mid"] for r in rows]
+    span_min = (tick_ts[-1] - tick_ts[0]) / 60000.0
+
+    def at(t: int) -> float | None:
+        i = bisect.bisect_right(tick_ts, t) - 1
+        return tick_mid[i] if i >= 0 else None
+
+    print(f"AURUM ENGINE - il mercato di {cfg.symbol}\n")
+    print(f"  registrati {len(rows):,} tick su {span_min:.1f} minuti"
+          .replace(",", "."))
+    if trades and trades[0]:
+        secs = max((trades[2] - trades[1]) / 1000.0, 1e-9)
+        print(f"  {trades[0]:,} scambi, {trades[0] / secs:.1f} al secondo"
+              .replace(",", "."))
+    print(f"\n  {'orizzonte':>10}  {'ferme':>7}  {'ferme':>9}  {'movimento':>10}"
+          f"  {'oltre 1':>8}")
+    print(f"  {'':>10}  {'(regola)':>7}  {'(mezzo tick)':>9}  {'mediano':>10}"
+          f"  {'tick':>8}")
+
+    limit = cfg.max_zero_move_fraction
+    best = None
+    for horizon in (5, 10, 15, 30, 60, 300):
+        h_ms = horizon * 1000
+        step = max(h_ms // 10, 100)
+        flat_exact = flat_half = total = big = 0
+        moves: list[float] = []
+        t = tick_ts[0] + h_ms
+        while t <= tick_ts[-1]:
+            a, b = at(t - h_ms), at(t)
+            if a is not None and b is not None and a > 0:
+                total += 1
+                delta = abs(b - a)
+                if delta == 0:
+                    flat_exact += 1
+                if delta <= cfg.tick_size / 2.0:
+                    flat_half += 1
+                if delta >= cfg.tick_size:
+                    big += 1
+                moves.append(delta / a * 10_000.0)
+            t += step
+        if total < 10:
+            continue
+        fe, fh = flat_exact / total, flat_half / total
+        med = percentile(moves, 0.5) or 0.0
+        mark = ""
+        if fe <= limit and best is None:
+            best = horizon
+            mark = "  <- primo che passa il cancello"
+        print(f"  {horizon:>9}s  {fe:>6.1%}  {fh:>9.1%}  {med:>9.3f}bps"
+              f"  {big / total:>7.1%}{mark}")
+
+    print(f"\n  Il cancello blocca sopra il {limit:.0%} di finestre ferme.")
+    if best is None:
+        print("  Nessun orizzonte fra quelli provati sta sotto la soglia: su questi")
+        print("  dati il mercato e' fermo troppo spesso perche' una binaria abbia")
+        print("  senso. Non e' un difetto del motore, e' il mercato.")
+    elif best > cfg.horizon_s:
+        print(f"  Il tuo orizzonte e' {cfg.horizon_s:g}s. Il primo che passa e'")
+        print(f"  {best}s: prova `run --horizon {best}`. Allungare l'orizzonte non")
+        print("  e' allentare un filtro, e' scegliere una scala su cui la cosa che")
+        print("  scommetti succede davvero.")
+    else:
+        print(f"  Il tuo orizzonte ({cfg.horizon_s:g}s) passa il cancello.")
+    print("\n  La colonna 'mezzo tick' e' come veniva misurato prima: su BTCUSDT,")
+    print("  dove lo spread e' quasi sempre un tick, contava come ferma ogni")
+    print("  finestra che si muoveva di un tick da un solo lato del book.")
+    return 0
+
+
 def cmd_diagnose(cfg: Config, args) -> int:
     """Perche' non arrivano segnali - in italiano, senza browser ne' curl.
 
@@ -6758,6 +6860,14 @@ def cmd_diagnose(cfg: Config, args) -> int:
                               "tranquilla non li trova. Guarda 'trade/s' sulla "
                               "dashboard e, se il mercato e' davvero cosi', abbassa "
                               "--n5 a quel valore."),
+        ("movimento atteso troppo piccolo",
+         "Il mercato e' fermo piu' spesso del limite su questo orizzonte. "
+         "Lancia `mercato`: misura sui TUOI tick quante finestre finiscono dove "
+         "sono partite, orizzonte per orizzonte, e ti dice il primo che passa. "
+         "Quasi sempre la risposta e' allungare l'orizzonte, non abbassare la "
+         "soglia."),
+        ("non ha avuto alcun movimento",
+         "Stessa cosa: troppe finestre piatte. `mercato` te lo quantifica."),
         ("movimento", "Il mercato si muove meno della soglia. --r10 piu' basso, ma "
                       "prima guarda `shadow`: le finestre scartate avrebbero vinto?"),
         ("flusso discorde", "Il flusso non conferma il movimento. Si puo' togliere "
@@ -7053,7 +7163,24 @@ def cmd_selftest(cfg: Config, args) -> int:
             "soglia allentata ignorata dall'agente"
         strict = VolatilityAgent(Config(min_expected_move_ticks=5.0))
         assert not strict.evaluate(ctx).extra["tradable"], "soglia stretta ignorata"
-        return "soglie coerenti e lette dagli agenti"
+
+        # La misura delle "finestre ferme" deve combaciare con il regolamento:
+        # il motore chiama PAREGGIO solo se uscita == ingresso. Con mezzo tick
+        # di tolleranza, un movimento di un tick su un solo lato del book -
+        # il caso piu' comune su BTCUSDT - veniva contato come mercato fermo.
+        assert Config().zero_move_tolerance == 0.0, "tolleranza di default"
+        series = TimeSeries(300_000)
+        t0, mid = 1_700_000_000_000, 100_000.005
+        for i in range(900):
+            if i and i % 50 == 0:
+                mid = round(mid + 0.005, 3)     # mezzo tick ogni 5 secondi
+            series.append(t0 + i * 100, mid)
+        con_regola = series.zero_move_fraction(5000, 30_000, tolerance=0.0)
+        con_mezzo = series.zero_move_fraction(5000, 30_000, tolerance=0.005)
+        assert con_regola == 0.0, f"serie in movimento data per ferma: {con_regola}"
+        assert con_mezzo > 0.3, f"la vecchia tolleranza doveva sbagliare: {con_mezzo}"
+        return (f"soglie lette dagli agenti; finestre ferme {con_regola:.0%} con la "
+                f"regola del motore contro {con_mezzo:.0%} con mezzo tick")
 
     # ---------------------------------------------------------------- database
     def t_db() -> str:
@@ -7373,6 +7500,7 @@ COMMANDS: dict[str, Callable[[Config, Any], int]] = {
     "burst-grid": cmd_burst_grid,
     "shadow": cmd_shadow,
     "diagnose": cmd_diagnose,
+    "mercato": cmd_market,
     "wallet": cmd_wallet,
     "config": cmd_config,
     "selftest": cmd_selftest,
@@ -7393,6 +7521,7 @@ def build_parser() -> argparse.ArgumentParser:
   %(prog)s run --source csv --csv trades.csv
   %(prog)s run --proxy http://127.0.0.1:3128
   %(prog)s diagnose                       perche' non arrivano segnali
+  %(prog)s mercato                        il mercato si muove abbastanza?
   %(prog)s wallet                         saldo, cicli e registro di cassa
   %(prog)s run --capital 500 --stake-amount 10
   %(prog)s stats                          statistiche del paper trading

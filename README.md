@@ -63,6 +63,7 @@ attivazione solo se il verdetto regge.
 | `burst` / `burst-grid` | replay di BURST-15, sessioni incluse, e la griglia di soglie |
 | `shadow` | anche le finestre che NON sono state tradate |
 | `diagnose` | perche' non arrivano segnali, in italiano, senza browser |
+| `mercato` | quante finestre finiscono dove sono partite, orizzonte per orizzonte |
 | `wallet` | saldo, cicli, regole di puntata e registro di cassa |
 | `selftest` | 11 verifiche interne, nessuna rete richiesta |
 
