@@ -42,11 +42,18 @@ Se vuoi solo farlo girare sulla tua macchina senza Docker, senza PostgreSQL e
 senza `pip install`, tutto il motore sta anche in un file solo:
 
 ```bash
+python3 aurum_engine.py config | head -3   # quale versione sto eseguendo?
 python3 aurum_engine.py selftest        # verifica il file su se stesso
 python3 aurum_engine.py check           # il venue e' raggiungibile?
 python3 aurum_engine.py run --payout 0.8   # OPERAZIONI DA 1 MINUTO
 open http://localhost:8002              # dashboard
 ```
+
+`config` stampa la versione come prima riga: e' la domanda che viene per prima
+quando qualcosa non torna. Se vedi `"horizon_s": 5.0` o `"http_port": 8000`
+stai eseguendo una **copia vecchia**, non una configurazione sbagliata. Se la
+porta e' occupata il motore ripiega sulla prima libera e dice quale;
+`diagnose` la cerca da solo.
 
 Il default e' il **prodotto da un minuto**: orizzonte 60s, ingresso a mercato,
 portafoglio da 500 EUR con puntate da 10. Le finestre che dipendono

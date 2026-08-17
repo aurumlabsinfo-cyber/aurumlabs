@@ -69,7 +69,7 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable, Iterator
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # --------------------------------------------------------------------------- #
 #  OROLOGIO
@@ -6627,13 +6627,29 @@ class Engine:
         self.store.start()
         self._running = True
         if self.cfg.http_port:
-            try:
-                self.http = make_http_server(self)
+            # Se la porta e' occupata si prova la successiva invece di partire
+            # senza dashboard: un motore che gira e non si puo' guardare e'
+            # peggio di uno che ti dice su quale porta lo trovi.
+            wanted = self.cfg.http_port
+            last: OSError | None = None
+            for port in range(wanted, wanted + 10):
+                self.cfg.http_port = port
+                try:
+                    self.http = make_http_server(self)
+                except OSError as exc:
+                    last = exc
+                    continue
                 threading.Thread(target=self.http.serve_forever,
                                  name="http", daemon=True).start()
-                self._log(f"dashboard su http://{self.cfg.http_host}:{self.cfg.http_port}")
-            except OSError as exc:
-                self._log(f"porta {self.cfg.http_port} non disponibile: {exc}")
+                if port != wanted:
+                    self._log(f"porta {wanted} occupata: uso la {port}")
+                self._log(f"dashboard su http://{self.cfg.http_host}:{port}")
+                break
+            else:
+                self.cfg.http_port = wanted
+                self._log(f"nessuna porta libera fra {wanted} e {wanted + 9}: "
+                          f"{last}. Il motore gira, ma senza dashboard. "
+                          f"Riparti con --port 9000.")
         self.retrainer.start()
 
     def stop(self) -> None:
@@ -7013,15 +7029,31 @@ def cmd_diagnose(cfg: Config, args) -> int:
     Interroga il motore in esecuzione e traduce la diagnostica in una risposta
     leggibile, con il consiglio giusto per il cancello che sta bloccando.
     """
+    # Se la porta non e' stata scelta a mano si cercano anche le successive:
+    # il motore ripiega sulla prima libera quando la sua e' occupata, e qui
+    # bisogna trovarlo dove e' finito davvero.
+    ports = ([cfg.http_port] if getattr(args, "port", None) is not None
+             else list(range(cfg.http_port, cfg.http_port + 10)))
+    d = None
     url = f"http://{cfg.http_host}:{cfg.http_port}/diagnostics"
-    try:
-        d = http_get_json(url, None, timeout=5)
-    except Exception as exc:  # noqa: BLE001 - e' un diagnostico
-        print(f"Non riesco a parlare con il motore su {url}")
-        print(f"  {type(exc).__name__}: {exc}\n")
+    last: Exception | None = None
+    for port in ports:
+        url = f"http://{cfg.http_host}:{port}/diagnostics"
+        try:
+            d = http_get_json(url, None, timeout=5)
+            break
+        except Exception as exc:  # noqa: BLE001 - e' un diagnostico
+            last = exc
+    if d is None:
+        where = (f"su {url}" if len(ports) == 1
+                 else f"su nessuna porta fra {ports[0]} e {ports[-1]}")
+        print(f"Non riesco a parlare con il motore {where}")
+        print(f"  {type(last).__name__}: {last}\n")
         print("  Il motore e' in esecuzione? Deve girare in un altro terminale con")
         print("  la dashboard attiva (senza --port 0). Se usi una porta diversa,")
         print("  passala anche qui: --port 8123")
+        print(f"\n  E controlla di avere questa versione: `python3 {os.path.basename(sys.argv[0])} "
+              f"config` deve\n  stampare \"version\": \"{VERSION}\".")
         return 1
 
     feed = d.get("feed", {})
@@ -7186,7 +7218,15 @@ def cmd_shadow(cfg: Config, args) -> int:
 
 
 def cmd_config(cfg: Config, args) -> int:
-    print(json.dumps(cfg.to_dict(), indent=2, ensure_ascii=False, default=str))
+    """La configurazione RISOLTA, con la versione del file in cima.
+
+    La versione sta qui perche' e' la domanda che viene per prima quando
+    qualcosa non torna: sto guardando il file che credo di guardare? Un
+    orizzonte a 5 secondi o una porta 8000 in questo elenco vogliono dire che
+    stai eseguendo una copia vecchia, non che la configurazione e' sbagliata.
+    """
+    print(json.dumps({"version": VERSION, **cfg.to_dict()},
+                     indent=2, ensure_ascii=False, default=str))
     return 0
 
 
