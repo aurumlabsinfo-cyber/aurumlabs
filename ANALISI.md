@@ -207,14 +207,38 @@ python3 aurum_engine.py shadow                        # finestre non tradate
 Contiene tutto quanto sopra: gli 8 agenti con i cancelli corretti, BURST-15 con
 la sessione, l'order book sequenziato, ~50 feature causali, il paper trading
 con trigger e countdown lato motore, la diagnostica dei cancelli, il
-riaddestramento automatico con calibrazione, statistiche e calibrazione,
-dashboard su `http://localhost:8000`, e il supporto proxy su REST **e**
-WebSocket.
+riaddestramento automatico con calibrazione, statistiche e calibrazione, e il
+supporto proxy su REST **e** WebSocket.
 
-Verificato: `selftest` supera 9/9 (framing WebSocket con frammentazione e ping,
-sequenza dell'order book, feature, regole di BURST-15, coerenza delle soglie,
-database, apprendimento con calibrazione e guardia OOD, statistica, motore
-end-to-end). Su 30 minuti di dati replayati: 18.000 righe di feature, 80 trade
+### La dashboard
+
+Su `http://localhost:8000`, servita dallo stesso file, senza librerie esterne:
+
+* **grafico a candele sempre in vista**, con intervallo selezionabile fra
+  5s, 15s, 1m, 5m, 10m e 30m. I tagli corti ci sono perche' il motore opera su
+  cinque secondi: su una candela da 30 minuti una sua operazione e' invisibile.
+  Le barre sono aggregate dagli stessi tick che il motore ha consumato, non da
+  un secondo feed che potrebbe raccontare un'altra storia;
+* **le operazioni disegnate sul grafico**: triangolo all'ingresso, pallino
+  all'uscita, linea fra i due, colorata per esito;
+* **segnale corrente** con countdown guidato dal motore, e quando non c'e'
+  segnale il riquadro dice quali cancelli stanno bloccando e da quanto;
+* **cosa analizza**: gli otto agenti con direzione, motivo e confidenza, oppure
+  le tre condizioni di BURST-15 con il valore corrente contro la soglia; sotto,
+  dieci indicatori di microstruttura (spread, flusso, profondita', volatilita',
+  movimento atteso, finestre piatte, intensita' della tape);
+* **storico operazioni** completo: ora, direzione, ingresso, uscita, variazione
+  in bps, esito, P&L, durata, confidenza;
+* sessione BURST-15, performance con intervallo di confidenza e pareggio
+  richiesto, stato dell'apprendimento e salute del sistema.
+
+Verificato: `selftest` supera 10/10 (aggregazione OHLC e API della dashboard,
+framing WebSocket con frammentazione e ping, sequenza dell'order book, feature,
+regole di BURST-15, coerenza delle soglie, database, apprendimento con
+calibrazione e guardia OOD, statistica, motore end-to-end). L'interfaccia e'
+stata anche aperta in un browser vero (Chromium headless) in entrambe le
+strategie: nessun errore JavaScript, grafico disegnato, marker allineati alle
+candele. Su 30 minuti di dati replayati: 18.000 righe di feature, 80 trade
 su carta, 1.800 finestre shadow, e il ciclo di apprendimento che addestra,
 valida walk-forward, calibra su una coda separata e attiva il modello.
 

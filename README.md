@@ -62,7 +62,14 @@ attivazione solo se il verdetto regge.
 | `backtest` | walk-forward su cio' che ha registrato |
 | `burst` / `burst-grid` | replay di BURST-15, sessioni incluse, e la griglia di soglie |
 | `shadow` | anche le finestre che NON sono state tradate |
-| `selftest` | 9 verifiche interne, nessuna rete richiesta |
+| `selftest` | 10 verifiche interne, nessuna rete richiesta |
+
+La dashboard su `:8000` e' servita dallo stesso file: grafico a candele
+sempre in vista (5s / 15s / 1m / 5m / 10m / 30m) con le operazioni disegnate
+sopra, il segnale corrente con il countdown, la diagnostica dei cancelli, cosa
+sta analizzando il motore in questo momento (gli otto agenti oppure le tre
+condizioni di BURST-15, piu' la microstruttura), la sessione, le statistiche,
+l'apprendimento, la salute e lo storico completo delle operazioni.
 
 Cosa resta solo nel progetto completo: la ricerca di strategie con correzione
 per test multipli, l'importatore dell'archivio storico Binance, i modelli ad

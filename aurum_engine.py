@@ -589,6 +589,76 @@ class Store:
             )
             self._conn.commit()
 
+    def candles(self, interval_s: int, limit: int = 240,
+                include_synthetic: bool = True) -> list[dict]:
+        """Barre OHLC aggregate dai tick registrati.
+
+        Il grafico dev'essere la STESSA serie che il motore ha consumato, non un
+        secondo feed che potrebbe raccontare qualcos'altro. L'aggregazione e'
+        fatta in SQL su tre GROUP BY indicizzati (apertura, chiusura, e
+        massimo/minimo/conteggio): SQLite garantisce che, in una query con
+        min()/max(), le colonne "nude" vengano dalla riga che ha prodotto quel
+        minimo o massimo - ed e' cosi' che si ottengono apertura e chiusura
+        senza window function e senza scaricare tutti i tick in memoria.
+        """
+        ms = max(1, int(interval_s)) * 1000
+        conn = self.reader()
+        try:
+            where = "" if include_synthetic else " WHERE is_synthetic = 0"
+            row = conn.execute(f"SELECT MAX(ts) AS m FROM market_ticks{where}").fetchone()
+            if not row or row["m"] is None:
+                return []
+            end = int(row["m"])
+            start = end - ms * max(1, int(limit))
+            cond = f"WHERE ts >= {start}" + ("" if include_synthetic
+                                             else " AND is_synthetic = 0")
+
+            opens = {
+                r["b"]: (r["t0"], r["mid"]) for r in conn.execute(
+                    f"SELECT ts/{ms} AS b, MIN(ts) AS t0, mid FROM market_ticks "
+                    f"{cond} GROUP BY b"
+                )
+            }
+            closes = {
+                r["b"]: r["mid"] for r in conn.execute(
+                    f"SELECT ts/{ms} AS b, MAX(ts) AS t1, mid FROM market_ticks "
+                    f"{cond} GROUP BY b"
+                )
+            }
+            spans = {
+                r["b"]: (r["hi"], r["lo"], r["n"]) for r in conn.execute(
+                    f"SELECT ts/{ms} AS b, MAX(mid) AS hi, MIN(mid) AS lo, "
+                    f"COUNT(*) AS n FROM market_ticks {cond} GROUP BY b"
+                )
+            }
+        finally:
+            conn.close()
+
+        out: list[dict] = []
+        for b in sorted(opens):
+            hi, lo, n = spans.get(b, (None, None, 0))
+            if hi is None:
+                continue
+            out.append({
+                "t": b * ms, "o": opens[b][1], "h": hi, "l": lo,
+                "c": closes.get(b, opens[b][1]), "n": n,
+            })
+        return out[-limit:]
+
+    def trade_markers(self, since_ts: int, limit: int = 200) -> list[dict]:
+        """Ingressi e uscite da sovrapporre al grafico."""
+        conn = self.reader()
+        try:
+            return [dict(r) for r in conn.execute(
+                "SELECT signal_id, direction, entry_price, expiry_price, result,"
+                " triggered_at, settled_at, horizon_s, pnl_units, strategy"
+                " FROM paper_trades WHERE triggered_at IS NOT NULL"
+                " AND triggered_at >= ? ORDER BY triggered_at DESC LIMIT ?",
+                (since_ts, limit),
+            )]
+        finally:
+            conn.close()
+
     def models(self) -> list[dict]:
         conn = self.reader()
         try:
@@ -4806,168 +4876,725 @@ def burst_replay(store: Store, cfg: Config, include_synthetic: bool = True,
 #  DASHBOARD + API HTTP
 # --------------------------------------------------------------------------- #
 
-DASHBOARD_HTML = """<!doctype html>
+DASHBOARD_HTML = r"""<!doctype html>
 <html lang="it"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AURUM ENGINE</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%234c8dff'/><path d='M3 12l3.2-7 3 4.2 1.6-2.4L13 12' stroke='%23081018' stroke-width='1.7' fill='none' stroke-linejoin='round'/></svg>">
 <style>
-:root{--bg:#0b0e13;--panel:#131822;--panel2:#1a2130;--line:#232c3d;--fg:#e8edf6;
---muted:#8a94a8;--up:#22c55e;--down:#ef4444;--warn:#f59e0b;--accent:#60a5fa}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 ui-monospace,
-SFMono-Regular,Menlo,monospace}
-.wrap{max-width:1100px;margin:0 auto;padding:16px}
-.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
-.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}
-.big{font-size:34px;font-weight:700;letter-spacing:-.02em}
-.huge{font-size:60px;font-weight:800;line-height:1}
-.up{color:var(--up)}.down{color:var(--down)}.warn{color:var(--warn)}
-.muted{color:var(--muted)}
-.row{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
-.card{border:2px solid var(--line);text-align:center}
-.card.up{border-color:rgba(34,197,94,.45);background:rgba(34,197,94,.06)}
-.card.down{border-color:rgba(239,68,68,.45);background:rgba(239,68,68,.06)}
-table{width:100%;border-collapse:collapse}
-td{padding:3px 0;vertical-align:top}
-td.n{text-align:right;color:var(--muted);white-space:nowrap}
-.bar{height:6px;background:var(--panel2);border-radius:3px;overflow:hidden}
-.bar>div{height:100%;background:var(--accent)}
-.pill{display:inline-block;padding:2px 8px;border:1px solid var(--line);
-border-radius:999px;font-size:11px}
-.banner{background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.4);
-color:var(--warn);border-radius:8px;padding:8px 12px;margin-bottom:12px;font-size:12px}
-h2{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);
-margin:0 0 10px}
-</style></head><body><div class="wrap">
-<div id="banner"></div>
-<div class="row" style="margin-bottom:12px">
-  <div><span class="label">AURUM ENGINE</span> <span class="pill" id="strategy">-</span>
-  <span class="pill" id="source">-</span></div>
-  <div class="label" id="clock">-</div>
-</div>
-<div class="panel card" id="card" style="margin-bottom:12px">
-  <div class="row"><div><div class="label" id="symbol">BTC/USDT</div>
-  <div class="big" id="price">-</div></div>
-  <div style="text-align:right"><div class="label">Stato</div>
-  <div id="status">-</div></div></div>
-  <div id="signalbox" style="margin-top:18px"></div>
-</div>
-<div class="grid">
-  <div class="panel"><h2>Diagnostica</h2><div id="verdict" class="muted"></div>
-    <div style="margin-top:10px" id="gates"></div></div>
-  <div class="panel"><h2>Sessione BURST-15</h2><div id="session" class="muted">-</div></div>
-  <div class="panel"><h2>Paper trading</h2><div id="stats"></div></div>
-  <div class="panel"><h2>Apprendimento</h2><div id="learn"></div></div>
-  <div class="panel"><h2>Salute</h2><div id="health"></div></div>
-  <div class="panel"><h2>Ultimi esiti</h2><div id="history"></div></div>
-</div>
-<p class="muted" style="font-size:11px;margin-top:16px">
-SOLO CARTA. Nessun ordine viene mai inviato ad alcun venue. Un tasso di
-vittoria non e' un edge finche' il limite inferiore del suo intervallo non
-supera il pareggio del payout.</p>
-</div>
-<script>
-const $=(id)=>document.getElementById(id);
-const money=(v)=>v==null?'-':Number(v).toLocaleString('it-IT',
-  {minimumFractionDigits:2,maximumFractionDigits:2});
-const pct=(v)=>v==null?'-':(100*v).toFixed(1)+'%';
-function tbl(rows){return '<table>'+rows.map(r=>
-  `<tr><td>${r[0]}</td><td class="n">${r[1]}</td></tr>`).join('')+'</table>';}
-
-let offset=0;
-async function get(p){const r=await fetch(p);return r.json();}
-
-async function tick(){
-  try{
-    const [d,s,m,st,rt]=await Promise.all([get('/diagnostics'),get('/signals/current'),
-      get('/market'),get('/statistics'),get('/retrain')]);
-    offset=(d.server_ts||Date.now())-Date.now();
-    $('strategy').textContent=d.strategy;
-    $('source').textContent=d.feed.source+(d.feed.is_synthetic?' (SIMULATO)':'');
-    $('clock').textContent=new Date().toLocaleTimeString('it-IT');
-    $('banner').innerHTML=d.feed.is_synthetic?
-      '<div class="banner">DATI SIMULATI: output generato da un modello, non dal '+
-      'mercato. Non descrive nulla di reale.</div>':'';
-    $('price').textContent='$'+money(m.price);
-    $('symbol').textContent=(m.symbol||'').replace('USDT','/USDT');
-
-    const sig=s.signal;
-    const card=$('card');
-    card.className='panel card'+(sig&&sig.direction==='UP'?' up':
-      sig&&sig.direction==='DOWN'?' down':'');
-    $('status').textContent=sig?sig.status:'IN ANALISI';
-    if(sig&&(sig.status!=='CANCELLED')&&sig.direction!=='NO_TRADE'){
-      const rem=sig.remaining_ms!=null?Math.max(0,Math.ceil(sig.remaining_ms/1000)):null;
-      const wait=sig.wait_remaining_ms!=null?Math.ceil(sig.wait_remaining_ms/1000):null;
-      $('signalbox').innerHTML=
-        `<div class="huge ${sig.direction==='UP'?'up':'down'}">`+
-        `${sig.direction==='UP'?'&#8593; SU':'&#8595; GIU'}</div>`+
-        `<div class="grid" style="margin-top:14px">`+
-        `<div><div class="label">Trigger</div><div>$${money(sig.trigger_price)}</div></div>`+
-        `<div><div class="label">Durata</div><div>${sig.horizon_s}s</div></div>`+
-        `<div><div class="label">Confidenza</div><div>${pct(sig.confidence)}</div></div>`+
-        `<div><div class="label">Entry</div><div>${sig.entry_price?'$'+money(sig.entry_price):'-'}</div></div>`+
-        `</div>`+
-        (rem!=null?`<div style="margin-top:14px"><div class="label">Countdown</div>
-          <div class="huge">${rem}</div></div>`:
-         wait!=null?`<div style="margin-top:14px" class="muted">
-          ${sig.entry_mode==='DELAY'?'Ingresso a mercato fra':'In attesa del trigger'} ${wait}s</div>`:'')+
-        (sig.result?`<div style="margin-top:10px" class="pill">${sig.result}</div>`:'');
-    }else{
-      const gl=(d.blocking_gates||[]).slice(0,3).map(g=>
-        `<tr><td>${g.gate}</td><td class="n warn">${pct(g.share_of_decisions)}</td></tr>`).join('');
-      $('signalbox').innerHTML='<div class="huge muted">NO TRADE</div>'+
-        `<div class="muted" style="margin-top:8px;font-size:12px">`+
-        `${d.signals_emitted} segnali in ${Math.round(d.uptime_s)}s &middot; `+
-        `${d.decisions_evaluated} finestre valutate</div>`+
-        (gl?`<div style="margin-top:12px;text-align:left"><div class="label">Cosa blocca, nel tempo</div>
-             <table>${gl}</table></div>`:'');
-    }
-
-    $('verdict').textContent=d.verdict;
-    $('gates').innerHTML=tbl((d.blocking_gates||[]).slice(0,6).map(g=>
-      [g.gate,pct(g.share_of_decisions)]));
-
-    const b=d.burst&&d.burst.session;
-    $('session').innerHTML=b?tbl([
-      ['P&amp;L sessione (unita)',b.pnl_units],
-      ['Trade',`${b.trades} (${b.wins}V/${b.losses}P/${b.ties}=)`],
-      ['Restano',Math.round(b.remaining_ms/1000)+'s'],
-      ['Stato',b.closed_reason||'aperta']]):
-      '<span class="muted">BURST-15 non attiva (SIGNAL_STRATEGY=burst15)</span>';
-
-    $('stats').innerHTML=tbl([
-      ['Segnali',st.signals],['Chiusi',st.settled],
-      ['Vinti / Persi / Pari',`${st.wins} / ${st.losses} / ${st.ties}`],
-      ['Win rate (decisi)',st.win_rate_decided!=null?pct(st.win_rate_decided):'-'],
-      ['IC 95%',st.win_rate_ci95?`${pct(st.win_rate_ci95[0])} - ${pct(st.win_rate_ci95[1])}`:'-'],
-      ['Pareggio richiesto',st.breakeven_win_rate!=null?pct(st.breakeven_win_rate):st.payout_status],
-      ['P&amp;L (unita)',st.pnl_units!=null?st.pnl_units:'-'],
-      ['Drawdown max',st.max_drawdown_units!=null?st.max_drawdown_units:'-']]);
-
-    $('learn').innerHTML=tbl([
-      ['Attivo',rt.enabled?'si':'no'],['Cicli',rt.runs],
-      ['Modelli attivati',rt.activations],
-      ['Ultimo esito',rt.last_result?(rt.last_result.edge||rt.last_result.skipped||'-'):'-'],
-      ['Nota',rt.last_result&&rt.last_result.note?rt.last_result.note:'-']]);
-
-    $('health').innerHTML=tbl([
-      ['Feed',d.feed.adapter.connected?'connesso':'<span class="warn">disconnesso</span>'],
-      ['Eta feed',d.feed.feed_age_ms!=null?Math.round(d.feed.feed_age_ms)+'ms':'-'],
-      ['Book',d.feed.book_synced?'sincronizzato':'<span class="warn">'+
-        (d.feed.book_desync_reason||'no')+'</span>'],
-      ['Qualita dati',pct(d.feed.data_quality.score)],
-      ['Errore adapter',d.feed.adapter.last_error||'-']]);
-
-    const h=(s.history||[]).slice(0,8).map(x=>
-      [`${x.direction} ${x.result||x.status}`,
-       x.pnl_units!=null?x.pnl_units.toFixed(2):'-']);
-    $('history').innerHTML=h.length?tbl(h):'<span class="muted">nessuno ancora</span>';
-  }catch(e){$('verdict').textContent='motore non raggiungibile: '+e;}
+:root{
+  --bg:#080a0f; --bg2:#0d1018; --panel:#111622; --panel2:#161d2b; --line:#1f2838;
+  --line2:#2a3547; --fg:#e9eef7; --fg2:#b7c1d4; --muted:#6d7a90;
+  --up:#26c281; --down:#ef4c5a; --warn:#f0a12e; --accent:#4c8dff; --accent2:#8b5cf6;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
 }
-tick();setInterval(tick,700);
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--fg);font:13px/1.5 var(--sans);
+  -webkit-font-smoothing:antialiased}
+.tnum{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.wrap{max-width:1440px;margin:0 auto;padding:0 18px 40px}
+
+/* ------------------------------------------------------------- header */
+header{position:sticky;top:0;z-index:30;background:rgba(8,10,15,.92);
+  backdrop-filter:blur(12px);border-bottom:1px solid var(--line);margin-bottom:16px}
+.hd{max-width:1440px;margin:0 auto;padding:11px 18px;display:flex;
+  align-items:center;gap:16px;flex-wrap:wrap}
+.brand{display:flex;align-items:baseline;gap:9px}
+.brand b{font-size:15px;letter-spacing:.16em;font-weight:800}
+.brand span{font-size:10px;color:var(--muted);letter-spacing:.1em}
+.hd-price{display:flex;align-items:baseline;gap:10px;margin-left:6px}
+.hd-price .p{font-size:22px;font-weight:700}
+.hd-price .d{font-size:12px;font-weight:600}
+.spacer{flex:1}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;
+  border:1px solid var(--line2);border-radius:999px;font-size:11px;
+  color:var(--fg2);background:var(--panel);white-space:nowrap}
+.pill.on{border-color:rgba(38,194,129,.5);color:var(--up)}
+.pill.off{border-color:rgba(239,76,90,.5);color:var(--down)}
+.pill.warn{border-color:rgba(240,161,46,.5);color:var(--warn)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--muted)}
+.dot.on{background:var(--up);box-shadow:0 0 8px rgba(38,194,129,.8)}
+.dot.off{background:var(--down)}
+
+/* -------------------------------------------------------------- panels */
+.banner{border-radius:9px;padding:9px 14px;margin-bottom:14px;font-size:12px;
+  border:1px solid rgba(240,161,46,.35);background:rgba(240,161,46,.09);color:var(--warn)}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:11px}
+.ph{display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding:11px 14px;border-bottom:1px solid var(--line)}
+.ph h2{font-size:11px;font-weight:700;letter-spacing:.11em;text-transform:uppercase;
+  color:var(--fg2)}
+.ph .sub{font-size:10px;color:var(--muted)}
+.pb{padding:14px}
+.grid{display:grid;gap:14px}
+.g2{grid-template-columns:1.15fr .85fr}
+.g3{grid-template-columns:repeat(3,1fr)}
+.g4{grid-template-columns:repeat(4,1fr)}
+@media(max-width:1080px){.g2,.g3,.g4{grid-template-columns:1fr}}
+.mb{margin-bottom:14px}
+
+/* --------------------------------------------------------------- chart */
+.chart-wrap{position:relative;height:400px}
+canvas{display:block;width:100%;height:100%}
+.tabs{display:flex;gap:4px;background:var(--bg2);padding:3px;border-radius:8px;
+  border:1px solid var(--line)}
+.tabs button{background:none;border:0;color:var(--muted);font:600 11px var(--mono);
+  padding:5px 11px;border-radius:6px;cursor:pointer;letter-spacing:.04em}
+.tabs button:hover{color:var(--fg2)}
+.tabs button.sel{background:var(--accent);color:#04070d}
+#tip{position:absolute;pointer-events:none;display:none;background:rgba(13,16,24,.97);
+  border:1px solid var(--line2);border-radius:8px;padding:8px 10px;font:11px var(--mono);
+  color:var(--fg2);white-space:pre;z-index:5;box-shadow:0 8px 24px rgba(0,0,0,.5)}
+.legend{display:flex;gap:14px;font-size:10px;color:var(--muted);padding:8px 14px 0}
+.legend i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px}
+
+/* ------------------------------------------------------------- signal */
+.sig{text-align:center;padding:8px 0 4px}
+.sig .arrow{font-size:56px;font-weight:800;line-height:1;letter-spacing:-.02em}
+.sig .none{font-size:34px;font-weight:800;color:var(--muted);letter-spacing:.04em}
+.cells{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:16px}
+.cell{background:var(--panel2);border:1px solid var(--line);border-radius:9px;
+  padding:9px 11px}
+.cell .k{font-size:9.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.09em}
+.cell .v{font-size:16px;font-weight:700;margin-top:3px}
+.count{margin-top:16px;display:flex;flex-direction:column;align-items:center;gap:7px}
+.ring{width:104px;height:104px;border-radius:50%;border:4px solid var(--line2);
+  display:flex;align-items:center;justify-content:center;font-size:36px;font-weight:800}
+.ring.up{border-color:var(--up);color:var(--up)}
+.ring.down{border-color:var(--down);color:var(--down)}
+.prog{height:5px;background:var(--panel2);border-radius:3px;overflow:hidden;width:100%}
+.prog>i{display:block;height:100%;background:var(--accent);border-radius:3px;
+  transition:width .2s linear}
+
+/* --------------------------------------------------------------- table */
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{font-size:9.5px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);
+  text-align:left;font-weight:600;padding:0 8px 7px;border-bottom:1px solid var(--line)}
+td{padding:6px 8px;border-bottom:1px solid rgba(31,40,56,.5)}
+tr:last-child td{border-bottom:0}
+td.n,th.n{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
+.kv{display:flex;justify-content:space-between;gap:12px;padding:4px 0;font-size:12px}
+.kv span:first-child{color:var(--muted)}
+.kv span:last-child{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.tag{display:inline-block;padding:1px 7px;border-radius:5px;font-size:10px;
+  font-weight:700;letter-spacing:.04em}
+.tag.WIN{background:rgba(38,194,129,.16);color:var(--up)}
+.tag.LOSS{background:rgba(239,76,90,.16);color:var(--down)}
+.tag.TIE{background:rgba(109,122,144,.16);color:var(--fg2)}
+.tag.CANCELLED{background:rgba(109,122,144,.1);color:var(--muted)}
+.tag.UP{background:rgba(38,194,129,.16);color:var(--up)}
+.tag.DOWN{background:rgba(239,76,90,.16);color:var(--down)}
+.tag.NO_TRADE{background:rgba(109,122,144,.14);color:var(--muted)}
+
+/* -------------------------------------------------------------- agents */
+.agent{border:1px solid var(--line);border-radius:9px;padding:10px 11px;
+  background:var(--panel2)}
+.agent .top{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.agent .nm{font-size:11px;font-weight:700;letter-spacing:.04em}
+.agent .rs{font-size:10.5px;color:var(--muted);margin-top:6px;line-height:1.45;
+  min-height:28px}
+.bar{height:4px;background:var(--bg2);border-radius:2px;margin-top:8px;overflow:hidden}
+.bar>i{display:block;height:100%;border-radius:2px}
+.metrics{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:9px}
+.metric{background:var(--panel2);border:1px solid var(--line);border-radius:8px;
+  padding:8px 10px}
+.metric .k{font-size:9.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+.metric .v{font-size:15px;font-weight:700;margin-top:2px;font-family:var(--mono)}
+.metric .h{font-size:9.5px;color:var(--muted);margin-top:1px}
+.up{color:var(--up)}.down{color:var(--down)}.warn{color:var(--warn)}
+.muted{color:var(--muted)}.acc{color:var(--accent)}
+.empty{color:var(--muted);font-size:12px;padding:10px 0;text-align:center}
+footer{margin-top:22px;padding-top:14px;border-top:1px solid var(--line);
+  font-size:11px;color:var(--muted);line-height:1.7}
+</style></head><body>
+
+<header><div class="hd">
+  <div class="brand"><b>AURUM</b><span>ENGINE</span></div>
+  <div class="hd-price"><span class="p tnum" id="price">—</span>
+    <span class="d tnum" id="chg"></span></div>
+  <div class="spacer"></div>
+  <span class="pill" id="p-sym">—</span>
+  <span class="pill" id="p-strat">—</span>
+  <span class="pill" id="p-src">—</span>
+  <span class="pill" id="p-status"><i class="dot" id="d-conn"></i><span id="t-status">—</span></span>
+  <span class="pill tnum" id="p-clock">—:—:—</span>
+</div></header>
+
+<div class="wrap">
+<div id="banner"></div>
+
+<!-- ------------------------------------------------------------ GRAFICO -->
+<div class="panel mb">
+  <div class="ph">
+    <div><h2>Grafico</h2><div class="sub" id="chart-sub">—</div></div>
+    <div class="tabs" id="tabs"></div>
+  </div>
+  <div class="legend">
+    <span><i style="background:var(--up)"></i>rialzo</span>
+    <span><i style="background:var(--down)"></i>ribasso</span>
+    <span><i style="background:var(--accent)"></i>ingresso operazione</span>
+    <span><i style="background:var(--muted)"></i>tick per barra</span>
+    <span id="lg-note" class="muted"></span>
+  </div>
+  <div class="chart-wrap"><canvas id="chart"></canvas><div id="tip"></div></div>
+</div>
+
+<!-- --------------------------------------------------- SEGNALE + DIAGNOSI -->
+<div class="grid g2 mb">
+  <div class="panel">
+    <div class="ph"><div><h2>Segnale corrente</h2>
+      <div class="sub" id="sig-sub">—</div></div>
+      <span class="pill" id="sig-state">—</span></div>
+    <div class="pb"><div id="signal"></div></div>
+  </div>
+  <div class="panel">
+    <div class="ph"><div><h2>Diagnostica</h2>
+      <div class="sub">perche' arrivano, o non arrivano, i segnali</div></div>
+      <span class="pill" id="diag-rate">—</span></div>
+    <div class="pb">
+      <div id="verdict" style="font-size:12px;line-height:1.6;margin-bottom:12px"></div>
+      <div id="gates"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ------------------------------------------------------ COSA ANALIZZA -->
+<div class="panel mb">
+  <div class="ph"><div><h2>Cosa analizza</h2>
+    <div class="sub" id="an-sub">—</div></div></div>
+  <div class="pb"><div id="analysis"></div></div>
+</div>
+
+<!-- ------------------------------------------ SESSIONE / PERF / LEARN / OK -->
+<div class="grid g4 mb">
+  <div class="panel"><div class="ph"><h2>Sessione BURST-15</h2></div>
+    <div class="pb" id="session"></div></div>
+  <div class="panel"><div class="ph"><h2>Performance</h2></div>
+    <div class="pb" id="perf"></div></div>
+  <div class="panel"><div class="ph"><h2>Apprendimento</h2></div>
+    <div class="pb" id="learn"></div></div>
+  <div class="panel"><div class="ph"><h2>Salute</h2></div>
+    <div class="pb" id="health"></div></div>
+</div>
+
+<!-- ------------------------------------------------------------- STORICO -->
+<div class="panel">
+  <div class="ph"><div><h2>Storico operazioni</h2>
+    <div class="sub" id="hist-sub">solo carta &middot; nessun ordine inviato</div></div>
+    <span class="pill" id="hist-count">—</span></div>
+  <div class="pb" style="overflow-x:auto"><div id="history"></div></div>
+</div>
+
+<footer>
+  <b>SOLO CARTA.</b> Nessun percorso di questo programma puo' inviare un ordine
+  ad alcun venue: non esiste chiave privata, firma, ne' endpoint di trading.<br>
+  Un tasso di vittoria non e' un vantaggio finche' il limite inferiore del suo
+  intervallo di confidenza non supera il pareggio richiesto dal payout. Le
+  finestre a 5 secondi si sovrappongono e sono correlate: gli intervalli sono
+  piu' stretti del vero.
+</footer>
+</div>
+
+<script>
+"use strict";
+var $ = function(id){ return document.getElementById(id); };
+var API = "";
+var state = { interval:"1m", candles:[], markers:[], hover:null, lastPrice:null };
+
+function num(v, d){ if(v===null||v===undefined||isNaN(v)) return "—";
+  return Number(v).toLocaleString("it-IT",{minimumFractionDigits:d===undefined?2:d,
+    maximumFractionDigits:d===undefined?2:d}); }
+function pct(v, d){ return (v===null||v===undefined||isNaN(v))?"—":(100*v).toFixed(d===undefined?1:d)+"%"; }
+function sec(ms){ return (ms===null||ms===undefined)?"—":Math.max(0,Math.round(ms/1000))+"s"; }
+function hhmm(ts){ if(!ts) return "—"; var d=new Date(ts);
+  return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0")
+    +":"+String(d.getSeconds()).padStart(2,"0"); }
+function esc(s){ return String(s===undefined||s===null?"":s)
+  .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function kv(rows){ return rows.map(function(r){
+  return '<div class="kv"><span>'+esc(r[0])+'</span><span class="'+(r[2]||"")+'">'
+    +(r[3]?r[1]:esc(r[1]))+'</span></div>'; }).join(""); }
+function get(path){ return fetch(API+path).then(function(r){ return r.json(); }); }
+
+/* ===================================================================== *
+ *  GRAFICO A CANDELE - disegnato a mano su canvas, nessuna libreria     *
+ * ===================================================================== */
+var cv = $("chart"), cx = cv.getContext("2d"), geom = null;
+
+function sizeCanvas(){
+  var r = cv.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  cv.width = Math.max(1, Math.floor(r.width*dpr));
+  cv.height = Math.max(1, Math.floor(r.height*dpr));
+  cx.setTransform(dpr,0,0,dpr,0,0);
+  return { w:r.width, h:r.height };
+}
+
+function niceStep(range, target){
+  var raw = range/Math.max(target,1), mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  var n = raw/mag;
+  var mult = n>5?10:(n>2?5:(n>1?2:1));
+  return mult*mag;
+}
+
+function drawChart(){
+  var box = sizeCanvas(), W = box.w, H = box.h;
+  cx.clearRect(0,0,W,H);
+  var cs = state.candles;
+  if(!cs.length){
+    cx.fillStyle = "#6d7a90"; cx.font = "12px system-ui"; cx.textAlign = "center";
+    cx.fillText("nessun dato registrato per questo intervallo", W/2, H/2);
+    geom = null; return;
+  }
+  var padR = 62, padB = 22, padT = 10, padL = 6;
+  var plotW = W-padL-padR, plotH = H-padT-padB, volH = Math.min(46, plotH*0.16);
+  var priceH = plotH-volH-6;
+
+  var hi = -Infinity, lo = Infinity, maxN = 1;
+  for(var i=0;i<cs.length;i++){
+    if(cs[i].h>hi) hi=cs[i].h; if(cs[i].l<lo) lo=cs[i].l;
+    if(cs[i].n>maxN) maxN=cs[i].n;
+  }
+  if(state.lastPrice){ hi=Math.max(hi,state.lastPrice); lo=Math.min(lo,state.lastPrice); }
+  var pad = (hi-lo)*0.08 || Math.max(hi*0.0002, 0.02);
+  hi += pad; lo -= pad;
+  var span = (hi-lo) || 1;
+  var y = function(p){ return padT + priceH - ((p-lo)/span)*priceH; };
+  var minSlots = 30;
+  var slot = plotW/Math.max(cs.length, minSlots);
+  var bw = Math.max(1, Math.min(16, slot*0.68));
+  // i indicizza le candele, ma accetta valori frazionari: e' cosi' che un
+  // marker piazzato a meta' barra finisce esattamente a meta' barra.
+  var x = function(i){ return padL + plotW - (cs.length - i - 0.5)*slot; };
+  geom = { x:x, y:y, slot:slot, padL:padL, padT:padT, priceH:priceH, W:W, H:H,
+           lo:lo, hi:hi, span:span, padR:padR, n:cs.length, plotW:plotW };
+
+  /* griglia + scala prezzi */
+  var step = niceStep(span, 6);
+  cx.font = "10px ui-monospace,monospace"; cx.textBaseline = "middle";
+  for(var p=Math.ceil(lo/step)*step; p<hi; p+=step){
+    var yy = y(p);
+    cx.strokeStyle = "#1a2231"; cx.lineWidth = 1;
+    cx.beginPath(); cx.moveTo(padL, yy+0.5); cx.lineTo(W-padR, yy+0.5); cx.stroke();
+    cx.fillStyle = "#6d7a90"; cx.textAlign = "left";
+    cx.fillText(p.toFixed(step<1?2:(step<10?1:0)), W-padR+7, yy);
+  }
+
+  /* asse tempi */
+  var labels = Math.max(2, Math.floor(plotW/110));
+  var everyT = Math.max(1, Math.floor(cs.length/labels));
+  // Sotto il minuto l'ora senza secondi stamperebbe la stessa etichetta dieci
+  // volte di fila: a quel punto tanto vale non metterla.
+  var bucketMs = cs.length>1 ? (cs[cs.length-1].t-cs[0].t)/(cs.length-1) : 60000;
+  var stamp = function(t){ var s = hhmm(t); return bucketMs < 60000 ? s : s.slice(0,5); };
+  cx.textAlign = "center";
+  var lastLabelX = -1e9;
+  for(var k=0;k<cs.length;k+=everyT){
+    var xx = x(k);
+    cx.strokeStyle = "#141b28";
+    cx.beginPath(); cx.moveTo(xx+0.5,padT); cx.lineTo(xx+0.5,padT+priceH); cx.stroke();
+    // Con poche barre le etichette finirebbero una sull'altra: se non c'e'
+    // spazio, meglio nessuna etichetta che due sovrapposte.
+    if(xx - lastLabelX < 74) continue;
+    lastLabelX = xx;
+    cx.fillStyle = "#6d7a90";
+    cx.fillText(stamp(cs[k].t), xx, H-padB/2);
+  }
+
+  /* volume come numero di tick nella barra */
+  for(var v=0;v<cs.length;v++){
+    var hgt = (cs[v].n/maxN)*volH;
+    cx.fillStyle = "rgba(109,122,144,.32)";
+    cx.fillRect(x(v)-bw/2, padT+priceH+6+(volH-hgt), bw, hgt);
+  }
+
+  /* candele */
+  for(var c=0;c<cs.length;c++){
+    var k2 = cs[c], up = k2.c >= k2.o;
+    var col = up ? "#26c281" : "#ef4c5a";
+    cx.strokeStyle = col; cx.fillStyle = col; cx.lineWidth = 1;
+    var xm = Math.round(x(c))+0.5;
+    cx.beginPath(); cx.moveTo(xm, y(k2.h)); cx.lineTo(xm, y(k2.l)); cx.stroke();
+    var yo = y(k2.o), yc = y(k2.c);
+    var top = Math.min(yo,yc), hh = Math.max(1, Math.abs(yc-yo));
+    cx.fillRect(x(c)-bw/2, top, bw, hh);
+  }
+
+  /* operazioni: triangolo all'ingresso, pallino all'uscita, linea fra i due */
+  var t0 = cs[0].t, tEnd = cs[cs.length-1].t;
+  var bucket = cs.length>1 ? Math.round((tEnd-t0)/(cs.length-1)) : 60000;
+  var toX = function(ts){ return x((ts-t0)/bucket); };
+  for(var m=0;m<state.markers.length;m++){
+    var mk = state.markers[m];
+    if(!mk.triggered_at || !mk.entry_price) continue;
+    if(mk.triggered_at < t0 || mk.triggered_at > tEnd+bucket) continue;
+    var mx = toX(mk.triggered_at), my = y(mk.entry_price);
+    var mcol = mk.result==="WIN" ? "#26c281" : (mk.result==="LOSS" ? "#ef4c5a" : "#4c8dff");
+    if(mk.settled_at && mk.expiry_price){
+      var ex = toX(mk.settled_at), ey = y(mk.expiry_price);
+      cx.strokeStyle = mcol; cx.globalAlpha = .55; cx.lineWidth = 1.4;
+      cx.beginPath(); cx.moveTo(mx,my); cx.lineTo(ex,ey); cx.stroke();
+      cx.globalAlpha = 1; cx.fillStyle = mcol;
+      cx.beginPath(); cx.arc(ex,ey,2.8,0,6.2832); cx.fill();
+    }
+    cx.fillStyle = mcol;
+    cx.beginPath();
+    if(mk.direction === "UP"){ cx.moveTo(mx,my-9); cx.lineTo(mx-5,my-1); cx.lineTo(mx+5,my-1); }
+    else { cx.moveTo(mx,my+9); cx.lineTo(mx-5,my+1); cx.lineTo(mx+5,my+1); }
+    cx.closePath(); cx.fill();
+  }
+
+  /* ultimo prezzo */
+  if(state.lastPrice){
+    var ly = y(state.lastPrice);
+    cx.setLineDash([4,4]); cx.strokeStyle = "#4c8dff"; cx.lineWidth = 1;
+    cx.beginPath(); cx.moveTo(padL,ly+0.5); cx.lineTo(W-padR,ly+0.5); cx.stroke();
+    cx.setLineDash([]);
+    cx.fillStyle = "#4c8dff";
+    cx.fillRect(W-padR+2, ly-8, padR-4, 16);
+    cx.fillStyle = "#04070d"; cx.textAlign = "left"; cx.font = "bold 10px ui-monospace,monospace";
+    cx.fillText(state.lastPrice.toFixed(2), W-padR+6, ly);
+  }
+
+  /* crosshair */
+  if(state.hover !== null && state.hover >= 0 && state.hover < cs.length){
+    var hx = x(state.hover);
+    cx.strokeStyle = "rgba(180,195,220,.35)"; cx.setLineDash([3,3]);
+    cx.beginPath(); cx.moveTo(hx+0.5,padT); cx.lineTo(hx+0.5,padT+priceH); cx.stroke();
+    cx.setLineDash([]);
+  }
+}
+
+cv.addEventListener("mousemove", function(e){
+  if(!geom || !state.candles.length){ return; }
+  var r = cv.getBoundingClientRect();
+  var mx = e.clientX-r.left, my = e.clientY-r.top;
+  var idx = Math.round((mx-geom.padL-geom.plotW)/geom.slot + geom.n - 0.5);
+  if(idx<0 || idx>=state.candles.length){ state.hover=null; $("tip").style.display="none"; drawChart(); return; }
+  state.hover = idx;
+  var k = state.candles[idx];
+  var t = $("tip");
+  t.textContent = hhmm(k.t)+"\nO "+num(k.o)+"\nH "+num(k.h)+"\nL "+num(k.l)
+    +"\nC "+num(k.c)+"\ntick "+k.n;
+  t.style.display = "block";
+  t.style.left = Math.min(r.width-130, Math.max(4, mx+14))+"px";
+  t.style.top = Math.max(4, my-70)+"px";
+  drawChart();
+});
+cv.addEventListener("mouseleave", function(){ state.hover=null;
+  $("tip").style.display="none"; drawChart(); });
+window.addEventListener("resize", drawChart);
+
+var INTERVALS = ["5s","15s","1m","5m","10m","30m"];
+$("tabs").innerHTML = INTERVALS.map(function(i){
+  return '<button data-i="'+i+'"'+(i===state.interval?' class="sel"':'')+'>'+i+'</button>';
+}).join("");
+$("tabs").addEventListener("click", function(e){
+  var b = e.target.closest("button"); if(!b) return;
+  state.interval = b.dataset.i;
+  Array.prototype.forEach.call($("tabs").children, function(c){
+    c.className = c.dataset.i===state.interval ? "sel" : "";
+  });
+  loadCandles();
+});
+
+function loadCandles(){
+  return get("/candles?interval="+state.interval+"&limit=240").then(function(d){
+    state.candles = d.candles || [];
+    state.markers = d.markers || [];
+    state.lastPrice = d.last_price;
+    $("chart-sub").textContent = state.candles.length+" barre da "+state.interval
+      +" · "+state.markers.length+" operazioni sul grafico";
+    $("lg-note").textContent = state.candles.length ? "" :
+      "il grafico si riempie man mano che il motore registra";
+    drawChart();
+  }).catch(function(){});
+}
+
+/* ===================================================================== *
+ *  PANNELLI                                                             *
+ * ===================================================================== */
+function renderSignal(s, d){
+  var sig = s.signal, box = $("signal");
+  $("sig-state").textContent = sig ? sig.status : "IN ANALISI";
+  $("sig-state").className = "pill" + (sig && sig.status==="ACTIVE" ? " on" : "");
+  if(!sig || sig.direction === "NO_TRADE" || sig.status === "CANCELLED"){
+    var gl = (d.blocking_gates||[]).slice(0,3).map(function(g){
+      return '<tr><td>'+esc(g.gate)+'</td><td class="n warn">'
+        +pct(g.share_of_decisions)+'</td></tr>'; }).join("");
+    $("sig-sub").textContent = "nessun segnale forzato";
+    box.innerHTML = '<div class="sig"><div class="none">NO TRADE</div>'
+      +'<div class="muted" style="margin-top:8px;font-size:11.5px">'
+      +d.signals_emitted+' segnali · '+d.decisions_evaluated+' finestre valutate · '
+      +Math.round(d.uptime_s)+'s di attivita\'</div></div>'
+      +(gl?'<table style="margin-top:14px"><thead><tr><th>Cosa blocca, nel tempo</th>'
+        +'<th class="n">quota</th></tr></thead><tbody>'+gl+'</tbody></table>':'');
+    return;
+  }
+  var up = sig.direction === "UP";
+  var cls = up ? "up" : "down";
+  var rem = sig.remaining_ms, wait = sig.wait_remaining_ms;
+  $("sig-sub").textContent = (sig.strategy||"") + " · orizzonte " + sig.horizon_s + "s"
+    + (sig.entry_mode==="DELAY" ? " · ingresso a tempo" : " · ingresso al tocco");
+  var html = '<div class="sig"><div class="arrow '+cls+'">'
+    + (up ? "&#8593; SU" : "&#8595; GIU&#768;") + '</div></div>'
+    + '<div class="cells">'
+    + '<div class="cell"><div class="k">'
+      + (sig.entry_mode==="DELAY" ? "Riferimento" : "Trigger") + '</div>'
+      + '<div class="v tnum">$'+num(sig.entry_mode==="DELAY"?sig.reference_price:sig.trigger_price)+'</div></div>'
+    + '<div class="cell"><div class="k">Ingresso</div><div class="v tnum">'
+      + (sig.entry_price ? "$"+num(sig.entry_price) : "—") + '</div></div>'
+    + '<div class="cell"><div class="k">Confidenza</div><div class="v tnum">'
+      + pct(sig.confidence) + '</div></div>'
+    + '<div class="cell"><div class="k">Regime</div><div class="v" style="font-size:12px">'
+      + esc(sig.regime) + '</div></div></div>';
+  if(rem !== null && rem !== undefined){
+    var frac = Math.max(0, Math.min(1, rem/(sig.horizon_s*1000)));
+    html += '<div class="count"><div class="ring '+cls+'">'+Math.ceil(rem/1000)+'</div>'
+      + '<div class="prog" style="max-width:220px"><i style="width:'+(frac*100)+'%"></i></div>'
+      + '<div class="muted" style="font-size:11px">countdown guidato dal motore</div></div>';
+  } else if(wait !== null && wait !== undefined){
+    html += '<div class="count"><div class="muted">'
+      + (sig.entry_mode==="DELAY" ? "ingresso a mercato fra " : "in attesa del trigger · ")
+      + sec(wait) + '</div></div>';
+  }
+  if(sig.result){
+    html += '<div style="text-align:center;margin-top:14px">'
+      + '<span class="tag '+sig.result+'">'+sig.result+'</span>'
+      + (sig.pnl_units!==null&&sig.pnl_units!==undefined
+         ? ' <span class="tnum '+(sig.pnl_units>=0?"up":"down")+'">'
+           +(sig.pnl_units>=0?"+":"")+sig.pnl_units.toFixed(2)+'u</span>' : '')
+      + '</div>';
+  }
+  box.innerHTML = html;
+}
+
+function renderAnalysis(sn, f, d){
+  var box = $("analysis"), dec = sn.last_decision, feats = (f && f.latest && f.latest.features) || {};
+  var html = "";
+  if(d.strategy === "burst15" && dec && dec.detail){
+    var t = dec.detail.thresholds || {}, n5 = dec.detail.n5, r10 = dec.detail.r10_bps,
+        ofi = dec.detail.ofi5;
+    $("an-sub").textContent = "AURUM BURST-15 · le tre condizioni del trigger, in tempo reale";
+    var cond = function(label, val, need, ok, fmt){
+      var frac = (val===null||val===undefined) ? 0 : Math.min(1, Math.abs(val)/(need||1));
+      return '<div class="agent"><div class="top"><span class="nm">'+label+'</span>'
+        + '<span class="tag '+(ok?"UP":"NO_TRADE")+'">'+(ok?"OK":"NO")+'</span></div>'
+        + '<div class="rs">valore <b class="'+(ok?"up":"muted")+'">'+fmt(val)+'</b>'
+        + ' · soglia '+fmt(need)+'</div>'
+        + '<div class="bar"><i style="width:'+(frac*100)+'%;background:'
+        + (ok?"var(--up)":"var(--muted)")+'"></i></div></div>';
+    };
+    html += '<div class="grid g3" style="margin-bottom:14px">'
+      + cond("Tape (trade in 5s)", n5, t.n5_min, n5!==null&&n5>=t.n5_min,
+             function(v){ return v===null||v===undefined?"—":Number(v).toFixed(0); })
+      + cond("Movimento 10s", r10, t.r10_min_bps,
+             r10!==null&&Math.abs(r10)>=t.r10_min_bps,
+             function(v){ return v===null||v===undefined?"—":Number(v).toFixed(2)+" bps"; })
+      + cond("Flusso concorde", ofi, 1,
+             !t.require_ofi_agree || (ofi!==null&&r10!==null&&(ofi>0)===(r10>0)),
+             function(v){ return v===null||v===undefined?"—":Number(v).toFixed(2); })
+      + '</div>';
+  } else if(dec && dec.agents && dec.agents.length){
+    $("an-sub").textContent = "otto agenti · ognuno guarda una fetta diversa della microstruttura";
+    html += '<div class="grid g4" style="margin-bottom:14px">'
+      + dec.agents.map(function(a){
+        var col = a.direction==="UP"?"var(--up)":(a.direction==="DOWN"?"var(--down)":"var(--muted)");
+        return '<div class="agent"><div class="top"><span class="nm">'+esc(a.agent)+'</span>'
+          + '<span class="tag '+a.direction+'">'+a.direction+'</span></div>'
+          + '<div class="rs">'+esc(a.reason)+'</div>'
+          + '<div class="bar"><i style="width:'+(a.confidence*100)+'%;background:'+col+'"></i></div>'
+          + '<div class="muted tnum" style="font-size:10px;margin-top:4px">conf '
+          + pct(a.confidence)+' · score '+Number(a.score).toFixed(3)+'</div></div>';
+      }).join("") + '</div>';
+    if(dec.detail && dec.detail.agreement_mass !== undefined){
+      var th = dec.detail.thresholds || {};
+      html += '<div class="grid g3" style="margin-bottom:14px">'
+        + '<div class="metric"><div class="k">Accordo (massa)</div><div class="v">'
+          + Number(dec.detail.agreement_mass).toFixed(3) + '</div>'
+          + '<div class="h">serve &ge; '+th.min_agreement+'</div></div>'
+        + '<div class="metric"><div class="k">Confidenza direzionale</div><div class="v">'
+          + pct(dec.confidence) + '</div><div class="h">serve &ge; '
+          + pct(th.min_confidence) + '</div></div>'
+        + '<div class="metric"><div class="k">P(su) / P(giu) / P(neutro)</div><div class="v" style="font-size:13px">'
+          + pct(dec.prob_up)+' / '+pct(dec.prob_down)+' / '+pct(dec.prob_neutral)
+          + '</div><div class="h">uscite del modello, non frequenze calibrate</div></div>'
+        + '</div>';
+    }
+  } else {
+    $("an-sub").textContent = "in attesa della prima valutazione";
+  }
+
+  var m = function(k, label, val, hint, cls){
+    return '<div class="metric"><div class="k">'+label+'</div><div class="v '+(cls||"")+'">'
+      + val + '</div><div class="h">'+hint+'</div></div>'; };
+  var q = (d.feed && d.feed.data_quality) || {};
+  html += '<div class="metrics">'
+    + m(0,"Spread", (feats.spread_bps!==undefined&&feats.spread_bps!==null?Number(feats.spread_bps).toFixed(3):"—")+" bps","costo implicito del tocco")
+    + m(0,"Flusso 1s / 5s", (feats.volume_imbalance_1s!==undefined&&feats.volume_imbalance_1s!==null?Number(feats.volume_imbalance_1s).toFixed(2):"—")
+        +" / "+(feats.volume_imbalance_5s!==undefined&&feats.volume_imbalance_5s!==null?Number(feats.volume_imbalance_5s).toFixed(2):"—"),"squilibrio compratori/venditori")
+    + m(0,"OFI notional 5s", feats.ofi_notional_5s!==undefined&&feats.ofi_notional_5s!==null?Number(feats.ofi_notional_5s).toFixed(2):"—","pesato per controvalore")
+    + m(0,"Profondita' 5 / 20", (feats.depth_imbalance_5!==undefined&&feats.depth_imbalance_5!==null?Number(feats.depth_imbalance_5).toFixed(2):"—")
+        +" / "+(feats.depth_imbalance_20!==undefined&&feats.depth_imbalance_20!==null?Number(feats.depth_imbalance_20).toFixed(2):"—"),"squilibrio del book")
+    + m(0,"Volatilita' 5s / 30s", (feats.realized_vol_5s_bps!==undefined&&feats.realized_vol_5s_bps!==null?Number(feats.realized_vol_5s_bps).toFixed(2):"—")
+        +" / "+(feats.realized_vol_30s_bps!==undefined&&feats.realized_vol_30s_bps!==null?Number(feats.realized_vol_30s_bps).toFixed(2):"—"),"bps realizzati")
+    + m(0,"Movimento atteso", (feats.expected_move_ticks!==undefined&&feats.expected_move_ticks!==null?Number(feats.expected_move_ticks).toFixed(1):"—")+" tick","su un orizzonte")
+    + m(0,"Finestre piatte", pct(feats.zero_move_fraction),"quota che finisce dov'e' partita")
+    + m(0,"Trade/s (1s / 30s)", (feats.trade_intensity_1s!==undefined&&feats.trade_intensity_1s!==null?Number(feats.trade_intensity_1s).toFixed(0):"—")
+        +" / "+(feats.trade_intensity_30s!==undefined&&feats.trade_intensity_30s!==null?Number(feats.trade_intensity_30s).toFixed(0):"—"),"intensita' della tape")
+    + m(0,"Ritorno 10s", (feats.return_10000ms!==undefined&&feats.return_10000ms!==null?Number(feats.return_10000ms).toFixed(2):"—")+" bps","quello che legge BURST-15")
+    + m(0,"Qualita' dati", pct(q.score), q.warmup_complete===false?"in riscaldamento":"gate a "+pct(d.thresholds.min_data_quality))
+    + '</div>';
+  box.innerHTML = html;
+}
+
+function renderHistory(h){
+  var rows = (h.trades||[]).filter(function(t){ return t.result; });
+  $("hist-count").textContent = rows.length + " operazioni";
+  if(!rows.length){ $("history").innerHTML =
+    '<div class="empty">nessuna operazione chiusa: appariranno qui appena il motore ne conclude una</div>';
+    return; }
+  $("history").innerHTML = '<table><thead><tr>'
+    + '<th>Ora</th><th>Strategia</th><th>Dir</th><th class="n">Ingresso</th>'
+    + '<th class="n">Uscita</th><th class="n">Var.</th><th>Esito</th>'
+    + '<th class="n">P&amp;L</th><th class="n">Durata</th><th class="n">Conf.</th>'
+    + '</tr></thead><tbody>'
+    + rows.map(function(t){
+      var mv = (t.entry_price && t.expiry_price)
+        ? (t.expiry_price-t.entry_price)/t.entry_price*10000 : null;
+      var dur = (t.settled_at && t.triggered_at) ? (t.settled_at-t.triggered_at) : null;
+      return '<tr><td class="tnum muted">'+hhmm(t.triggered_at||t.ts)+'</td>'
+        + '<td class="muted">'+esc(t.strategy||"—")+'</td>'
+        + '<td><span class="tag '+t.direction+'">'+t.direction+'</span></td>'
+        + '<td class="n">'+num(t.entry_price)+'</td>'
+        + '<td class="n">'+num(t.expiry_price)+'</td>'
+        + '<td class="n '+(mv>0?"up":(mv<0?"down":"muted"))+'">'
+          +(mv===null?"—":(mv>0?"+":"")+mv.toFixed(2)+" bps")+'</td>'
+        + '<td><span class="tag '+t.result+'">'+t.result+'</span></td>'
+        + '<td class="n '+(t.pnl_units>0?"up":(t.pnl_units<0?"down":"muted"))+'">'
+          +(t.pnl_units===null||t.pnl_units===undefined?"—":(t.pnl_units>0?"+":"")+t.pnl_units.toFixed(2))+'</td>'
+        + '<td class="n muted">'+(dur===null?"—":(dur/1000).toFixed(1)+"s")+'</td>'
+        + '<td class="n muted">'+pct(t.confidence)+'</td></tr>';
+    }).join("") + '</tbody></table>';
+}
+
+/* ===================================================================== *
+ *  CICLO                                                                *
+ * ===================================================================== */
+function tickFast(){
+  Promise.all([get("/diagnostics"), get("/signals/current"), get("/market"),
+               get("/signals"), get("/features")])
+    .then(function(r){
+      var d=r[0], s=r[1], mk=r[2], sn=r[3], f=r[4];
+      $("price").textContent = "$"+num(mk.price);
+      state.lastPrice = mk.price;
+      $("p-sym").textContent = (mk.symbol||"").replace("USDT","/USDT");
+      $("p-strat").textContent = d.strategy === "burst15" ? "BURST-15" : "ENSEMBLE";
+      $("p-src").textContent = d.feed.source + (d.feed.is_synthetic ? " · SIMULATO" : "");
+      $("p-src").className = "pill" + (d.feed.is_synthetic ? " warn" : "");
+      $("p-clock").textContent = new Date().toLocaleTimeString("it-IT");
+      var live = d.feed.adapter && d.feed.adapter.connected;
+      $("d-conn").className = "dot " + (live ? "on" : "off");
+      $("t-status").textContent = live ? "connesso" : "disconnesso";
+      $("p-status").className = "pill " + (live ? "on" : "off");
+      $("diag-rate").textContent = d.signals_emitted + " segnali · "
+        + d.signals_per_hour.toFixed(1) + "/h";
+
+      var warn = "";
+      if(d.feed.is_synthetic) warn += "DATI SIMULATI: generati da un modello, non dal mercato. "
+        + "Nulla di quanto vedi descrive il mercato reale. ";
+      if(!live) warn += "Feed disconnesso"
+        + (d.feed.adapter && d.feed.adapter.last_error ? ": "+d.feed.adapter.last_error : "") + ". ";
+      $("banner").innerHTML = warn ? '<div class="banner">'+esc(warn)+'</div>' : "";
+
+      $("verdict").textContent = d.verdict;
+      var gl = (d.blocking_gates||[]).slice(0,6);
+      $("gates").innerHTML = gl.length ? '<table><thead><tr><th>Cancello</th>'
+        + '<th class="n">volte</th><th class="n">quota</th></tr></thead><tbody>'
+        + gl.map(function(g){ return '<tr><td>'+esc(g.gate)+'</td>'
+          + '<td class="n muted">'+g.count+'</td>'
+          + '<td class="n warn">'+pct(g.share_of_decisions)+'</td></tr>'; }).join("")
+        + '</tbody></table>' : '<div class="empty">nessun blocco registrato</div>';
+
+      renderSignal(s, d);
+      renderAnalysis(sn, f, d);
+
+      var b = d.burst && d.burst.session;
+      $("session").innerHTML = b ? kv([
+        ["P&L sessione", (b.pnl_units>=0?"+":"")+b.pnl_units.toFixed(2)+"u",
+          b.pnl_units>0?"up":(b.pnl_units<0?"down":"")],
+        ["Operazioni", b.trades+" ("+b.wins+"V/"+b.losses+"P/"+b.ties+"=)"],
+        ["Finestra", sec(b.remaining_ms)+" rimasti"],
+        ["Aperte ora", String(b.open_signals)],
+        ["Stato", b.closed_reason || "aperta"],
+      ]) : '<div class="empty">BURST-15 non attiva<br><span class="muted">'
+        + '--strategy burst15</span></div>';
+      drawChart();
+    }).catch(function(e){ $("verdict").textContent = "motore non raggiungibile: "+e; });
+}
+
+function tickSlow(){
+  Promise.all([get("/statistics"), get("/retrain"), get("/health"),
+               get("/paper-trades?limit=60"), get("/db")])
+    .then(function(r){
+      var st=r[0], rt=r[1], hl=r[2], hist=r[3], db=r[4];
+      $("perf").innerHTML = kv([
+        ["Segnali", String(st.signals)],
+        ["Chiusi", String(st.settled)],
+        ["V / P / =", st.wins+" / "+st.losses+" / "+st.ties],
+        ["Win rate", st.win_rate_decided!==null&&st.win_rate_decided!==undefined
+          ? pct(st.win_rate_decided) : "—"],
+        ["IC 95%", st.win_rate_ci95 ? pct(st.win_rate_ci95[0])+" – "+pct(st.win_rate_ci95[1]) : "—"],
+        ["Pareggio richiesto", st.breakeven_win_rate!==undefined
+          ? pct(st.breakeven_win_rate) : st.payout_status],
+        ["P&L", st.pnl_units!==undefined ? (st.pnl_units>=0?"+":"")+st.pnl_units.toFixed(2)+"u" : "—",
+          st.pnl_units>0?"up":(st.pnl_units<0?"down":"")],
+        ["Drawdown max", st.max_drawdown_units!==undefined ? st.max_drawdown_units.toFixed(2)+"u" : "—"],
+      ]) + (st.above_breakeven===false
+        ? '<div class="muted" style="font-size:10.5px;margin-top:8px">sotto il pareggio '
+          + 'del payout: vincere piu\' della meta\' delle volte non basta</div>' : '');
+
+      var lr = rt.last_result || {};
+      $("learn").innerHTML = kv([
+        ["Automatico", rt.enabled ? "attivo" : "spento", rt.enabled?"up":"muted"],
+        ["Cicli eseguiti", String(rt.runs)],
+        ["Modelli attivati", String(rt.activations)],
+        ["Ultimo verdetto", lr.edge || lr.skipped || "—"],
+        ["Modello attivo", (hl.components.model.detail.model_id || "nessuno")],
+        ["Calibrato", hl.components.model.detail.calibrated ? "si" : "no"],
+      ]) + (lr.note ? '<div class="muted" style="font-size:10.5px;margin-top:8px">'
+        + esc(lr.note) + '</div>' : '');
+
+      var c = hl.components;
+      $("health").innerHTML = kv([
+        ["Stato", hl.status, hl.status==="HEALTHY"?"up":"warn"],
+        ["Attivo da", Math.round(hl.uptime_s)+"s"],
+        ["Book", c.order_book.status==="UP" ? "sincronizzato"
+          : (hl.market.orderbook.desync_reason||"no"), c.order_book.status==="UP"?"up":"warn"],
+        ["Eta' feed", hl.market.feed_age_ms!==null&&hl.market.feed_age_ms!==undefined
+          ? Math.round(hl.market.feed_age_ms)+"ms" : "—"],
+        ["Latenza p95", hl.market.latency_p95_ms!==null&&hl.market.latency_p95_ms!==undefined
+          ? Math.round(hl.market.latency_p95_ms)+"ms" : "—"],
+        ["Database", (db.counts.market_ticks||0).toLocaleString("it-IT")+" tick"],
+        ["Righe scritte", (db.writer.written||0).toLocaleString("it-IT")],
+      ]);
+
+      renderHistory(hist);
+    }).catch(function(){});
+}
+
+loadCandles(); tickFast(); tickSlow();
+setInterval(tickFast, 600);
+setInterval(tickSlow, 3000);
+setInterval(loadCandles, 4000);
 </script></body></html>"""
+
+
+#: Intervalli offerti al grafico. Il motore opera su 5 secondi: su una candela
+#: da 30 minuti un suo trade e' invisibile, quindi ci sono anche i tagli corti.
+CANDLE_INTERVALS: dict[str, int] = {
+    "5s": 5, "15s": 15, "1m": 60, "5m": 300, "10m": 600, "30m": 1800,
+}
 
 
 def make_http_server(engine: "Engine"):
@@ -4990,6 +5617,12 @@ def make_http_server(engine: "Engine"):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(body)
+
+        def _query(self) -> dict[str, str]:
+            from urllib.parse import parse_qs, urlsplit
+
+            raw = parse_qs(urlsplit(self.path).query)
+            return {k: v[0] for k, v in raw.items() if v}
 
         def do_GET(self) -> None:  # noqa: N802 - firma imposta da BaseHTTPRequestHandler
             path = self.path.split("?")[0].rstrip("/") or "/"
@@ -5028,6 +5661,33 @@ def make_http_server(engine: "Engine"):
                         "server_ts": now_ms()},
             if path == "/orderbook":
                 return engine.market.book.snapshot_dict(levels=20),
+            if path == "/candles":
+                params = self._query()
+                label = params.get("interval", "1m")
+                seconds = CANDLE_INTERVALS.get(label)
+                if seconds is None:
+                    return {"error": "intervallo sconosciuto",
+                            "available": list(CANDLE_INTERVALS)}, 400
+                limit = max(10, min(600, int(params.get("limit", 240))))
+                candles = engine.store.candles(seconds, limit)
+                since = candles[0]["t"] if candles else now_ms() - 3_600_000
+                return {
+                    "interval": label, "bucket_s": seconds,
+                    "count": len(candles), "candles": candles,
+                    "markers": engine.store.trade_markers(since),
+                    "last_price": (engine.market.last_tick.mid
+                                   if engine.market.last_tick else None),
+                    "server_ts": now_ms(),
+                    "note": ("Barre aggregate dai tick registrati: una barra "
+                             "copre solo il tempo in cui il motore girava. I "
+                             "buchi sono fermi veri, non dati mancanti."),
+                },
+            if path == "/paper-trades":
+                params = self._query()
+                limit = max(1, min(500, int(params.get("limit", 50))))
+                trades = engine.store.paper_trades(limit=limit)
+                return {"count": len(trades), "trades": trades,
+                        "mode": "SOLO CARTA - nessun ordine inviato ad alcun venue"},
             if path == "/features":
                 return {"latest": _finite(engine.features.latest),
                         "computed": engine.features.computed},
@@ -5785,6 +6445,75 @@ def cmd_selftest(cfg: Config, args) -> int:
                 f"{counts['features']} feature, {counts['shadow_decisions']} shadow, "
                 f"replay {replay['trades']} trade")
 
+    # ----------------------------------------------------- grafico e API
+    def t_ui() -> str:
+        """Aggregazione OHLC e superficie HTTP: il grafico e la dashboard."""
+        import tempfile
+        from urllib.request import urlopen
+
+        path = os.path.join(tempfile.mkdtemp(), "ui.db")
+        # port 0 significa "niente dashboard", quindi qui se ne prende una
+        # libera davvero, altrimenti non ci sarebbe nulla da interrogare.
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        free_port = probe.getsockname()[1]
+        probe.close()
+        c = Config(source="sim", db_path=path, sim_seed=2, min_warmup_s=0.0,
+                   http_port=free_port, quiet=True, auto_retrain=False, payout=0.8)
+        store = Store(c)
+        store.start()
+        # Due minuti esatti di tick, allineati al minuto: senza l'allineamento
+        # i 120 secondi cadrebbero a cavallo di tre bucket e il valore atteso
+        # sarebbe una coincidenza del timestamp scelto.
+        base = (1_700_000_000_000 // 60_000) * 60_000
+        for i in range(120):
+            price = 100_000.0 + (i % 60)      # dente di sega su ogni minuto
+            store.add("market_ticks", Tick(
+                ts=base + i * 1000, exchange="t", symbol="BTCUSDT",
+                bid_price=price - 0.01, bid_qty=1.0, ask_price=price + 0.01,
+                ask_qty=1.0).row())
+        store.flush()
+        bars = store.candles(60, limit=10)
+        assert len(bars) == 2, f"barre da 1m: {len(bars)}"
+        first = bars[0]
+        assert first["o"] == 100_000.0, f"apertura {first['o']}"
+        assert first["c"] == 100_059.0, f"chiusura {first['c']}"
+        assert first["h"] == 100_059.0 and first["l"] == 100_000.0, "massimo/minimo"
+        assert first["n"] == 60, f"tick nella barra: {first['n']}"
+        fine = store.candles(15, limit=20)
+        assert len(fine) == 8, f"barre da 15s: {len(fine)}"
+
+        engine = Engine(c, store=store)
+        engine.start()
+        try:
+            assert engine.http is not None, "server HTTP non avviato"
+            port = engine.http.server_address[1]
+            page = urlopen(f"http://127.0.0.1:{port}/", timeout=5).read().decode()
+            assert "AURUM ENGINE" in page and "id=\"chart\"" in page, "dashboard"
+            assert "5s" in page and "30m" in page, "selettore degli intervalli"
+            api = json.loads(urlopen(
+                f"http://127.0.0.1:{port}/candles?interval=1m", timeout=5).read())
+            assert api["count"] == 2 and api["bucket_s"] == 60, api
+            # Un intervallo inesistente deve essere un 400 con la lista di
+            # quelli validi, non una risposta vuota che sembra "nessun dato".
+            from urllib.error import HTTPError
+            try:
+                urlopen(f"http://127.0.0.1:{port}/candles?interval=7h", timeout=5)
+                raise AssertionError("intervallo ignoto accettato")
+            except HTTPError as exc:
+                assert exc.code == 400, exc.code
+                bad = json.loads(exc.read())
+                assert "error" in bad and "available" in bad, bad
+            hist = json.loads(urlopen(
+                f"http://127.0.0.1:{port}/paper-trades", timeout=5).read())
+            assert "trades" in hist and "SOLO CARTA" in hist["mode"]
+        finally:
+            engine.stop()
+        os.unlink(path)
+        return (f"{len(bars)} barre da 1m e {len(fine)} da 15s corrette, "
+                f"dashboard e API servite")
+
+    check("grafico a candele e API della dashboard", t_ui)
     check("websocket (framing, frammenti, ping, lunghezze)", t_ws)
     check("order book (sequenza e desync)", t_book)
     check("feature engine (r10, n5, ofi)", t_features)
