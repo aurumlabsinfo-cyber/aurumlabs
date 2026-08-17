@@ -232,7 +232,42 @@ Su `http://localhost:8000`, servita dallo stesso file, senza librerie esterne:
 * sessione BURST-15, performance con intervallo di confidenza e pareggio
   richiesto, stato dell'apprendimento e salute del sistema.
 
-Verificato: `selftest` supera 10/10 (aggregazione OHLC e API della dashboard,
+### Il portafoglio e i cicli
+
+Il motore ragionava solo in *unita' di puntata*: una misura statistica che non
+risponde alla domanda pratica, quanto avrei adesso. Ora c'e' un conto vero (su
+carta): capitale iniziale, puntata per operazione, saldo, esposizione, drawdown
+e curva del capitale.
+
+```bash
+python3 aurum_engine.py run --payout 0.85 --capital 500 --stake-amount 10
+python3 aurum_engine.py wallet
+```
+
+Quando il saldo non copre piu' una puntata il ciclo e' finito: il motore si
+ferma, **studia** (lo stesso walk-forward, con la stessa regola di attivazione -
+un modello entra in produzione solo se il verdetto regge), e **riapre** un ciclo
+nuovo con il capitale iniziale. Lo studio gira su un thread separato: farlo nel
+ciclo di mercato vorrebbe dire un feed fermo, che per definizione e' NO TRADE.
+
+Tre scelte che vale la pena spiegare:
+
+* **il saldo e' la somma del registro**, non un contatore in memoria. Ogni
+  movimento e' una riga con il saldo risultante: il conto si ricostruisce e si
+  verifica riga per riga, anche dopo un riavvio;
+* **la puntata si fissa all'ingresso**. Con la puntata in percentuale,
+  calcolarla alla chiusura significherebbe pagare le perdite col saldo di prima
+  e incassare le vincite con quello di dopo;
+* **senza payout il portafoglio resta spento**. Un saldo in denaro senza il
+  payout del broker non e' definito, e viene dichiarato tale.
+
+Una precisazione che il codice stesso stampa: **ricominciare non recupera
+niente.** Il capitale del ciclo bruciato e' perso. Quello che i cicli danno e'
+una misura onesta - quanti se ne bruciano, quanto durano, se durano di piu' man
+mano che il motore impara - non una seconda possibilita' sulla stessa puntata.
+
+Verificato: `selftest` supera 11/11 (portafoglio con azzeramento, studio e
+ciclo nuovo, aggregazione OHLC e API della dashboard,
 framing WebSocket con frammentazione e ping, sequenza dell'order book, feature,
 regole di BURST-15, coerenza delle soglie, database, apprendimento con
 calibrazione e guardia OOD, statistica, motore end-to-end). L'interfaccia e'

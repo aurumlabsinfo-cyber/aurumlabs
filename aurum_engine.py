@@ -188,6 +188,29 @@ class Config:
     payout: float | None = None
     stake: float = 1.0
 
+    # ---------------------------------------------------------- portafoglio
+    # Denaro FINTO, su carta. Serve a rispondere alla domanda che le "unita' di
+    # puntata" non rispondono: quanto avrei adesso, e quanto ho rischiato per
+    # arrivarci. Senza payout noto il saldo non e' calcolabile e viene
+    # dichiarato tale, non inventato.
+    wallet_start: float = 500.0
+    wallet_currency: str = "EUR"
+    #: "fixed"   - sempre la stessa cifra (stake_amount)
+    #: "percent" - una quota del saldo corrente (stake_percent), quindi composta
+    stake_mode: str = "fixed"
+    stake_amount: float = 10.0
+    stake_percent: float = 1.0
+    #: Il conto e' AZZERATO quando non regge piu' nemmeno una puntata. Sopra
+    #: questa soglia il ciclo continua; sotto, si chiude.
+    wallet_min_balance: float = 0.0
+    #: Perdita massima in una giornata, nella valuta. 0 = nessun limite.
+    wallet_max_daily_loss: float = 0.0
+    #: Quando il conto si azzera: studia su tutto quello che ha registrato,
+    #: attiva un modello solo se il verdetto walk-forward regge, poi riapre un
+    #: ciclo nuovo con il capitale iniziale.
+    wallet_auto_restart: bool = True
+    wallet_study_on_reset: bool = True
+
     # ------------------------------------------------------ apprendimento
     auto_retrain: bool = True
     retrain_interval_s: float = 1800.0
@@ -354,6 +377,7 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     expiry_price REAL, confidence REAL, edge REAL, regime TEXT, horizon_s REAL,
     triggered_at INTEGER, expires_at INTEGER, settled_at INTEGER,
     result TEXT, pnl_units REAL, payout REAL, stake REAL,
+    stake_amount REAL, pnl_money REAL, balance_after REAL,
     data_quality REAL, features TEXT, is_synthetic INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_paper_ts ON paper_trades(ts);
@@ -371,6 +395,12 @@ CREATE TABLE IF NOT EXISTS model_versions (
     horizon_s REAL, symbol TEXT, n_train INTEGER, feature_names TEXT,
     metrics TEXT, edge_classification TEXT, artifact TEXT, is_active INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS wallet_ledger (
+    ts INTEGER NOT NULL, kind TEXT, signal_id TEXT, direction TEXT, result TEXT,
+    stake REAL, payout REAL, amount REAL, balance_after REAL, note TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_wallet_ts ON wallet_ledger(ts);
 
 CREATE TABLE IF NOT EXISTS events (
     ts INTEGER NOT NULL, component TEXT, kind TEXT, severity TEXT, detail TEXT
@@ -404,6 +434,10 @@ COLUMNS: dict[str, tuple[str, ...]] = {
         "ts", "symbol", "lean", "prob_up", "confidence", "edge", "horizon_s",
         "reference_price", "regime", "emitted", "blocked_by", "data_quality",
         "model_id", "is_synthetic",
+    ),
+    "wallet_ledger": (
+        "ts", "kind", "signal_id", "direction", "result", "stake", "payout",
+        "amount", "balance_after", "note",
     ),
     "events": ("ts", "component", "kind", "severity", "detail"),
 }
@@ -539,7 +573,7 @@ class Store:
             out = {}
             for table in (
                 "market_ticks", "trades", "features", "signals", "paper_trades",
-                "shadow_decisions", "model_versions",
+                "shadow_decisions", "model_versions", "wallet_ledger",
             ):
                 out[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             return out
@@ -588,6 +622,15 @@ class Store:
                 [row[k] for k in keys],
             )
             self._conn.commit()
+
+    def ledger(self, limit: int | None = None) -> list[dict]:
+        conn = self.reader()
+        try:
+            sql = "SELECT * FROM wallet_ledger ORDER BY ts ASC, rowid ASC"
+            rows = [dict(r) for r in conn.execute(sql)]
+            return rows[-limit:] if limit else rows
+        finally:
+            conn.close()
 
     def candles(self, interval_s: int, limit: int = 240,
                 include_synthetic: bool = True) -> list[dict]:
@@ -3366,6 +3409,10 @@ class LiveSignal:
     data_quality: float = 0.0
     model_id: str | None = None
     is_synthetic: bool = False
+    #: Denaro davvero a rischio su questa operazione, fissato all'ingresso.
+    stake_amount: float = 0.0
+    pnl_money: float | None = None
+    balance_after: float | None = None
     features: dict = field(default_factory=dict)
 
     def to_dict(self, server_ts: int | None = None) -> dict[str, Any]:
@@ -3403,6 +3450,7 @@ class SignalEngine:
         self.decisions = DecisionEngine(cfg, model=model,
                                         performance=self.agent_hit_rates)
         self.burst = BurstStrategy(cfg)
+        self.wallet = Wallet(cfg, store)
         self.active: dict[str, LiveSignal] = {}
         self.history: list[LiveSignal] = []
         self.last_decision: Decision | None = None
@@ -3443,6 +3491,14 @@ class SignalEngine:
             self._bump_gate("massimo di segnali contemporanei")
             self._shadow(decision, vector, False, ["max concurrent"])
             return decision
+        # Il portafoglio e' un cancello come gli altri: se il conto non regge
+        # un'altra puntata, non c'e' segnale da emettere.
+        allowed, why = self.wallet.can_trade()
+        if not allowed:
+            self._bump_gate("portafoglio: " + gate_key(why))
+            decision.no_trade_reasons.append("portafoglio: " + why)
+            self._shadow(decision, vector, False, ["portafoglio"])
+            return decision
         # BURST-15 ha il proprio cooldown di sessione: sovrapporgli quello
         # dell'ensemble modificherebbe in silenzio la regola della strategia.
         if self.strategy != "burst15" and (
@@ -3479,6 +3535,8 @@ class SignalEngine:
             is_synthetic=self.market.is_synthetic,
             features=vector.get("features", {}),
         )
+        sig.stake_amount = self.wallet.next_stake()
+        self.wallet.reserve(sid, sig.stake_amount)
         self.active[sid] = sig
         self.last_signal_ts = decision.ts
         self.counters["signals"] += 1
@@ -3576,6 +3634,8 @@ class SignalEngine:
 
     def _finish(self, sig: LiveSignal) -> None:
         self.active.pop(sig.signal_id, None)
+        sig.pnl_money = self.wallet.settle(sig.signal_id, sig.result, sig.settled_at)
+        sig.balance_after = self.wallet.balance if self.wallet.active else None
         if sig.strategy == "burst15":
             self.burst.on_settled(sig.signal_id, sig.result, sig.settled_at)
         self.history.append(sig)
@@ -3679,7 +3739,9 @@ class SignalEngine:
             "triggered_at": sig.triggered_at, "expires_at": sig.expires_at,
             "settled_at": sig.settled_at, "result": sig.result,
             "pnl_units": sig.pnl_units, "payout": self.cfg.payout,
-            "stake": self.cfg.stake, "data_quality": sig.data_quality,
+            "stake": self.cfg.stake, "stake_amount": sig.stake_amount,
+            "pnl_money": sig.pnl_money, "balance_after": sig.balance_after,
+            "data_quality": sig.data_quality,
             "features": json.dumps(_finite(sig.features), default=str),
             "is_synthetic": int(sig.is_synthetic),
         })
@@ -3718,6 +3780,7 @@ class SignalEngine:
                 self.burst.session.to_dict(ts)
                 if self.strategy == "burst15" and self.burst.session else None
             ),
+            "wallet": self.wallet.status(),
             "is_synthetic": self.market.is_synthetic,
         }
 
@@ -3942,6 +4005,359 @@ def monte_carlo(results: list[str], payout: float | None, stake: float = 1.0,
         "probability_of_ruin": round(ruins / simulations, 4),
         "median_max_drawdown": round(percentile(sorted(drawdowns), 0.5) or 0.0, 3),
     }
+
+
+# --------------------------------------------------------------------------- #
+#  PORTAFOGLIO (denaro finto, su carta)
+# --------------------------------------------------------------------------- #
+
+
+class Wallet:
+    """Il conto: capitale, puntata, saldo, esposizione, drawdown, e i CICLI.
+
+    Le "unita' di puntata" rispondono alla domanda statistica; questo risponde a
+    quella pratica: quanto avrei adesso, e quanto ho rischiato per arrivarci.
+
+    Quando il saldo non regge piu' nemmeno una puntata il ciclo e' finito. Il
+    motore allora si ferma, STUDIA tutto quello che ha registrato - lo stesso
+    walk-forward di sempre, con la stessa regola di attivazione - e solo dopo
+    riapre un ciclo nuovo con il capitale iniziale.
+
+    Va detto con chiarezza, perche' e' il punto in cui e' piu' facile mentirsi:
+    **ricominciare non recupera niente.** Il capitale del ciclo precedente e'
+    perso. Quello che i cicli danno e' una misura onesta - quanti ne bruci,
+    quanto durano, se durano di piu' man mano che impara - non una seconda
+    possibilita' sulla stessa puntata.
+
+    Tre regole non negoziabili:
+
+    * senza payout noto il denaro NON e' calcolabile: il portafoglio si dichiara
+      inattivo invece di stampare un saldo inventato;
+    * il saldo e' la somma del registro, non un contatore in memoria: ogni
+      movimento e' una riga con il saldo risultante, ricostruibile e
+      verificabile;
+    * la puntata si fissa all'ingresso. Con la puntata in percentuale,
+      calcolarla alla chiusura significherebbe pagare le perdite con il saldo di
+      prima e incassare le vincite con quello di dopo.
+    """
+
+    OPERATIVA, STUDIO, CHIUSA = "OPERATIVA", "STUDIO", "CHIUSA"
+
+    def __init__(self, cfg: Config, store: Store | None) -> None:
+        self.cfg = cfg
+        self.store = store
+        self.balance = float(cfg.wallet_start)
+        self.cycle = 1
+        self.cycle_start_ts = now_ms()
+        self.cycle_trades = 0
+        self.state = self.OPERATIVA
+        self.exposure = 0.0
+        self.opened = 0
+        self.closed = 0
+        self.peak = self.balance
+        self.max_drawdown = 0.0
+        self.history: list[tuple[int, float]] = []
+        self.cycles: list[dict[str, Any]] = []
+        self.day_key = self._day(now_ms())
+        self.day_start_balance = self.balance
+        self.study_result: dict[str, Any] | None = None
+        #: Chiamato quando il conto si azzera. Il motore ci attacca lo studio,
+        #: che gira su un thread suo: addestrare dentro il ciclo di mercato
+        #: bloccherebbe il feed per secondi.
+        self.on_bust: Callable[["Wallet"], None] | None = None
+        self._reserved: dict[str, float] = {}
+        self._load()
+
+    # -------------------------------------------------------------- stato
+    @property
+    def active(self) -> bool:
+        """Senza payout il denaro non e' definito: meglio niente di un numero
+        inventato."""
+        return self.cfg.payout is not None
+
+    @staticmethod
+    def _day(ts: int) -> str:
+        return time.strftime("%Y-%m-%d", time.localtime(ts / 1000))
+
+    def _write(self, kind: str, ts: int, **fields: Any) -> None:
+        if self.store is None:
+            return
+        row = {"ts": ts, "kind": kind, "signal_id": None, "direction": None,
+               "result": None, "stake": None, "payout": self.cfg.payout,
+               "amount": 0.0, "balance_after": self.balance, "note": None}
+        row.update(fields)
+        self.store.add("wallet_ledger", row)
+
+    def _load(self) -> None:
+        """Ricostruisce saldo e ciclo dal registro.
+
+        Se il registro e' vuoto apre il conto con un versamento iniziale: cosi'
+        anche il capitale di partenza e' una riga verificabile, non un valore
+        implicito che nessuno puo' controllare."""
+        if self.store is None:
+            self.history = [(now_ms(), self.balance)]
+            return
+        # Le scritture sono accodate e svuotate da un thread: senza questo, un
+        # registro non ancora scaricato sembrerebbe vuoto e il conto si
+        # riaprirebbe in silenzio al capitale iniziale, cancellando la storia.
+        self.store.flush()
+        rows = self.store.ledger()
+        if not rows:
+            ts = now_ms()
+            self.balance = float(self.cfg.wallet_start)
+            self.cycle_start_ts = ts
+            self._write("APERTURA", ts, amount=self.balance,
+                        note=f"ciclo 1 · capitale {self.balance:.2f} "
+                             f"{self.cfg.wallet_currency}")
+            self.history = [(ts, self.balance)]
+            return
+
+        self.balance = float(rows[-1]["balance_after"])
+        self.history = [(r["ts"], float(r["balance_after"])) for r in rows]
+        self.cycle = max(1, sum(1 for r in rows if r["kind"] == "APERTURA"))
+        self.closed = sum(1 for r in rows if r["kind"] == "TRADE")
+        opens = [r for r in rows if r["kind"] == "APERTURA"]
+        self.cycle_start_ts = int(opens[-1]["ts"]) if opens else int(rows[0]["ts"])
+        self.cycle_trades = sum(1 for r in rows
+                                if r["kind"] == "TRADE" and r["ts"] >= self.cycle_start_ts)
+        # I cicli conclusi si ricostruiscono dal registro: apertura, quante
+        # operazioni ci sono state in mezzo, azzeramento. Contarle qui invece di
+        # leggerle dalla nota significa che restano vere anche fra un riavvio e
+        # l'altro - ed e' quel conteggio, non il saldo di adesso, a dire se il
+        # motore stia migliorando.
+        prev_open = int(rows[0]["ts"])
+        trades_in_cycle = 0
+        for r in rows:
+            if r["kind"] == "TRADE":
+                trades_in_cycle += 1
+            elif r["kind"] == "AZZERATO":
+                ended = int(r["ts"])
+                self.cycles.append({
+                    "cycle": len(self.cycles) + 1, "started_ts": prev_open,
+                    "ended_ts": ended, "trades": trades_in_cycle,
+                    "minutes": round((ended - prev_open) / 60000.0, 2),
+                    "end_balance": float(r["balance_after"]),
+                    "note": r["note"],
+                })
+                trades_in_cycle = 0
+            elif r["kind"] == "APERTURA":
+                prev_open = int(r["ts"])
+                trades_in_cycle = 0
+
+        self.peak = max((b for _, b in self.history), default=self.balance)
+        run_peak = -1e18
+        for _, b in self.history:
+            run_peak = max(run_peak, b)
+            self.max_drawdown = min(self.max_drawdown, b - run_peak)
+        today = [b for ts, b in self.history if self._day(ts) == self.day_key]
+        self.day_start_balance = today[0] if today else self.balance
+
+    # ------------------------------------------------------------ puntata
+    #: Sotto questa cifra una puntata non ha piu' senso: nessun broker la
+    #: accetterebbe e il conto e' finito comunque.
+    MIN_MEANINGFUL_STAKE = 0.01
+
+    def desired_stake(self) -> float:
+        """La puntata che la regola CHIEDE, senza guardare se il conto la copre.
+
+        Va tenuta distinta da quella effettiva: se la si taglia sul saldo, un
+        conto da 5 euro "puo' sempre puntare 5" e non si azzera mai - diventa
+        solo sempre piu' piccolo. Con puntata fissa, non coprire la puntata E'
+        la fine del ciclo.
+        """
+        if not self.active:
+            return 0.0
+        if self.cfg.stake_mode == "percent":
+            return round(max(0.0, self.balance * self.cfg.stake_percent / 100.0), 2)
+        return round(max(0.0, float(self.cfg.stake_amount)), 2)
+
+    def next_stake(self) -> float:
+        """Quanto si rischia davvero sulla prossima operazione: la puntata
+        richiesta se il saldo la copre, altrimenti zero (ciclo finito)."""
+        want = self.desired_stake()
+        return want if self.balance >= want and want >= self.MIN_MEANINGFUL_STAKE else 0.0
+
+    def is_busted(self) -> bool:
+        """Il ciclo e' finito quando il conto non regge piu' una puntata."""
+        if not self.active:
+            return False
+        want = self.desired_stake()
+        if self.balance <= 0 or want < self.MIN_MEANINGFUL_STAKE:
+            return True
+        return self.balance < max(self.cfg.wallet_min_balance, want)
+
+    def can_trade(self) -> tuple[bool, str]:
+        if not self.active:
+            return (True, "")   # senza denaro il portafoglio non e' un vincolo
+        cur = self.cfg.wallet_currency
+        if self.state == self.STUDIO:
+            return (False, f"conto azzerato al ciclo {self.cycle}: studio in "
+                           f"corso prima di riaprire")
+        if self.state == self.CHIUSA:
+            return (False, f"conto azzerato al ciclo {self.cycle} e riapertura "
+                           f"automatica disattivata")
+        if self.is_busted():
+            return (False, f"saldo {self.balance:.2f} {cur} non copre una "
+                           f"puntata da {self.desired_stake():.2f}")
+        limit = self.cfg.wallet_max_daily_loss
+        if limit > 0 and (self.day_start_balance - self.balance) >= limit:
+            return (False, f"perdita giornaliera "
+                           f"{self.day_start_balance - self.balance:.2f} al limite "
+                           f"di {limit:.2f} {cur}")
+        return (True, "")
+
+    # ---------------------------------------------------------- movimenti
+    def reserve(self, signal_id: str, stake: float) -> None:
+        """Blocca la puntata all'ingresso: e' capitale a rischio, non piu'
+        disponibile per un'altra operazione."""
+        if not self.active or stake <= 0:
+            return
+        self._reserved[signal_id] = stake
+        self.exposure += stake
+        self.opened += 1
+
+    def settle(self, signal_id: str, result: str | None,
+               ts: int | None = None) -> float | None:
+        """Applica l'esito, scrive la riga di registro, e chiude il ciclo se il
+        conto e' finito. Ritorna il movimento in valuta."""
+        stake = self._reserved.pop(signal_id, None)
+        if not self.active or stake is None:
+            return None
+        self.exposure = max(0.0, self.exposure - stake)
+        payout = float(self.cfg.payout or 0.0)
+        if result == WIN:
+            amount = stake * payout
+        elif result == LOSS:
+            amount = -stake
+        else:
+            amount = 0.0   # TIE o CANCELLED: la puntata torna al suo posto
+
+        ts = ts or now_ms()
+        day = self._day(ts)
+        if day != self.day_key:
+            self.day_key = day
+            self.day_start_balance = self.balance
+        self.balance = round(self.balance + amount, 2)
+        self.closed += 1
+        self.cycle_trades += 1
+        self.peak = max(self.peak, self.balance)
+        self.max_drawdown = min(self.max_drawdown, self.balance - self.peak)
+        self.history.append((ts, self.balance))
+        self.history = self.history[-5000:]
+        self._write("TRADE", ts, signal_id=signal_id, result=result, stake=stake,
+                    amount=round(amount, 2))
+
+        if self.is_busted() and self.state == self.OPERATIVA:
+            self._bust(ts)
+        return amount
+
+    def _bust(self, ts: int) -> None:
+        """Il ciclo e' bruciato: si registra, si ferma, si passa allo studio."""
+        duration_min = (ts - self.cycle_start_ts) / 60000.0
+        note = (f"ciclo {self.cycle} azzerato dopo {self.cycle_trades} operazioni "
+                f"e {duration_min:.1f} minuti")
+        self._write("AZZERATO", ts, amount=0.0, note=note)
+        self.cycles.append({
+            "cycle": self.cycle, "started_ts": self.cycle_start_ts,
+            "ended_ts": ts, "trades": self.cycle_trades,
+            "minutes": round(duration_min, 2),
+            "end_balance": self.balance, "note": note,
+        })
+        self.cycles = self.cycles[-100:]
+        self.state = self.STUDIO if self.cfg.wallet_auto_restart else self.CHIUSA
+        if self.store is not None:
+            self.store.event("wallet", "bust", "WARNING", note)
+        if self.on_bust is not None and self.cfg.wallet_auto_restart:
+            try:
+                self.on_bust(self)
+            except Exception as exc:  # noqa: BLE001 - lo studio non ferma il motore
+                self.study_result = {"error": f"{type(exc).__name__}: {exc}"}
+                self.start_new_cycle("riapertura dopo studio fallito")
+
+    def start_new_cycle(self, note: str | None = None) -> None:
+        """Riapre con il capitale iniziale. Il ciclo precedente resta perso: e'
+        un ricominciare, non un recupero."""
+        ts = now_ms()
+        self.cycle += 1
+        self.cycle_start_ts = ts
+        self.cycle_trades = 0
+        self.balance = float(self.cfg.wallet_start)
+        self.exposure = 0.0
+        self._reserved.clear()
+        self.peak = self.balance
+        self.day_key = self._day(ts)
+        self.day_start_balance = self.balance
+        self.state = self.OPERATIVA
+        self.history.append((ts, self.balance))
+        self._write("APERTURA", ts, amount=self.balance,
+                    note=(note or f"ciclo {self.cycle} · capitale "
+                                  f"{self.balance:.2f} {self.cfg.wallet_currency}"))
+
+    # -------------------------------------------------------------- viste
+    def status(self) -> dict[str, Any]:
+        cfg = self.cfg
+        if not self.active:
+            return {
+                "active": False, "currency": cfg.wallet_currency,
+                "start": cfg.wallet_start, "state": "SPENTO",
+                "reason": ("PAYOUT SCONOSCIUTO: senza il payout del broker un "
+                           "saldo in denaro non e' definito. Passa --payout 0.8 "
+                           "(il tuo valore) e il portafoglio si accende."),
+            }
+        pnl = self.balance - cfg.wallet_start
+        closed = [c for c in self.cycles if c.get("minutes") is not None]
+        return {
+            "active": True, "state": self.state,
+            "currency": cfg.wallet_currency,
+            "start": round(cfg.wallet_start, 2),
+            "balance": round(self.balance, 2),
+            "exposure": round(self.exposure, 2),
+            "open_trades": len(self._reserved),
+            "pnl_cycle": round(pnl, 2),
+            "pnl_cycle_pct": round(pnl / cfg.wallet_start * 100.0, 2)
+            if cfg.wallet_start else None,
+            "peak": round(self.peak, 2),
+            "max_drawdown": round(self.max_drawdown, 2),
+            "day_pnl": round(self.balance - self.day_start_balance, 2),
+            "cycle": self.cycle,
+            "cycle_trades": self.cycle_trades,
+            "cycle_minutes": round((now_ms() - self.cycle_start_ts) / 60000.0, 1),
+            "cycles_burned": len(self.cycles),
+            "cycles": self.cycles[-10:][::-1],
+            "avg_cycle_minutes": (
+                round(sum(c["minutes"] for c in closed) / len(closed), 1)
+                if closed else None
+            ),
+            "avg_cycle_trades": (
+                round(sum(c["trades"] for c in closed) / len(closed), 1)
+                if closed else None
+            ),
+            "trades_closed_total": self.closed,
+            "next_stake": self.next_stake(),
+            "stake_rule": (f"{cfg.stake_percent:g}% del saldo"
+                           if cfg.stake_mode == "percent"
+                           else f"{cfg.stake_amount:g} {cfg.wallet_currency} a operazione"),
+            "desired_stake": self.desired_stake(),
+            "trades_to_zero": (int(self.balance // self.desired_stake())
+                               if self.desired_stake() > 0 else 0),
+            "auto_restart": cfg.wallet_auto_restart,
+            "last_study": self.study_result,
+            "payout": cfg.payout,
+            "breakeven_win_rate": round(breakeven_win_rate(float(cfg.payout)), 4),
+            "note": ("Denaro FINTO: nessun ordine e' mai stato inviato. E "
+                     "ricominciare dopo un azzeramento non recupera il capitale "
+                     "del ciclo bruciato: quello che i cicli misurano e' quanti "
+                     "ne servono e quanto durano."),
+        }
+
+    def equity_curve(self, points: int = 240) -> list[dict[str, Any]]:
+        if not self.active or not self.history:
+            return []
+        rows = self.history
+        if len(rows) > points:
+            step = len(rows) / points
+            rows = [rows[int(i * step)] for i in range(points)] + [rows[-1]]
+        return [{"t": t, "balance": round(b, 2)} for t, b in rows]
 
 
 # --------------------------------------------------------------------------- #
@@ -4934,6 +5350,14 @@ header{position:sticky;top:0;z-index:30;background:rgba(8,10,15,.92);
 @media(max-width:1080px){.g2,.g3,.g4{grid-template-columns:1fr}}
 .mb{margin-bottom:14px}
 
+/* ---------------------------------------------------------- portafoglio */
+.wal-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}
+.wal-big{font-size:38px;font-weight:800;letter-spacing:-.02em;line-height:1.1}
+.wal-cycle{font-size:26px;font-weight:800}
+.k{font-size:9.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.09em}
+.eq-wrap{position:relative;height:132px}
+#equity{width:100%;height:100%}
+
 /* --------------------------------------------------------------- chart */
 .chart-wrap{position:relative;height:400px}
 canvas{display:block;width:100%;height:100%}
@@ -5023,6 +5447,43 @@ footer{margin-top:22px;padding-top:14px;border-top:1px solid var(--line);
 
 <div class="wrap">
 <div id="banner"></div>
+
+<!-- -------------------------------------------------------- PORTAFOGLIO -->
+<div class="panel mb">
+  <div class="ph">
+    <div><h2>Portafoglio</h2><div class="sub" id="wal-sub">—</div></div>
+    <span class="pill" id="wal-state">—</span>
+  </div>
+  <div class="pb">
+    <div class="grid" style="grid-template-columns:1.1fr 1fr;gap:16px">
+      <div>
+        <div class="wal-head">
+          <div><div class="k">Saldo</div><div class="wal-big tnum" id="wal-balance">—</div>
+            <div class="tnum" id="wal-pnl">—</div></div>
+          <div style="text-align:right">
+            <div class="k">Ciclo</div><div class="wal-cycle tnum" id="wal-cycle">—</div>
+            <div class="muted" id="wal-cycle-sub" style="font-size:10.5px">—</div></div>
+        </div>
+        <div class="cells" style="grid-template-columns:repeat(4,1fr);margin-top:14px">
+          <div class="cell"><div class="k">Puntata</div>
+            <div class="v tnum" id="wal-stake">—</div></div>
+          <div class="cell"><div class="k">A rischio ora</div>
+            <div class="v tnum" id="wal-exposure">—</div></div>
+          <div class="cell"><div class="k">Puntate allo zero</div>
+            <div class="v tnum" id="wal-tozero">—</div></div>
+          <div class="cell"><div class="k">Drawdown max</div>
+            <div class="v tnum" id="wal-dd">—</div></div>
+        </div>
+      </div>
+      <div>
+        <div class="k" style="margin-bottom:6px">Curva del capitale</div>
+        <div class="eq-wrap"><canvas id="equity"></canvas></div>
+        <div id="wal-cycles" style="margin-top:10px"></div>
+      </div>
+    </div>
+    <div id="wal-note" class="muted" style="font-size:10.5px;margin-top:12px"></div>
+  </div>
+</div>
 
 <!-- ------------------------------------------------------------ GRAFICO -->
 <div class="panel mb">
@@ -5311,9 +5772,103 @@ function loadCandles(){
   }).catch(function(){});
 }
 
+/* --------------------------------------------------------- curva capitale */
+var eq = $("equity"), ex = eq.getContext("2d");
+function drawEquity(points, start){
+  var r = eq.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  eq.width = Math.max(1, Math.floor(r.width*dpr));
+  eq.height = Math.max(1, Math.floor(r.height*dpr));
+  ex.setTransform(dpr,0,0,dpr,0,0);
+  ex.clearRect(0,0,r.width,r.height);
+  if(!points || points.length < 2){
+    ex.fillStyle = "#6d7a90"; ex.font = "11px system-ui"; ex.textAlign = "center";
+    ex.fillText("nessun movimento ancora", r.width/2, r.height/2);
+    return;
+  }
+  var vals = points.map(function(p){ return p.balance; });
+  var hi = Math.max.apply(null, vals.concat([start]));
+  var lo = Math.min.apply(null, vals.concat([start]));
+  var pad = (hi-lo)*0.12 || 1; hi += pad; lo -= pad;
+  var W = r.width, H = r.height, m = 4;
+  var X = function(i){ return m + (i/(points.length-1))*(W-2*m); };
+  var Y = function(v){ return m + (1-(v-lo)/(hi-lo))*(H-2*m); };
+  // linea del capitale iniziale: sopra si e' in guadagno, sotto in perdita
+  var y0 = Y(start);
+  ex.setLineDash([3,3]); ex.strokeStyle = "#2a3547"; ex.lineWidth = 1;
+  ex.beginPath(); ex.moveTo(0,y0); ex.lineTo(W,y0); ex.stroke(); ex.setLineDash([]);
+  var last = vals[vals.length-1];
+  var col = last >= start ? "#26c281" : "#ef4c5a";
+  var grad = ex.createLinearGradient(0,0,0,H);
+  grad.addColorStop(0, last >= start ? "rgba(38,194,129,.28)" : "rgba(239,76,90,.28)");
+  grad.addColorStop(1, "rgba(0,0,0,0)");
+  ex.beginPath(); ex.moveTo(X(0), Y(vals[0]));
+  for(var i=1;i<vals.length;i++) ex.lineTo(X(i), Y(vals[i]));
+  ex.strokeStyle = col; ex.lineWidth = 1.8; ex.stroke();
+  ex.lineTo(X(vals.length-1), H); ex.lineTo(X(0), H); ex.closePath();
+  ex.fillStyle = grad; ex.fill();
+  // i punti in cui il conto e' stato riaperto: risalite verticali al capitale
+  ex.fillStyle = "#f0a12e";
+  for(var k=1;k<vals.length;k++){
+    if(vals[k] === start && vals[k-1] < start*0.5){
+      ex.beginPath(); ex.arc(X(k), Y(vals[k]), 3, 0, 6.2832); ex.fill();
+    }
+  }
+}
+
 /* ===================================================================== *
  *  PANNELLI                                                             *
  * ===================================================================== */
+function renderWallet(w){
+  var cur = w.currency || "EUR";
+  $("wal-state").textContent = w.active ? w.state : "SPENTO";
+  $("wal-state").className = "pill" + (w.active
+    ? (w.state === "OPERATIVA" ? " on" : " warn") : "");
+  if(!w.active){
+    $("wal-sub").textContent = "non calcolabile";
+    $("wal-balance").textContent = "—";
+    $("wal-pnl").textContent = "";
+    $("wal-cycle").textContent = "—";
+    $("wal-cycle-sub").textContent = "";
+    ["wal-stake","wal-exposure","wal-tozero","wal-dd"].forEach(function(id){
+      $(id).textContent = "—"; });
+    $("wal-note").textContent = w.reason || "";
+    $("wal-cycles").innerHTML = "";
+    drawEquity([], 0);
+    return;
+  }
+  $("wal-sub").textContent = w.stake_rule + " · payout " + w.payout
+    + " · pareggio " + pct(w.breakeven_win_rate);
+  $("wal-balance").textContent = num(w.balance) + " " + cur;
+  $("wal-balance").className = "wal-big tnum " + (w.balance >= w.start ? "up" : "down");
+  var sign = w.pnl_cycle >= 0 ? "+" : "";
+  $("wal-pnl").textContent = sign + num(w.pnl_cycle) + " " + cur
+    + " (" + sign + Number(w.pnl_cycle_pct).toFixed(2) + "%) sul ciclo";
+  $("wal-pnl").className = "tnum " + (w.pnl_cycle >= 0 ? "up" : "down");
+  $("wal-cycle").textContent = "#" + w.cycle;
+  $("wal-cycle-sub").textContent = w.cycle_trades + " operazioni · "
+    + w.cycle_minutes + " min" + (w.cycles_burned ? " · " + w.cycles_burned
+      + " cicli bruciati" : "");
+  $("wal-stake").textContent = num(w.next_stake || w.desired_stake) + " " + cur;
+  $("wal-exposure").textContent = num(w.exposure) + " " + cur;
+  $("wal-tozero").textContent = w.trades_to_zero;
+  $("wal-dd").textContent = num(w.max_drawdown) + " " + cur;
+  var cy = (w.cycles || []).slice(0,4);
+  $("wal-cycles").innerHTML = cy.length
+    ? '<table><thead><tr><th>Ciclo bruciato</th><th class="n">operazioni</th>'
+      + '<th class="n">durata</th></tr></thead><tbody>'
+      + cy.map(function(c){ return '<tr><td class="muted">#'+c.cycle+'</td>'
+        + '<td class="n">'+(c.trades===null?"—":c.trades)+'</td>'
+        + '<td class="n muted">'+(c.minutes===undefined?"—":c.minutes+" min")+'</td></tr>';
+        }).join("") + '</tbody></table>'
+    : '<div class="muted" style="font-size:10.5px">nessun ciclo bruciato finora</div>';
+  var study = w.last_study;
+  $("wal-note").innerHTML = (study
+    ? '<b>Ultimo studio dopo l&#39;azzeramento:</b> '
+      + esc(study.edge || study.skipped || study.error || "—")
+      + (study.note ? " · " + esc(study.note) : "") + "<br>"
+    : "") + esc(w.note || "");
+  drawEquity(w.equity_curve, w.start);
+}
 function renderSignal(s, d){
   var sig = s.signal, box = $("signal");
   $("sig-state").textContent = sig ? sig.status : "IN ANALISI";
@@ -5455,24 +6010,28 @@ function renderHistory(h){
     '<div class="empty">nessuna operazione chiusa: appariranno qui appena il motore ne conclude una</div>';
     return; }
   $("history").innerHTML = '<table><thead><tr>'
-    + '<th>Ora</th><th>Strategia</th><th>Dir</th><th class="n">Ingresso</th>'
+    + '<th>Ora</th><th>Dir</th><th class="n">Ingresso</th>'
     + '<th class="n">Uscita</th><th class="n">Var.</th><th>Esito</th>'
-    + '<th class="n">P&amp;L</th><th class="n">Durata</th><th class="n">Conf.</th>'
+    + '<th class="n">Puntata</th><th class="n">Esito &euro;</th>'
+    + '<th class="n">Saldo</th><th class="n">Durata</th><th class="n">Conf.</th>'
     + '</tr></thead><tbody>'
     + rows.map(function(t){
       var mv = (t.entry_price && t.expiry_price)
         ? (t.expiry_price-t.entry_price)/t.entry_price*10000 : null;
       var dur = (t.settled_at && t.triggered_at) ? (t.settled_at-t.triggered_at) : null;
+      var money = t.pnl_money;
       return '<tr><td class="tnum muted">'+hhmm(t.triggered_at||t.ts)+'</td>'
-        + '<td class="muted">'+esc(t.strategy||"—")+'</td>'
         + '<td><span class="tag '+t.direction+'">'+t.direction+'</span></td>'
         + '<td class="n">'+num(t.entry_price)+'</td>'
         + '<td class="n">'+num(t.expiry_price)+'</td>'
         + '<td class="n '+(mv>0?"up":(mv<0?"down":"muted"))+'">'
           +(mv===null?"—":(mv>0?"+":"")+mv.toFixed(2)+" bps")+'</td>'
         + '<td><span class="tag '+t.result+'">'+t.result+'</span></td>'
-        + '<td class="n '+(t.pnl_units>0?"up":(t.pnl_units<0?"down":"muted"))+'">'
-          +(t.pnl_units===null||t.pnl_units===undefined?"—":(t.pnl_units>0?"+":"")+t.pnl_units.toFixed(2))+'</td>'
+        + '<td class="n muted">'+(t.stake_amount?num(t.stake_amount):"—")+'</td>'
+        + '<td class="n '+(money>0?"up":(money<0?"down":"muted"))+'">'
+          +(money===null||money===undefined?"—":(money>0?"+":"")+num(money))+'</td>'
+        + '<td class="n">'+(t.balance_after===null||t.balance_after===undefined
+          ?"—":num(t.balance_after))+'</td>'
         + '<td class="n muted">'+(dur===null?"—":(dur/1000).toFixed(1)+"s")+'</td>'
         + '<td class="n muted">'+pct(t.confidence)+'</td></tr>';
     }).join("") + '</tbody></table>';
@@ -5535,9 +6094,10 @@ function tickFast(){
 
 function tickSlow(){
   Promise.all([get("/statistics"), get("/retrain"), get("/health"),
-               get("/paper-trades?limit=60"), get("/db")])
+               get("/paper-trades?limit=60"), get("/db"), get("/wallet")])
     .then(function(r){
-      var st=r[0], rt=r[1], hl=r[2], hist=r[3], db=r[4];
+      var st=r[0], rt=r[1], hl=r[2], hist=r[3], db=r[4], wal=r[5];
+      renderWallet(wal);
       $("perf").innerHTML = kv([
         ["Segnali", String(st.signals)],
         ["Chiusi", String(st.settled)],
@@ -5700,6 +6260,12 @@ def make_http_server(engine: "Engine"):
                         "no_trade_reasons": (
                             engine.signals.last_decision.no_trade_reasons
                             if engine.signals.last_decision else [])},
+            if path == "/wallet":
+                w = engine.signals.wallet
+                return {**w.status(), "equity_curve": w.equity_curve(),
+                        "ledger": (engine.store.ledger(limit=100)
+                                   if engine.store else []),
+                        "server_ts": now_ms()},
             if path == "/burst/session":
                 return {**engine.signals.burst.status(),
                         "active_strategy": cfg.strategy},
@@ -5754,6 +6320,7 @@ class Engine:
         self.signals = SignalEngine(cfg, self.market, self.features, self.store,
                                     self.model)
         self.retrainer = Retrainer(cfg, self.store, on_model=self._activate_model)
+        self.signals.wallet.on_bust = self._on_wallet_bust
         self.http = None
         self.started_at = now_ms()
         self._last_feature_ts = 0
@@ -5769,6 +6336,37 @@ class Engine:
                 self.model = Model.from_json(artifact)
         except Exception as exc:  # noqa: BLE001 - un modello rotto non blocca il feed
             self.market.record_error("model", f"caricamento fallito: {exc}")
+
+    def _on_wallet_bust(self, wallet: Wallet) -> None:
+        """Il conto si e' azzerato: studia su tutto il registrato, poi riapri.
+
+        Su un thread separato, e non per eleganza: l'addestramento impiega
+        secondi, e farlo dentro il ciclo di mercato vorrebbe dire un feed fermo,
+        che per definizione e' NO TRADE. Finche' lo studio gira il portafoglio
+        resta in stato STUDIO e nessun segnale viene emesso - il che e'
+        esattamente quello che deve succedere.
+        """
+        def study() -> None:
+            result: dict[str, Any] = {"skipped": "studio disattivato"}
+            t0 = time.time()
+            try:
+                if self.cfg.wallet_study_on_reset:
+                    self._log(f"conto azzerato al ciclo {wallet.cycle}: studio su "
+                              f"tutto quello che ho registrato...")
+                    result = self.retrainer.run_once()
+            except Exception as exc:  # noqa: BLE001 - il motore non si ferma qui
+                result = {"error": f"{type(exc).__name__}: {exc}"}
+            finally:
+                wallet.study_result = {**result, "seconds": round(time.time() - t0, 1)}
+                verdict = (result.get("edge") or result.get("skipped")
+                           or result.get("error") or "nessun verdetto")
+                wallet.start_new_cycle(
+                    f"ciclo {wallet.cycle + 1} dopo studio: {verdict}"
+                )
+                self._log(f"studio concluso ({verdict}) · riparto con "
+                          f"{wallet.balance:.2f} {self.cfg.wallet_currency} "
+                          f"al ciclo {wallet.cycle}")
+        threading.Thread(target=study, name="wallet-study", daemon=True).start()
 
     def _activate_model(self, model: Model) -> None:
         self.model = model
@@ -5935,9 +6533,14 @@ class Engine:
         if self.cfg.strategy == "burst15" and self.signals.burst.session:
             s = self.signals.burst.session
             session = f" | sessione {s.pnl_units:+.1f}u {s.trades}t"
+        wallet = ""
+        w = self.signals.wallet
+        if w.active:
+            wallet = (f" | {w.balance:.0f}{self.cfg.wallet_currency[:1]} "
+                      f"c{w.cycle}" + (" STUDIO" if w.state == w.STUDIO else ""))
         sys.stdout.write(
             f"\r\033[K{price}  dec {c['decisions']}  seg {c['signals']}  "
-            f"V/P/= {c['wins']}/{c['losses']}/{c['ties']}{session}{gate}"
+            f"V/P/= {c['wins']}/{c['losses']}/{c['ties']}{wallet}{session}{gate}"
         )
         sys.stdout.flush()
 
@@ -6057,6 +6660,18 @@ def _open_existing(cfg: Config) -> Store:
             f"oppure indica il percorso completo con --db /percorso/aurum.db"
         )
     return Store(cfg)
+
+
+def cmd_wallet(cfg: Config, args) -> int:
+    """Saldo, movimenti e regole di puntata, ricostruiti dal registro."""
+    store = _open_existing(cfg)
+    wallet = Wallet(cfg, store)
+    out = wallet.status()
+    out["ledger_tail"] = store.ledger(limit=args.limit)
+    out["equity_curve_points"] = len(wallet.equity_curve())
+    print(json.dumps(out, indent=2, ensure_ascii=False, default=str))
+    store.stop()
+    return 0
 
 
 def cmd_stats(cfg: Config, args) -> int:
@@ -6513,6 +7128,90 @@ def cmd_selftest(cfg: Config, args) -> int:
         return (f"{len(bars)} barre da 1m e {len(fine)} da 15s corrette, "
                 f"dashboard e API servite")
 
+    # ---------------------------------------------------------- portafoglio
+    def t_wallet() -> str:
+        """500 euro, puntate da 10, azzeramento, studio, ciclo nuovo."""
+        import tempfile
+
+        path = os.path.join(tempfile.mkdtemp(), "wallet.db")
+        c = Config(db_path=path, payout=0.8, wallet_start=500.0,
+                   stake_amount=10.0, stake_mode="fixed", wallet_auto_restart=True)
+        store = Store(c)
+        store.start()
+        w = Wallet(c, store)
+        assert w.active and w.balance == 500.0, "conto non aperto a 500"
+        assert w.next_stake() == 10.0, f"puntata {w.next_stake()}"
+        assert w.status()["trades_to_zero"] == 50, "50 puntate da 10 su 500"
+
+        # una vinta: +8 con payout 0.8, e la puntata torna disponibile
+        w.reserve("a", w.next_stake())
+        assert w.exposure == 10.0, "la puntata deve risultare a rischio"
+        assert w.settle("a", WIN) == 8.0
+        assert w.balance == 508.0 and w.exposure == 0.0, w.balance
+
+        # un pareggio non muove il conto
+        w.reserve("b", w.next_stake())
+        assert w.settle("b", TIE) == 0.0 and w.balance == 508.0
+
+        # lo studio viene richiesto UNA volta, all'azzeramento
+        studied = []
+
+        def fake_study(wallet):
+            studied.append(wallet.cycle)
+            wallet.study_result = {"edge": "NESSUN EDGE ROBUSTO IDENTIFICATO"}
+            wallet.start_new_cycle("ciclo di prova")
+
+        w.on_bust = fake_study
+        # 508 euro reggono 50 puntate da 10: alla 50esima il conto non copre
+        # piu' la puntata successiva e il ciclo finisce.
+        losses = 0
+        for i in range(80):
+            if studied:
+                break                              # azzerato: si ferma qui
+            stake = w.next_stake()
+            assert stake == 10.0, f"puntata {stake} alla perdita {i}"
+            w.reserve(f"L{i}", stake)
+            w.settle(f"L{i}", LOSS)
+            losses += 1
+        assert losses == 50, f"azzerato dopo {losses} perdite invece di 50"
+
+        assert studied == [1], f"studio invocato {studied}"
+        assert w.cycle == 2, f"ciclo {w.cycle}"
+        assert w.balance == 500.0, f"riaperto a {w.balance}"
+        assert len(w.cycles) == 1 and w.cycles[0]["trades"] > 0, w.cycles
+        st = w.status()
+        assert st["cycles_burned"] == 1 and st["state"] == "OPERATIVA", st["state"]
+
+        # senza riapertura automatica il conto resta chiuso e non opera piu'
+        c2 = Config(db_path=path, payout=0.8, wallet_start=20.0,
+                    stake_amount=10.0, wallet_auto_restart=False)
+        w2 = Wallet(c2, store)
+        w2.balance = 5.0
+        assert w2.is_busted(), "5 euro non coprono una puntata da 10"
+        ok, why = w2.can_trade()
+        assert not ok and "non copre" in why, why
+
+        # il saldo si ricostruisce dal registro, non da un contatore in memoria
+        store.flush()
+        reloaded = Wallet(c, store)
+        assert reloaded.balance == 500.0, f"ricostruito a {reloaded.balance}"
+        assert reloaded.cycle == 2, f"ciclo ricostruito {reloaded.cycle}"
+        ledger = store.ledger()
+        kinds = [r["kind"] for r in ledger]
+        assert kinds.count("APERTURA") == 2 and "AZZERATO" in kinds, kinds
+        assert abs(ledger[-1]["balance_after"] - 500.0) < 1e-9
+
+        # senza payout il denaro non e' calcolabile e lo dice
+        blind = Wallet(Config(db_path=":memory:", payout=None), None)
+        assert not blind.active
+        assert "PAYOUT SCONOSCIUTO" in blind.status()["reason"]
+
+        store.stop()
+        os.unlink(path)
+        return (f"500 -> azzerato in {w.cycles[0]['trades']} operazioni -> studio "
+                f"-> ciclo 2 a 500, registro coerente")
+
+    check("portafoglio (cicli, azzeramento, studio, registro)", t_wallet)
     check("grafico a candele e API della dashboard", t_ui)
     check("websocket (framing, frammenti, ping, lunghezze)", t_ws)
     check("order book (sequenza e desync)", t_book)
@@ -6546,6 +7245,7 @@ COMMANDS: dict[str, Callable[[Config, Any], int]] = {
     "burst": cmd_burst,
     "burst-grid": cmd_burst_grid,
     "shadow": cmd_shadow,
+    "wallet": cmd_wallet,
     "config": cmd_config,
     "selftest": cmd_selftest,
 }
@@ -6564,6 +7264,8 @@ def build_parser() -> argparse.ArgumentParser:
   %(prog)s run --source sim               simulatore, senza rete
   %(prog)s run --source csv --csv trades.csv
   %(prog)s run --proxy http://127.0.0.1:3128
+  %(prog)s wallet                         saldo, cicli e registro di cassa
+  %(prog)s run --capital 500 --stake-amount 10
   %(prog)s stats                          statistiche del paper trading
   %(prog)s backtest                       walk-forward su cio' che ha registrato
   %(prog)s burst                          replay di BURST-15, sessioni incluse
@@ -6578,6 +7280,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--payout", type=float,
                    help="payout del broker, es. 0.8. Senza, nessun P&L monetario")
     p.add_argument("--stake", type=float)
+    p.add_argument("--capital", type=float, help="capitale iniziale del portafoglio")
+    p.add_argument("--currency", help="valuta mostrata, es. EUR")
+    p.add_argument("--stake-mode", choices=["fixed", "percent"],
+                   help="puntata fissa o percentuale del saldo")
+    p.add_argument("--stake-amount", type=float, help="puntata fissa, in valuta")
+    p.add_argument("--stake-percent", type=float,
+                   help="puntata come percentuale del saldo")
+    p.add_argument("--min-balance", type=float,
+                   help="sotto questo saldo il motore smette di operare")
+    p.add_argument("--max-daily-loss", type=float,
+                   help="perdita massima giornaliera in valuta, 0 = nessun limite")
     p.add_argument("--db", help="percorso del database SQLite")
     p.add_argument("--proxy", help="http://host:porta per REST e WebSocket")
     p.add_argument("--csv", help="file di trade per --source csv")
@@ -6593,6 +7306,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-synthetic", action="store_true",
                    help="INQUINA il report: le righe del simulatore non sono mercato")
     p.add_argument("--min-trades", type=int, default=30, help="soglia per burst-grid")
+    p.add_argument("--limit", type=int, default=25,
+                   help="righe di registro mostrate da `wallet`")
     p.add_argument("--json", action="store_true", help="una riga JSON per evento")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--seed", type=int, help="seme del simulatore")
@@ -6615,6 +7330,14 @@ def apply_args(cfg: Config, args) -> Config:
         cfg.payout = args.payout
     if args.stake is not None:
         cfg.stake = args.stake
+    for attr, name in (("capital", "wallet_start"), ("currency", "wallet_currency"),
+                       ("stake_mode", "stake_mode"), ("stake_amount", "stake_amount"),
+                       ("stake_percent", "stake_percent"),
+                       ("min_balance", "wallet_min_balance"),
+                       ("max_daily_loss", "wallet_max_daily_loss")):
+        value = getattr(args, attr, None)
+        if value is not None:
+            setattr(cfg, name, value)
     if args.port is not None:
         cfg.http_port = args.port
     if args.warmup is not None:

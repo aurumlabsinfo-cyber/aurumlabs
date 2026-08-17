@@ -62,14 +62,39 @@ attivazione solo se il verdetto regge.
 | `backtest` | walk-forward su cio' che ha registrato |
 | `burst` / `burst-grid` | replay di BURST-15, sessioni incluse, e la griglia di soglie |
 | `shadow` | anche le finestre che NON sono state tradate |
-| `selftest` | 10 verifiche interne, nessuna rete richiesta |
+| `wallet` | saldo, cicli, regole di puntata e registro di cassa |
+| `selftest` | 11 verifiche interne, nessuna rete richiesta |
 
-La dashboard su `:8000` e' servita dallo stesso file: grafico a candele
-sempre in vista (5s / 15s / 1m / 5m / 10m / 30m) con le operazioni disegnate
-sopra, il segnale corrente con il countdown, la diagnostica dei cancelli, cosa
-sta analizzando il motore in questo momento (gli otto agenti oppure le tre
-condizioni di BURST-15, piu' la microstruttura), la sessione, le statistiche,
-l'apprendimento, la salute e lo storico completo delle operazioni.
+La dashboard su `:8000` e' servita dallo stesso file: **portafoglio** con saldo,
+puntata, curva del capitale e ciclo in corso; grafico a candele sempre in vista
+(5s / 15s / 1m / 5m / 10m / 30m) con le operazioni disegnate sopra; il segnale
+corrente con il countdown; la diagnostica dei cancelli; cosa sta analizzando il
+motore in questo momento (gli otto agenti oppure le tre condizioni di BURST-15,
+piu' la microstruttura); la sessione, le statistiche, l'apprendimento, la salute
+e lo storico completo delle operazioni con puntata, esito in euro e saldo.
+
+### Il portafoglio
+
+```bash
+python3 aurum_engine.py run --payout 0.85 \
+    --capital 500 --stake-amount 10        # 500 EUR, 10 EUR a operazione
+python3 aurum_engine.py wallet             # saldo, cicli, registro di cassa
+```
+
+Il conto parte da `--capital` (500 EUR di default) e rischia `--stake-amount`
+per operazione (10 di default; con `--stake-mode percent --stake-percent 2`
+punta invece una quota del saldo, quindi composta). Quando il saldo non copre
+piu' una puntata il **ciclo e' bruciato**: il motore si ferma, ri-studia tutto
+quello che ha registrato con lo stesso walk-forward di sempre, attiva un modello
+solo se il verdetto regge, e riapre un ciclo nuovo con il capitale iniziale.
+
+Ogni movimento e' una riga nel registro (`wallet_ledger`), quindi il saldo e'
+ricostruibile e verificabile - non un contatore in memoria. **Senza `--payout`
+il portafoglio resta spento**: senza il payout del broker un saldo in denaro non
+e' definito, e il motore lo dichiara invece di inventarlo.
+
+E va detto: ricominciare dopo un azzeramento **non recupera** il capitale
+bruciato. Quello che i cicli misurano e' quanti ne servono e quanto durano.
 
 Cosa resta solo nel progetto completo: la ricerca di strategie con correzione
 per test multipli, l'importatore dell'archivio storico Binance, i modelli ad
