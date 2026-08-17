@@ -224,7 +224,7 @@ class Config:
     #: "fixed"   - sempre la stessa cifra (stake_amount)
     #: "percent" - una quota del saldo corrente (stake_percent), quindi composta
     stake_mode: str = "fixed"
-    stake_amount: float = 10.0
+    stake_amount: float = 25.0
     stake_percent: float = 1.0
     #: Il conto e' AZZERATO quando non regge piu' nemmeno una puntata. Sopra
     #: questa soglia il ciclo continua; sotto, si chiude.
@@ -5976,7 +5976,7 @@ cv.addEventListener("mouseleave", function(){ state.hover=null;
   $("tip").style.display="none"; drawChart(); });
 window.addEventListener("resize", drawChart);
 
-var INTERVALS = ["5s","15s","1m","5m","10m","30m"];
+var INTERVALS = ["5s","20s","1m","5m","10m","30m"];
 $("tabs").innerHTML = INTERVALS.map(function(i){
   return '<button data-i="'+i+'"'+(i===state.interval?' class="sel"':'')+'>'+i+'</button>';
 }).join("");
@@ -6402,7 +6402,7 @@ setInterval(loadCandles, 4000);
 #: Intervalli offerti al grafico. Il motore opera su 5 secondi: su una candela
 #: da 30 minuti un suo trade e' invisibile, quindi ci sono anche i tagli corti.
 CANDLE_INTERVALS: dict[str, int] = {
-    "5s": 5, "15s": 15, "1m": 60, "5m": 300, "10m": 600, "30m": 1800,
+    "5s": 5, "15s": 15, "20s": 20, "1m": 60, "5m": 300, "10m": 600, "30m": 1800,
 }
 
 
@@ -7692,7 +7692,10 @@ def cmd_selftest(cfg: Config, args) -> int:
             port = engine.http.server_address[1]
             page = urlopen(f"http://127.0.0.1:{port}/", timeout=5).read().decode()
             assert "AURUM ENGINE" in page and "id=\"chart\"" in page, "dashboard"
-            assert "5s" in page and "30m" in page, "selettore degli intervalli"
+            assert "5s" in page and "20s" in page and "30m" in page, \
+                "selettore degli intervalli"
+            # 120 secondi di tick danno esattamente 6 barre da 20s.
+            assert len(store.candles(20, limit=20)) == 6, "barre da 20s"
             api = json.loads(urlopen(
                 f"http://127.0.0.1:{port}/candles?interval=1m", timeout=5).read())
             assert api["count"] == 2 and api["bucket_s"] == 60, api

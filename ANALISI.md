@@ -216,8 +216,8 @@ supporto proxy su REST **e** WebSocket.
 Su `http://localhost:8002`, servita dallo stesso file, senza librerie esterne:
 
 * **grafico a candele sempre in vista**, con intervallo selezionabile fra
-  5s, 15s, 1m, 5m, 10m e 30m. I tagli corti ci sono perche' il motore opera su
-  cinque secondi: su una candela da 30 minuti una sua operazione e' invisibile.
+  5s, 20s, 1m, 5m, 10m e 30m. I tagli corti ci sono perche' un'operazione dura
+  un minuto: su una candela da 30 minuti sarebbe invisibile.
   Le barre sono aggregate dagli stessi tick che il motore ha consumato, non da
   un secondo feed che potrebbe raccontare un'altra storia;
 * **le operazioni disegnate sul grafico**: triangolo all'ingresso, pallino
@@ -241,7 +241,7 @@ carta): capitale iniziale, puntata per operazione, saldo, esposizione, drawdown
 e curva del capitale.
 
 ```bash
-python3 aurum_engine.py run --payout 0.85 --capital 500 --stake-amount 10
+python3 aurum_engine.py run --payout 0.85 --capital 500 --stake-amount 25
 python3 aurum_engine.py wallet
 ```
 

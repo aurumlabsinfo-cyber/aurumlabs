@@ -88,7 +88,7 @@ attivazione solo se il verdetto regge.
 
 La dashboard su `:8002` e' servita dallo stesso file: **portafoglio** con saldo,
 puntata, curva del capitale e ciclo in corso; grafico a candele sempre in vista
-(5s / 15s / 1m / 5m / 10m / 30m) con le operazioni disegnate sopra; il segnale
+(5s / 20s / 1m / 5m / 10m / 30m) con le operazioni disegnate sopra; il segnale
 corrente con il countdown; la diagnostica dei cancelli; cosa sta analizzando il
 motore in questo momento (gli otto agenti oppure le tre condizioni di BURST-15,
 piu' la microstruttura); la sessione, le statistiche, l'apprendimento, la salute
@@ -98,12 +98,13 @@ e lo storico completo delle operazioni con puntata, esito in euro e saldo.
 
 ```bash
 python3 aurum_engine.py run --payout 0.85 \
-    --capital 500 --stake-amount 10        # 500 EUR, 10 EUR a operazione
+    --capital 500 --stake-amount 25        # e' anche il default
 python3 aurum_engine.py wallet             # saldo, cicli, registro di cassa
 ```
 
 Il conto parte da `--capital` (500 EUR di default) e rischia `--stake-amount`
-per operazione (10 di default; con `--stake-mode percent --stake-percent 2`
+per operazione (25 di default, cioe' 20 puntate prima dello zero; con
+`--stake-mode percent --stake-percent 2`
 punta invece una quota del saldo, quindi composta). Quando il saldo non copre
 piu' una puntata il **ciclo e' bruciato**: il motore si ferma, ri-studia tutto
 quello che ha registrato con lo stesso walk-forward di sempre, attiva un modello
