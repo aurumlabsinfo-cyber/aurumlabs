@@ -62,6 +62,7 @@ attivazione solo se il verdetto regge.
 | `backtest` | walk-forward su cio' che ha registrato |
 | `burst` / `burst-grid` | replay di BURST-15, sessioni incluse, e la griglia di soglie |
 | `shadow` | anche le finestre che NON sono state tradate |
+| `diagnose` | perche' non arrivano segnali, in italiano, senza browser |
 | `wallet` | saldo, cicli, regole di puntata e registro di cassa |
 | `selftest` | 11 verifiche interne, nessuna rete richiesta |
 
@@ -205,6 +206,7 @@ If it shows NO TRADE for longer than you expect, do not start turning
 thresholds down. Ask the engine:
 
 ```bash
+python3 aurum_engine.py diagnose        # motore a file singolo
 curl localhost:8000/diagnostics | jq '.verdict, .blocking_gates'
 ```
 

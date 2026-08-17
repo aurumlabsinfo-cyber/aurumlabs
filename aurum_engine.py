@@ -1045,7 +1045,9 @@ class Tick:
     ask_price: float
     ask_qty: float
     last_price: float | None = None
-    latency_ms: float = 0.0
+    #: None = non misurata. Diverso da 0.0, che vorrebbe dire "istantanea":
+    #: dichiarare zero una latenza mai calcolata e' una bugia comoda.
+    latency_ms: float | None = None
     book_synced: bool = False
     is_synthetic: bool = False
 
@@ -1273,6 +1275,22 @@ class Feed:
         self.reconnects = 0
         self.last_error: str | None = None
         self.last_message_ts: int | None = None
+        #: Ultimo ritardo misurato fra l'orario dell'exchange e il nostro.
+        #: Il book ticker di Binance non porta un timestamp, quindi eredita
+        #: quello dell'ultimo messaggio che ce l'aveva.
+        self.last_latency_ms: float | None = None
+
+    def measure_latency(self, exchange_ts: Any) -> float | None:
+        try:
+            lat = now_ms() - int(exchange_ts)
+        except (TypeError, ValueError):
+            return None
+        # Un orologio locale indietro rispetto al venue darebbe latenze
+        # negative: sono un problema di orologio, non del feed, e come tali
+        # vanno riportate a zero invece di inquinare le statistiche.
+        lat = max(0.0, float(lat))
+        self.last_latency_ms = lat
+        return lat
 
     def poll(self, timeout: float) -> list[Any]:
         raise NotImplementedError
@@ -1289,6 +1307,7 @@ class Feed:
             "messages": self.messages, "reconnects": self.reconnects,
             "last_error": self.last_error, "synthetic": self.synthetic,
             "last_message_ts": self.last_message_ts,
+            "last_latency_ms": self.last_latency_ms,
         }
 
 
@@ -1369,23 +1388,28 @@ class BinanceFeed(Feed):
         ts = now_ms()
         etype = data.get("e")
         if etype == "trade":
+            self.measure_latency(data.get("E"))
             return TradePrint(
                 ts=ts, exchange=self.name, symbol=data["s"],
                 trade_id=int(data["t"]), price=float(data["p"]),
                 quantity=float(data["q"]), is_buyer_maker=bool(data["m"]),
             )
         if etype == "depthUpdate":
+            self.measure_latency(data.get("E"))
             return DepthUpdate(
                 ts=ts, first_id=int(data["U"]), final_id=int(data["u"]),
                 bids=[(float(p), float(q)) for p, q in data.get("b", [])],
                 asks=[(float(p), float(q)) for p, q in data.get("a", [])],
             )
         if "b" in data and "a" in data and "u" in data and "e" not in data:
-            # bookTicker: nessun campo "e", solo u/s/b/B/a/A
+            # bookTicker: nessun campo "e", solo u/s/b/B/a/A - e nessun
+            # timestamp del venue, quindi la latenza e' quella dell'ultimo
+            # messaggio che ne portava uno.
             return Tick(
                 ts=ts, exchange=self.name, symbol=data.get("s", self.symbol),
                 bid_price=float(data["b"]), bid_qty=float(data["B"]),
                 ask_price=float(data["a"]), ask_qty=float(data["A"]),
+                latency_ms=self.last_latency_ms,
             )
         return None
 
@@ -1478,6 +1502,14 @@ class CoinbaseFeed(Feed):
                 continue
             mtype = msg.get("type")
             ts = now_ms()
+            iso = msg.get("time")
+            if iso:
+                try:
+                    from datetime import datetime
+                    self.measure_latency(int(datetime.fromisoformat(
+                        iso.replace("Z", "+00:00")).timestamp() * 1000))
+                except ValueError:
+                    pass
             if mtype == "ticker" and msg.get("best_bid") and msg.get("best_ask"):
                 out.append(Tick(
                     ts=ts, exchange=self.name, symbol=self.symbol,
@@ -1486,6 +1518,7 @@ class CoinbaseFeed(Feed):
                     ask_price=float(msg["best_ask"]),
                     ask_qty=float(msg.get("best_ask_size") or 0.0),
                     last_price=float(msg["price"]) if msg.get("price") else None,
+                    latency_ms=self.last_latency_ms,
                 ))
             elif mtype in ("match", "last_match"):
                 self._seq += 1
@@ -1562,7 +1595,8 @@ class SyntheticFeed(Feed):
         out: list[Any] = [
             Tick(ts=ts, exchange=self.name, symbol=self.symbol,
                  bid_price=bids[0][0], bid_qty=bids[0][1],
-                 ask_price=asks[0][0], ask_qty=asks[0][1], is_synthetic=True),
+                 ask_price=asks[0][0], ask_qty=asks[0][1],
+                 latency_ms=0.0, is_synthetic=True),
             DepthUpdate(ts=ts, first_id=self._update_id, final_id=self._update_id,
                         bids=bids, asks=asks),
         ]
@@ -2061,7 +2095,8 @@ class MarketData:
             if self.last_trade is not None:
                 event.last_price = self.last_trade.price
             self.last_tick = event
-            self.latencies.append(event.latency_ms)
+            if event.latency_ms is not None:
+                self.latencies.append(event.latency_ms)
             if self.store and self.cfg.persist_ticks:
                 self.store.add("market_ticks", event.row())
         elif isinstance(event, TradePrint):
@@ -2096,9 +2131,14 @@ class MarketData:
         """Punteggio 0..1 spiegabile. Un guasto grave lo porta a 0."""
         cfg = self.cfg
         reasons: list[str] = []
+        # `reasons` BLOCCA, `notes` informa e basta. Tenerli separati e' il
+        # motivo per cui "la latenza non e' misurabile su questo feed" non
+        # diventa un divieto di operare: e' un'informazione mancante, non un
+        # guasto.
+        notes: list[str] = []
         if self.last_tick is None:
             return {"score": 0.0, "ok": False, "warmup_complete": False,
-                    "reasons": ["nessun dato di mercato ricevuto"]}
+                    "reasons": ["nessun dato di mercato ricevuto"], "notes": []}
 
         score = 1.0
         age = self.feed_age_ms or 0.0
@@ -2113,8 +2153,10 @@ class MarketData:
             reasons.append(f"book non sincronizzato: {self.book.desync_reason}")
             score = 0.0
 
-        p95 = percentile(list(self.latencies), 0.95) or 0.0
-        if p95 > cfg.max_latency_ms:
+        p95 = percentile(list(self.latencies), 0.95)
+        if p95 is None:
+            notes.append("latenza non misurata su questo feed")
+        elif p95 > cfg.max_latency_ms:
             reasons.append(f"latenza p95 {p95:.0f}ms > {cfg.max_latency_ms:.0f}ms")
             score = 0.0
         elif p95 > cfg.max_latency_ms / 2:
@@ -2139,6 +2181,8 @@ class MarketData:
             "ok": score >= cfg.min_data_quality and warm,
             "warmup_complete": warm,
             "reasons": reasons,
+            "notes": notes,
+            "latency_p95_ms": p95,
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -6662,6 +6706,89 @@ def _open_existing(cfg: Config) -> Store:
     return Store(cfg)
 
 
+def cmd_diagnose(cfg: Config, args) -> int:
+    """Perche' non arrivano segnali - in italiano, senza browser ne' curl.
+
+    Interroga il motore in esecuzione e traduce la diagnostica in una risposta
+    leggibile, con il consiglio giusto per il cancello che sta bloccando.
+    """
+    url = f"http://{cfg.http_host}:{cfg.http_port}/diagnostics"
+    try:
+        d = http_get_json(url, None, timeout=5)
+    except Exception as exc:  # noqa: BLE001 - e' un diagnostico
+        print(f"Non riesco a parlare con il motore su {url}")
+        print(f"  {type(exc).__name__}: {exc}\n")
+        print("  Il motore e' in esecuzione? Deve girare in un altro terminale con")
+        print("  la dashboard attiva (senza --port 0). Se usi una porta diversa,")
+        print("  passala anche qui: --port 8123")
+        return 1
+
+    feed = d.get("feed", {})
+    q = feed.get("data_quality", {})
+    print(f"AURUM ENGINE - diagnosi ({d['strategy']})\n")
+    print(f"  {d['verdict']}\n")
+    print(f"  finestre valutate : {d['decisions_evaluated']}")
+    print(f"  segnali emessi    : {d['signals_emitted']}"
+          f"  ({d['signals_per_hour']:.1f}/ora)")
+    print(f"  attivo da         : {d['uptime_s']:.0f}s")
+    print(f"  feed              : {feed.get('source')}"
+          f"{' (SIMULATO)' if feed.get('is_synthetic') else ''}"
+          f" · {'connesso' if (feed.get('adapter') or {}).get('connected') else 'DISCONNESSO'}")
+    if (feed.get("adapter") or {}).get("last_error"):
+        print(f"  errore adapter    : {feed['adapter']['last_error']}")
+    print(f"  book              : {'sincronizzato' if feed.get('book_synced') else feed.get('book_desync_reason')}")
+    print(f"  qualita' dati     : {q.get('score')}")
+    for note in q.get("notes", []):
+        print(f"                      nota: {note}")
+
+    gates = d.get("blocking_gates") or []
+    if gates:
+        print("\n  Cosa blocca, in ordine:")
+        for g in gates[:6]:
+            print(f"    {g['share_of_decisions']:6.1%}  {g['gate']}  ({g['count']}x)")
+
+    #: Il consiglio dipende dal cancello, e nessuno di questi consigli e'
+    #: "alza le soglie finche' non esce qualcosa".
+    advice = [
+        ("nessun dato", "Il feed non arriva. Lancia `check`: se fallisce e' rete, "
+                        "non configurazione. Prova --proxy o --source coinbase."),
+        ("book", "Lo snapshot REST non riesce. Stesso rimedio: `check`, poi --proxy."),
+        ("riscaldamento", "Sta solo scaldando. Aspetta, oppure riparti con --warmup 15."),
+        ("tape troppo calma", "BURST-15 chiede molti scambi in 5 secondi: in un'ora "
+                              "tranquilla non li trova. Guarda 'trade/s' sulla "
+                              "dashboard e, se il mercato e' davvero cosi', abbassa "
+                              "--n5 a quel valore."),
+        ("movimento", "Il mercato si muove meno della soglia. --r10 piu' basso, ma "
+                      "prima guarda `shadow`: le finestre scartate avrebbero vinto?"),
+        ("flusso discorde", "Il flusso non conferma il movimento. Si puo' togliere "
+                            "il vincolo con --no-ofi, ed e' il primo da testare in "
+                            "`burst-grid`."),
+        ("accordo fra agenti", "Gli otto agenti non concordano abbastanza. E' il "
+                               "cancello piu' stretto dell'ensemble: prova "
+                               "--strategy burst15, che ha regole esplicite."),
+        ("confidenza", "La direzione non e' abbastanza netta. Vedi `shadow` prima "
+                       "di toccare min_edge."),
+        ("cooldown", "Sta operando: il cooldown fra un'operazione e l'altra e' il "
+                     "cancello piu' frequente quando le cose funzionano."),
+        ("portafoglio", "Il conto non regge un'altra puntata: guarda `wallet`."),
+        ("massimo di segnali", "C'e' gia' un'operazione aperta. Normale."),
+    ]
+    top = (d.get("binding_gate") or "").lower()
+    print()
+    for key, text in advice:
+        if key in top:
+            print(f"  Consiglio: {text}")
+            break
+    else:
+        if d["signals_emitted"] == 0:
+            print("  Consiglio: nessun cancello ha ancora bloccato - il motore non "
+                  "ha valutato abbastanza finestre. Aspetta un minuto.")
+    print("\n  Prima di allentare qualsiasi soglia: `shadow` dice se le finestre "
+          "scartate\n  da quel cancello avrebbero vinto. E' l'unica prova che "
+          "distingue un filtro\n  che ti protegge da uno che ti costa.")
+    return 0
+
+
 def cmd_wallet(cfg: Config, args) -> int:
     """Saldo, movimenti e regole di puntata, ricostruiti dal registro."""
     store = _open_existing(cfg)
@@ -7245,6 +7372,7 @@ COMMANDS: dict[str, Callable[[Config, Any], int]] = {
     "burst": cmd_burst,
     "burst-grid": cmd_burst_grid,
     "shadow": cmd_shadow,
+    "diagnose": cmd_diagnose,
     "wallet": cmd_wallet,
     "config": cmd_config,
     "selftest": cmd_selftest,
@@ -7264,6 +7392,7 @@ def build_parser() -> argparse.ArgumentParser:
   %(prog)s run --source sim               simulatore, senza rete
   %(prog)s run --source csv --csv trades.csv
   %(prog)s run --proxy http://127.0.0.1:3128
+  %(prog)s diagnose                       perche' non arrivano segnali
   %(prog)s wallet                         saldo, cicli e registro di cassa
   %(prog)s run --capital 500 --stake-amount 10
   %(prog)s stats                          statistiche del paper trading
