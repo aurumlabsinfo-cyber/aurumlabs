@@ -45,7 +45,7 @@ senza `pip install`, tutto il motore sta anche in un file solo:
 python3 aurum_engine.py selftest        # verifica il file su se stesso
 python3 aurum_engine.py check           # il venue e' raggiungibile?
 python3 aurum_engine.py run --payout 0.8   # OPERAZIONI DA 1 MINUTO
-open http://localhost:8000              # dashboard
+open http://localhost:8002              # dashboard
 ```
 
 Il default e' il **prodotto da un minuto**: orizzonte 60s, ingresso a mercato,
@@ -79,7 +79,7 @@ attivazione solo se il verdetto regge.
 | `wallet` | saldo, cicli, regole di puntata e registro di cassa |
 | `selftest` | 12 verifiche interne, nessuna rete richiesta |
 
-La dashboard su `:8000` e' servita dallo stesso file: **portafoglio** con saldo,
+La dashboard su `:8002` e' servita dallo stesso file: **portafoglio** con saldo,
 puntata, curva del capitale e ciclo in corso; grafico a candele sempre in vista
 (5s / 15s / 1m / 5m / 10m / 30m) con le operazioni disegnate sopra; il segnale
 corrente con il countdown; la diagnostica dei cancelli; cosa sta analizzando il

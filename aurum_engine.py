@@ -6,7 +6,7 @@ Feed di mercato -> order book locale -> feature microstrutturali -> agenti /
 AURUM BURST-15 -> segnali binari PAPER-ONLY con trigger e countdown verificati
 lato motore, tutto registrato su database e riaddestrato da solo.
 
-    python3 aurum_engine.py run                      # live su Binance, dashboard su :8000
+    python3 aurum_engine.py run                      # live su Binance, dashboard su :8002
     python3 aurum_engine.py run --strategy burst15   # strategia AURUM BURST-15
     python3 aurum_engine.py run --source sim         # simulatore, senza rete
     python3 aurum_engine.py check                    # il venue e' raggiungibile?
@@ -37,7 +37,7 @@ Cosa c'e' dentro, rispetto al progetto completo:
   * apprendimento automatico: dataset causale, walk-forward con purge, modello
     logistico, classificazione dell'edge, attivazione solo se PROVEN/PROMISING;
   * statistiche, calibrazione, Monte Carlo;
-  * dashboard HTML + API JSON su http://localhost:8000
+  * dashboard HTML + API JSON su http://localhost:8002
 
 Cosa resta nel repository completo e NON e' qui: la ricerca esaustiva di
 strategie con correzione per test multipli (`app/ml/search.py`), l'importatore
@@ -250,7 +250,7 @@ class Config:
     ml_l2: float = 1e-4
 
     # ------------------------------------------------------------ interfaccia
-    http_port: int = 8000
+    http_port: int = 8002
     http_host: str = "127.0.0.1"
     quiet: bool = False
     json_out: bool = False
@@ -7811,7 +7811,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="""esempi:
   %(prog)s check                          il venue e' raggiungibile?
   %(prog)s run --payout 0.8               OPERAZIONI DA 1 MINUTO (default),
-                                          live su Binance, dashboard su :8000
+                                          live su Binance, dashboard su :8002
   %(prog)s run --strategy burst15 --payout 0.8   variante a 5 secondi
   %(prog)s run --entry trigger            ingresso al tocco (puo' annullarsi)
   %(prog)s run --source sim               simulatore, senza rete

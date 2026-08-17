@@ -213,7 +213,7 @@ supporto proxy su REST **e** WebSocket.
 
 ### La dashboard
 
-Su `http://localhost:8000`, servita dallo stesso file, senza librerie esterne:
+Su `http://localhost:8002`, servita dallo stesso file, senza librerie esterne:
 
 * **grafico a candele sempre in vista**, con intervallo selezionabile fra
   5s, 15s, 1m, 5m, 10m e 30m. I tagli corti ci sono perche' il motore opera su
