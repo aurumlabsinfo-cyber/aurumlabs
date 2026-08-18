@@ -4,6 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AURUM SIGNAL ENGINE M60 · EUR/USD</title>
+<!-- Icona incorporata: senza, il browser chiede /favicon.ico a ogni caricamento
+     e riceve un 404 che sporca la console per niente. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b1220'/%3E%3Cpath d='M6 24 L16 8 L26 24' stroke='%23d9a441' stroke-width='3' fill='none' stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
 :root{
   --bg:#070b12; --panel:#0d1420; --panel2:#111a28; --line:#1b2636;
@@ -287,7 +290,11 @@ function drawChart(){
   var cx = cv.getContext("2d"); cx.setTransform(dpr,0,0,dpr,0,0);
   cx.clearRect(0,0,W,H);
   var cs = STATE.candles;
-  if(!cs || cs.length < 2){
+  /* Una sola barra si disegna: chiedere il minimo di due significava che su
+     15m il grafico restava vuoto per un quarto d'ora mentre l'intestazione
+     dichiarava "1 barra" — due affermazioni diverse sulla stessa schermata.
+     La scala regge un solo elemento (lo scarto ha un minimo). */
+  if(!cs || cs.length < 1){
     cx.fillStyle="#7d8ba3"; cx.font="12px system-ui"; cx.textAlign="center";
     cx.fillText("nessuna barra per questo intervallo", W/2, H/2); return;
   }

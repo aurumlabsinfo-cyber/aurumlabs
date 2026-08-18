@@ -879,6 +879,47 @@ def t_dashboard() -> str:
     # `websockets`, uvicorn respinge /ws con un 404 e il browser ritenta per
     # sempre: la pagina sembra viva e non lo e'. Qui si verifica che lo stato
     # sia esposto e che il frontend sappia ripiegare invece di insistere.
+    # Ogni rotta deve produrre JSON valido anche con numeri non finiti.
+    # Un profit factor infinito — una vittoria e nessuna perdita, il caso piu'
+    # banale che esista — faceva rispondere 500 a /wallet, perche' JSON non
+    # ammette Infinity e un solo valore in fondo alla struttura fa fallire
+    # l'intera risposta.
+    from ..dashboard.server import _routes, json_safe
+    assert json_safe(float("inf")) is None
+    assert json_safe(float("nan")) is None
+    assert json_safe({"a": [1.0, float("-inf")]}) == {"a": [1.0, None]}
+    rotte = _routes(cfg, engine)
+    for path, fn in rotte.items():
+        payload = fn("1m", 10) if path == "/candles" else fn()
+        json.dumps(json_safe(payload), default=str)   # non deve sollevare
+
+    # Lo storico deve venire dal DATABASE, non dalla memoria del processo:
+    # dopo un riavvio il saldo si ricostruisce dal registro e lo storico no,
+    # e sulla stessa schermata comparivano due verita' diverse.
+    engine.db.upsert("signals", {
+        "signal_id": "storico1", "decision_id": "d", "cycle_id": 1,
+        "created_ts": BASE_TS, "entry_ts": BASE_TS + 30_000,
+        "expiry_ts": BASE_TS + 90_000, "direction": CALL, "state": "EXPIRED",
+        "result": WIN, "pnl": 20.0, "balance_after": 520.0, "mode": "SIMULATION"})
+    engine.db.flush()
+    storico = rotte["/signals"]()["history"]
+    assert any(s.get("signal_id") == "storico1" for s in storico), (
+        "lo storico non legge dal database: si azzererebbe a ogni riavvio")
+
+    # Il grafico deve disegnare anche una barra sola: su 15m chiedere il
+    # minimo di due lasciava la tela vuota per un quarto d'ora mentre
+    # l'intestazione dichiarava "1 barra".
+    assert "cs.length < 1" in INDEX_HTML, (
+        "il grafico rifiuta di disegnare una barra singola")
+
+    # Un ciclo con una vittoria e nessuna perdita non deve produrre infiniti.
+    from ..core.wallet import VirtualWallet as _VW
+    w = _VW(_sim_config(), None)
+    w.reserve("x")
+    w.settle("x", WIN, 1)
+    assert w.current.profit_factor is None, (
+        "profit factor infinito: JSON non lo puo' rappresentare")
+
     t = transport_state()
     assert set(t) == {"realtime", "transport", "reason", "fix"}, t
     assert isinstance(t["realtime"], bool)

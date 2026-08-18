@@ -71,9 +71,17 @@ class CycleStats:
 
     @property
     def profit_factor(self) -> float | None:
-        """Quanto si guadagna per ogni euro perso. Sotto 1 si sta perdendo."""
+        """Quanto si guadagna per ogni euro perso. Sotto 1 si sta perdendo.
+
+        Senza perdite il rapporto sarebbe infinito, e infinito qui non e' un
+        risultato: e' l'assenza del denominatore. Restituiva `float("inf")`, e
+        siccome JSON non ammette l'infinito la rotta `/wallet` rispondeva 500
+        appena arrivava la prima vittoria prima della prima perdita — cioe' nel
+        caso piu' banale possibile. `None` significa "non calcolabile", ed e'
+        cio' che l'interfaccia gia' sa mostrare.
+        """
         if self.gross_loss <= 0:
-            return None if self.gross_profit <= 0 else float("inf")
+            return None
         return self.gross_profit / self.gross_loss
 
     @property

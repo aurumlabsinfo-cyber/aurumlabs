@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import threading
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,27 @@ def transport_state() -> dict[str, Any]:
 
 INDEX_HTML = (Path(__file__).parent / "frontend" / "index.html").read_text(
     encoding="utf-8") if (Path(__file__).parent / "frontend" / "index.html").exists() else ""
+
+
+def json_safe(value: Any) -> Any:
+    """Rende un risultato serializzabile senza far cadere la rotta.
+
+    JSON non ammette `Infinity` ne' `NaN`: un solo valore non finito in fondo a
+    una struttura fa fallire l'intera risposta con un 500. E' successo davvero
+    — un profit factor infinito (una vittoria, nessuna perdita) faceva
+    rispondere 500 a `/wallet`, cioe' proprio nel caso piu' banale.
+
+    La causa si corregge dove nasce; questa e' la rete di sicurezza: un numero
+    che non si puo' rappresentare diventa `null`, e il resto della pagina
+    continua a funzionare invece di sparire.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    return value
 
 
 def _routes(cfg, engine) -> dict[str, Any]:
@@ -122,6 +144,29 @@ def _routes(cfg, engine) -> dict[str, Any]:
             out["status"] = "WATCH" if d.confidence > 0.5 else "NO_TRADE"
             out["blockers"] = d.blockers
         return out
+
+    def signal_history(limit: int = 120) -> list[dict]:
+        """Lo storico dal DATABASE, non dalla memoria del processo.
+
+        La lista in memoria si azzera a ogni riavvio: dopo un `systemctl
+        restart` lo storico spariva dallo schermo mentre il saldo restava
+        quello di prima, perche' il portafoglio si ricostruisce dal registro e
+        lo storico no. Due verita' diverse sulla stessa schermata sono peggio
+        di un dato mancante — il database e' l'unica verita', e questa rotta
+        legge da li'.
+
+        Se la lettura fallisce si ripiega sulla memoria: uno storico parziale
+        vale piu' di una tabella vuota.
+        """
+        try:
+            rows = engine.db.query(
+                "SELECT * FROM signals WHERE state IN ('EXPIRED','CANCELLED') "
+                "ORDER BY entry_ts DESC LIMIT ?", (limit,))
+            if rows:
+                return rows
+        except Exception:                    # noqa: BLE001 - mai far cadere la pagina
+            pass
+        return [s.to_dict() for s in engine.signals.history[-limit:]][::-1]
 
     def agents() -> dict:
         d = engine.last_decision
@@ -264,8 +309,7 @@ def _routes(cfg, engine) -> dict[str, Any]:
         "/signal": current_signal,
         "/signals": lambda: {"active": [s.to_dict(engine.now())
                                         for s in engine.signals.active.values()],
-                             "history": [s.to_dict() for s in
-                                         engine.signals.history[-100:]][::-1],
+                             "history": signal_history(),
                              "stats": engine.signals.stats()},
         "/agents": agents,
         "/wallet": lambda: {**engine.wallet.status(),
@@ -305,11 +349,11 @@ def build_app(cfg, engine):
         if path == "/candles":
             @app.get(path)
             def _candles(interval: str = "1m", limit: int = 240):
-                return JSONResponse(fn(interval, limit))
+                return JSONResponse(json_safe(fn(interval, limit)))
         else:
             @app.get(path, name=path.strip("/").replace("/", "_") or "root")
             def _handler(_fn=fn):
-                return JSONResponse(_fn())
+                return JSONResponse(json_safe(_fn()))
 
     for path, fn in routes.items():
         _register(path, fn)
@@ -454,7 +498,7 @@ class DashboardServer:
                         status = 200
                     except Exception as exc:  # noqa: BLE001
                         payload, status = {"error": f"{type(exc).__name__}: {exc}"}, 500
-                body = json.dumps(payload, default=str).encode()
+                body = json.dumps(json_safe(payload), default=str).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
