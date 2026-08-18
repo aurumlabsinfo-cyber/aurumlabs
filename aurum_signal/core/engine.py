@@ -73,6 +73,17 @@ class AurumEngine:
         self._subscribers: list[Callable[[str, dict], None]] = []
         self._research_thread: threading.Thread | None = None
         self._research_lock = threading.Lock()
+        #: Il giudizio del booster per ogni segnale aperto, tenuto fino
+        #: all'esito. Senza, l'esito verrebbe registrato con punteggio zero e
+        #: il booster misurerebbe se stesso su un dato che non ha prodotto.
+        self._booster_results: dict[str, Any] = {}
+        self._last_flow_snapshot = 0
+        #: Osservazioni sullo stream in attesa del proprio futuro. Non sono
+        #: decisioni: e' materiale di ricerca sul comportamento dei tick, e
+        #: nessun segnale dipende da loro.
+        self._pending_patterns: list[dict[str, Any]] = []
+        self._last_pattern_ts = 0
+        self.strategy_id = f"s_{uuid.uuid4().hex[:10]}"
         self.outcomes.listeners.append(self._on_outcome)
 
     # ------------------------------------------------------------- orologio
@@ -105,6 +116,30 @@ class AurumEngine:
         self.db.event("engine", "INFO",
                       f"avvio {VERSION} in modalita' {self.mode}",
                       {"symbol": self.cfg.symbol, "adapter": self.feed.adapter.name})
+        # La strategia in esecuzione, con i parametri che la definiscono.
+        # Serve a rispondere alla domanda che si pone dopo un ciclo fallito:
+        # "con quali soglie stava girando quando e' andata cosi'?".
+        self.db.upsert("strategy_versions", {
+            "strategy_id": self.strategy_id, "ts": self.started_ts,
+            "parent_id": None, "status": "CHAMPION",
+            "promoted_ts": self.started_ts, "retired_ts": None,
+            "reason": "parametri di avvio",
+            "params": json.dumps({
+                "min_confidence": self.cfg.min_confidence,
+                "min_edge": self.cfg.min_edge,
+                "effective_min_probability": self.cfg.effective_min_probability,
+                "payout": self.cfg.payout,
+                "breakeven": self.cfg.breakeven_win_rate,
+                "lead_s": self.cfg.signal_lead_seconds,
+                "freeze_s": self.cfg.signal_freeze_seconds,
+                "max_concurrent": self.cfg.max_concurrent_signals,
+                "heuristic_shrink": self.decisions.heuristic_shrink,
+            })})
+        self.db.upsert("booster_versions", {
+            "booster_id": self.booster.booster_id, "ts": self.started_ts,
+            "mode": self.booster.mode,
+            "params": json.dumps({"min_samples": self.cfg.booster_min_samples}),
+            "metrics": None, "validated": int(self.booster.validated)})
         self._start_research_worker()
 
         deadline = (time.time() + max_seconds) if max_seconds else None
@@ -186,6 +221,8 @@ class AurumEngine:
         self.db.add("regime_history", {
             "ts": now, "regime": d.regime, "confidence": d.regime_confidence,
             "volatility_bps": vec.values.get("sigma_horizon_bps")})
+        self._record_order_flow(vec, now)
+        self._observe_stream_pattern(vec, d, now)
 
         # I segnali aperti vengono sorvegliati con la valutazione corrente.
         self.signals.update(d, now, self.last_quote.mid if self.last_quote else None)
@@ -210,10 +247,28 @@ class AurumEngine:
             return
         self.wallet._reserved[sig.signal_id] = stake
         self.db.upsert("decisions", {**d.to_row(), "emitted": 1})
-        # Il booster osserva e registra. In ombra NON tocca il segnale.
+        self._record_similarity(d, now)
+
+    def _evaluate_booster(self, sig) -> None:
+        """Il giudizio del booster, al congelamento e non alla creazione.
+
+        Momento scelto di proposito: il booster legge gli ULTIMI secondi, e
+        alla creazione — trenta secondi prima dell'entrata — quegli ultimi
+        secondi non sono ancora accaduti. Valutarlo li' significava dargli in
+        pasto una storia vuota e registrarne il verdetto come se fosse
+        informato.
+
+        In ombra il risultato non tocca il segnale: si salva e basta.
+        """
+        d = self.last_decision
+        if d is None or sig.signal_id in self._booster_results:
+            return
+        now = self.now()
         try:
             t = time.perf_counter()
-            res = self.booster.evaluate(sig, d, [])
+            history = [sig.previews[k] for k in sorted(sig.previews)]
+            res = self.booster.evaluate(sig, d, history)
+            self._booster_results[sig.signal_id] = res
             self.latency.record("booster", (time.perf_counter() - t) * 1000.0, now)
             self.db.upsert("booster_decisions", {
                 "decision_id": d.decision_id, "signal_id": sig.signal_id,
@@ -225,6 +280,131 @@ class AurumEngine:
                 "applied": int(res.applied), "latency_ms": res.latency_ms})
         except Exception as exc:  # noqa: BLE001 - il booster non ferma il motore
             self.db.event("booster", "WARNING", str(exc))
+
+    def _record_similarity(self, d, now: int) -> None:
+        """I casi passati piu' simili a questo, salvati accanto alla decisione.
+
+        Serve a rispondere dopo, non adesso: "quando il mercato somigliava a
+        questo, com'e' andata?". Senza salvarlo al momento della decisione la
+        domanda diventa impossibile, perche' la libreria nel frattempo cambia.
+        """
+        try:
+            similar = self.research.library.similar(d.features, d.regime, limit=3)
+        except Exception:  # noqa: BLE001 - la libreria non ferma il motore
+            return
+        for s in similar:
+            self.db.add("similarity_results", {
+                "decision_id": d.decision_id, "setup_id": s.get("setup_id"),
+                "ts": now, "similarity": s.get("similarity"),
+                "historical_win_rate": s.get("win_rate"),
+                "samples": s.get("samples")})
+
+    def _record_strategy_metrics(self, wallet) -> None:
+        """Il risultato del ciclo appena chiuso, attribuito alla strategia.
+
+        L'intervallo di confidenza e' li' per un motivo: un ciclo si chiude
+        dopo venti operazioni, e su venti operazioni un tasso del 40% e uno
+        del 60% sono spesso lo stesso tasso. Senza l'intervallo si finisce a
+        cambiare strategia per inseguire il rumore.
+        """
+        c = wallet.current
+        if c is None:
+            return
+        from ..ml.calibration import wilson_interval
+        from ..research.validation import binomial_p_value
+        n, wins = c.decided, c.wins
+        lo, hi = wilson_interval(wins, n) if n else (0.0, 1.0)
+        self.db.add("strategy_metrics", {
+            "strategy_id": self.strategy_id, "ts": self.now(),
+            "scope": f"cycle:{c.cycle_id}", "samples": n,
+            "win_rate": c.win_rate, "expectancy": c.expectancy,
+            "profit_factor": c.profit_factor, "max_drawdown": c.max_drawdown,
+            "ci_low": round(lo, 4), "ci_high": round(hi, 4),
+            "p_value": (round(binomial_p_value(wins, n,
+                                               self.cfg.breakeven_win_rate), 6)
+                        if n else None)})
+
+    def _observe_stream_pattern(self, vec, d, now: int) -> None:
+        """Registra lo stato dello stream e, un minuto dopo, cosa e' successo.
+
+        Non e' una decisione e nessun segnale ne dipende: e' materiale grezzo
+        per la ricerca, che permette di chiedersi in seguito "dopo questa
+        configurazione di flusso, il prezzo dove e' andato a +10, +20, +30 e
+        +60 secondi?". Registrarlo mentre accade e' l'unico modo di averlo:
+        ricostruirlo dopo significherebbe ricalcolare le feature con la storia
+        di oggi, cioe' guardare il passato con informazioni che allora non
+        c'erano.
+        """
+        if now - self._last_pattern_ts >= 5_000:
+            self._last_pattern_ts = now
+            flow = vec.values.get("tick_imbalance_5s")
+            if flow is not None and self.last_quote is not None:
+                self._pending_patterns.append({
+                    "ts": now, "price": self.last_quote.mid, "regime": d.regime,
+                    "order_flow": flow,
+                    "direction": CALL if flow > 0 else PUT,
+                    "features": {k: vec.values.get(k) for k in (
+                        "momentum", "acceleration", "realized_vol_5s_bps",
+                        "move_over_noise", "spread_bps", "quote_velocity_10s",
+                        "trend_strength", "zscore_60s")},
+                })
+            if len(self._pending_patterns) > 5_000:
+                del self._pending_patterns[:1_000]
+
+        # Chiude quelle mature: il futuro di 60 secondi fa e' adesso.
+        matured = [p for p in self._pending_patterns
+                   if now - p["ts"] >= self.cfg.horizon_ms]
+        if not matured:
+            return
+        self._pending_patterns = [p for p in self._pending_patterns
+                                  if now - p["ts"] < self.cfg.horizon_ms]
+        for p in matured:
+            base = p["price"]
+            if not base:
+                continue
+
+            def ret(offset_s: int, _p=p, _b=base) -> float | None:
+                px = self._price_at(_p["ts"] + offset_s * 1000)
+                return round((px - _b) / _b * 10_000.0, 4) if px else None
+
+            r60 = ret(60)
+            self.db.add("stream_patterns", {
+                "pattern_id": f"flow_{p['direction']}_{p['regime']}",
+                "ts": p["ts"], "regime": p["regime"],
+                "features_before": json.dumps(p["features"], default=str),
+                "order_flow": p["order_flow"], "direction": p["direction"],
+                "future_return_10s": ret(10), "future_return_20s": ret(20),
+                "future_return_30s": ret(30), "future_return_60s": r60,
+                "success": (None if r60 is None else
+                            int((r60 > 0) == (p["direction"] == CALL)))})
+
+    def _record_order_flow(self, vec, now: int) -> None:
+        """La microstruttura misurata, con l'onesta' di dire cos'e' e cosa non e'.
+
+        Su un feed FX gratuito NON esiste un book di livello 2: qui c'e' solo
+        cio' che il provider fornisce davvero — direzione dei tick, velocita'
+        delle quotazioni, spread. `available` distingue una misura reale da
+        un'astensione, cosi' chi studiera' questi dati fra un mese sapra' quali
+        righe significano qualcosa. Un book inventato sarebbe peggio di
+        nessun book.
+        """
+        if now - self._last_flow_snapshot < 1000:      # una al secondo basta
+            return
+        self._last_flow_snapshot = now
+        caps = self.feed.adapter.capabilities if self.feed.adapter else None
+        components = {k: vec.values.get(k) for k in (
+            "tick_imbalance_1s", "tick_imbalance_5s", "tick_imbalance_15s",
+            "tick_imbalance_30s", "quote_velocity_10s", "spread_bps",
+            "spread_vs_average")}
+        measured = [v for v in components.values() if v is not None]
+        score = vec.values.get("tick_imbalance_5s")
+        self.db.add("order_flow_snapshots", {
+            "ts": now, "score": score,
+            "components": json.dumps(components, default=str),
+            "available": int(bool(measured) and score is not None),
+            "note": ("nessun book L2: il provider fornisce solo tick e spread"
+                     if caps is None or not getattr(caps, "has_depth", False)
+                     else "book disponibile dal provider")})
 
     def _record_shadow(self, d, now: int) -> None:
         """Anche un NO_TRADE va valutato: e' una scelta che si puo' sbagliare."""
@@ -244,8 +424,11 @@ class AurumEngine:
     def _on_signal_event(self, event: str, sig) -> None:
         if event == "pre_signal":
             self.telegram.send(self.telegram.signal_message(sig, self.cfg))
+        elif event == "frozen":
+            self._evaluate_booster(sig)
         elif event == "cancelled":
             self.wallet.release(sig.signal_id)
+            self._booster_results.pop(sig.signal_id, None)
             self.telegram.send(self.telegram.cancel_message(sig))
         self._publish(event, sig.to_dict(self.now()))
 
@@ -272,14 +455,47 @@ class AurumEngine:
                     self.research.library.observe(feats, regime, result)
                 except (ValueError, TypeError):
                     pass
-            self.booster.record(
-                type("R", (), {"score": 0.0, "base_probability": sig.probability})(),
-                won)
+            # Il punteggio VERO che il booster aveva dato a questo segnale.
+            # Registrare uno zero fisso — com'era prima — significava misurare
+            # il booster su un dato che non aveva prodotto: ogni osservazione
+            # finiva nella stessa fascia, nessun segnale risultava scartato, e
+            # il rapporto non poteva dire niente per costruzione.
+            res = self._booster_results.pop(sig.signal_id, None)
+            if res is not None:
+                self.booster.record(res, won)
+                self.db.upsert("booster_decisions", {
+                    "decision_id": sig.decision_id,
+                    "base_result": result,
+                    "boosted_simulated_result": (
+                        result if res.action != "VETO" else "EVITATA")})
+            self._record_booster_metrics()
         self.telegram.send(self.telegram.result_message(sig, self.wallet.balance))
         self._publish("settled", sig.to_dict(self.now()))
 
+    def _record_booster_metrics(self) -> None:
+        """Una fotografia periodica di quanto vale il booster, sul database.
+
+        Ogni cinquanta esiti: piu' spesso sarebbe rumore salvato con cura.
+        """
+        n = len(self.booster.observations)
+        if n < 50 or n % 50 != 0:
+            return
+        rep = self.booster.report(self.cfg.breakeven_win_rate)
+        if rep.get("status") != "OK":
+            return
+        self.db.add("booster_metrics", {
+            "booster_id": self.booster.booster_id, "ts": self.now(),
+            "samples": rep["samples"], "base_win_rate": rep["base_win_rate"],
+            "boosted_win_rate": rep["boosted_win_rate"],
+            "base_expectancy": rep["base_expectancy"],
+            "boosted_expectancy": rep["boosted_expectancy"],
+            "brier_base": None, "brier_boosted": None,
+            "verdict": rep["verdict"][:500]})
+
     def _on_cycle_failed(self, wallet) -> None:
         """Il ciclo e' finito: si studia PRIMA di ricominciare."""
+        self._record_strategy_metrics(wallet)
+
         def study() -> None:
             try:
                 report = self.research.study(wallet, self.signals,
@@ -347,6 +563,7 @@ class AurumEngine:
                         ds = self.build_dataset()
                         if len(ds) >= self.cfg.research_min_samples:
                             self.research.run_once(ds)
+                            self._adopt_champion()
                 except Exception as exc:  # noqa: BLE001 - la ricerca non ferma nulla
                     self.db.event("research", "ERROR",
                                   f"{type(exc).__name__}: {exc}")
@@ -358,6 +575,38 @@ class AurumEngine:
         self._research_thread = threading.Thread(target=loop, name="research",
                                                  daemon=True)
         self._research_thread.start()
+
+    def _adopt_champion(self) -> None:
+        """Il modello promosso dalla ricerca entra nella decisione.
+
+        Senza questo passo il percorso di validazione non cambierebbe niente:
+        il sistema studierebbe, concluderebbe, e continuerebbe a decidere
+        esattamente come prima. E' un'assegnazione di riferimento, quindi il
+        loop realtime non si ferma: alla decisione successiva il modello c'e'
+        gia', e nel frattempo continua con le sole euristiche.
+
+        Il modello NON sostituisce gli agenti: entra con peso 0.5 se calibrato
+        e 0.25 se no, come qualunque altra opinione (vedi `MetaDecisionEngine`).
+        """
+        champ = self.research.champion_model
+        current = getattr(self.decisions.model, "model_id", None)
+        if champ is None or getattr(champ, "model_id", None) == current:
+            return
+        self.decisions.model = champ
+        self.db.event("engine", "INFO",
+                      f"modello {champ.model_id} adottato dal motore decisionale",
+                      {"previous": current, "calibrated": champ.calibrated,
+                       "features": champ.feature_names})
+        self._publish("model", {"model_id": champ.model_id,
+                                "calibrated": champ.calibrated,
+                                "metrics": champ.metrics})
+
+    def rollback_model(self, reason: str) -> dict[str, Any]:
+        """Ritira il modello in produzione e torna alle sole euristiche."""
+        out = self.research.demote(reason)
+        self.decisions.model = None
+        self._publish("model", {"model_id": None, "reason": reason})
+        return out
 
     def build_dataset(self, include_simulation: bool | None = None) -> Dataset:
         """Righe causali con l'etichetta a +orizzonte, prese dal database.

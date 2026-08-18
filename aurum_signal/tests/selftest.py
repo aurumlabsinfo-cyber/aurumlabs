@@ -15,6 +15,7 @@ import os
 import random
 import tempfile
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 from ..config import Config
@@ -125,6 +126,55 @@ def t_database() -> str:
     db.stop()
     os.unlink(path)
     return "upsert, batch, e un guasto isolato che non perde le altre tabelle"
+
+
+def t_schema_coerente() -> str:
+    """Ogni tabella dichiarata deve avere colonne vere e qualcuno che ci scrive.
+
+    Due difetti reali che questa verifica intercetta.
+
+    **Colonne inventate.** `BATCH_COLUMNS` elenca i nomi usati negli INSERT: se
+    uno non esiste nella tabella, l'errore compare solo a runtime, e per come
+    e' fatto il writer si traduce in righe perse in silenzio.
+
+    **Tabelle sempre vuote.** Una tabella dichiarata e mai scritta e' peggio di
+    una tabella assente: promette una capacita' che non esiste, e chi legge il
+    database mesi dopo non ha modo di distinguere "non e' successo niente" da
+    "non e' mai stato collegato".
+    """
+    import re
+    from ..storage.schema import BATCH_COLUMNS, SCHEMA, UPSERT_KEYS
+
+    path = os.path.join(tempfile.mkdtemp(), "schema.db")
+    db = Database(path)
+    conn = db.reader()
+    declared = set(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", SCHEMA))
+
+    # a) le colonne dichiarate esistono davvero.
+    for table, cols in BATCH_COLUMNS.items():
+        assert table in declared, f"{table} in BATCH_COLUMNS ma non nello schema"
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        unknown = [c for c in cols if c not in have]
+        assert not unknown, f"{table}: colonne inesistenti {unknown}"
+    for table in UPSERT_KEYS:
+        assert table in declared, f"{table} in UPSERT_KEYS ma non nello schema"
+
+    # b) ogni tabella ha almeno un punto di scrittura nel codice.
+    root = Path(__file__).resolve().parent.parent
+    sources = "\n".join(
+        p.read_text(encoding="utf-8") for p in sorted(root.rglob("*.py"))
+        if "schema.py" not in p.name and "selftest.py" not in p.name)
+    orfane = [t for t in sorted(declared)
+              if f'"{t}"' not in sources and f"'{t}'" not in sources
+              and t not in ("meta",)]     # `meta` la scrive il Database stesso
+    assert not orfane, (
+        f"tabelle dichiarate e mai scritte: {orfane}. Una tabella vuota per "
+        "sempre promette una capacita' che non c'e'.")
+
+    db.stop()
+    os.unlink(path)
+    return (f"{len(declared)} tabelle: colonne verificate contro lo schema "
+            f"reale, nessuna orfana")
 
 
 def t_buffers() -> str:
@@ -846,6 +896,7 @@ def t_dashboard() -> str:
 CASES: list[tuple[str, Callable[[], str]]] = [
     ("configurazione e payout", t_config),
     ("database (batch, upsert, guasto isolato)", t_database),
+    ("schema: colonne vere e nessuna tabella orfana", t_schema_coerente),
     ("buffer causali e candele", t_buffers),
     ("feature engine su scala EUR/USD", t_features),
     ("qualita' dei dati", t_data_quality),

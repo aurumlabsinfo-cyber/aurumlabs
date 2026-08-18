@@ -254,6 +254,12 @@ class ResearchEngine:
         self.library = SetupLibrary(cfg)
         self.shadow = ShadowAnalyser(cfg, db)
         self.champion_id: str | None = None
+        #: Il modello effettivamente promosso, pronto per il motore decisionale.
+        #: Finche' e' None il motore decide con le sole euristiche — ed e' lo
+        #: stato normale: la maggior parte dei giri di ricerca non promuove
+        #: niente, ed e' cosi' che deve andare.
+        self.champion_model: Any = None
+        self.champion_metrics: dict[str, Any] = {}
         self.runs = 0
         self.promotions = 0
         self.rollbacks = 0
@@ -422,6 +428,13 @@ class ResearchEngine:
         report["candidates"] = sorted(
             results, key=lambda x: x.get("p_adjusted", 1.0))[:10]
         report["promoted"] = promoted
+
+        # 5. Il vincitore diventa un modello utilizzabile, altrimenti tutto
+        #    questo percorso non cambia niente: senza questo passo il sistema
+        #    studia, conclude, e continua a decidere come prima.
+        if promoted:
+            best = min(promoted, key=lambda r: r["holdout"]["p_value"])
+            report["champion"] = self._promote(best, discovery, holdout, ds)
         report["duration_s"] = round(time.time() - started, 2)
         short = [r for r in fdr_survivors
                  if (r.get("holdout") or {}).get("status") == "CAMPIONE INSUFFICIENTE"]
@@ -461,6 +474,135 @@ class ResearchEngine:
                              if k in report})
         self.history = self.history[-50:]
         return report
+
+    # ------------------------------------------------------------ promozione
+    def _promote(self, candidate: dict[str, Any], discovery: Dataset,
+                 holdout: Dataset, full: Dataset) -> dict[str, Any]:
+        """Trasforma un candidato che ha superato tutto in un modello utile.
+
+        Due dettagli decidono se questo passo e' onesto o finto.
+
+        **La calibrazione si stima FUORI CAMPIONE.** Il modello addestrato
+        sulla scoperta predice l'holdout, e Platt si stima su quelle
+        previsioni. Calibrare sulle stesse righe dell'addestramento produce
+        una curva perfetta che non descrive niente.
+
+        **Il modello finale si riaddestra su tutto.** Il candidato e' stato
+        giudicato usando solo la scoperta; una volta superato il giudizio,
+        buttare via un quarto dei dati sarebbe uno spreco. Il giudizio resta
+        quello dato prima, e resta allegato al modello.
+        """
+        from ..ml.calibration import brier_score, fit_platt, log_loss
+        from ..ml.model import Model, fit_estimator, predict_proba
+
+        feats = candidate["features"]
+        try:
+            d_idx = [discovery.names.index(f) for f in feats]
+            h_idx = [holdout.names.index(f) for f in feats]
+            f_idx = [full.names.index(f) for f in feats]
+        except ValueError:
+            return {"status": "FALLITA", "reason": "feature non allineate"}
+
+        from ..ml.model import PureLogistic
+        # a) modello di giudizio: solo scoperta -> previsioni sull'holdout.
+        judge = fit_estimator(PureLogistic(epochs=14),
+                              [[r[i] for i in d_idx] for r in discovery.rows],
+                              discovery.y)
+        hold_rows = [[r[i] for i in h_idx] for r in holdout.rows]
+        hold_probs = predict_proba(judge, hold_rows)
+        calibrator = fit_platt(hold_probs, holdout.y)
+
+        before = {"brier": brier_score(hold_probs, holdout.y),
+                  "log_loss": log_loss(hold_probs, holdout.y)}
+        cal_probs = [calibrator.transform(p) for p in hold_probs]
+        after = {"brier": brier_score(cal_probs, holdout.y),
+                 "log_loss": log_loss(cal_probs, holdout.y)}
+        # Una calibrazione che PEGGIORA il Brier non si applica: sarebbe
+        # rumore stimato su un campione piccolo travestito da correzione.
+        keep_cal = after["brier"] <= before["brier"] + 1e-6
+
+        # b) modello finale: tutti i dati, stesso algoritmo, stesse feature.
+        final = fit_estimator(PureLogistic(epochs=14),
+                              [[r[i] for i in f_idx] for r in full.rows], full.y)
+
+        model_id = f"m_{uuid.uuid4().hex[:10]}"
+        model = Model(
+            model_id=model_id, algorithm="logistic_pure", feature_names=feats,
+            horizon_s=self.cfg.horizon_seconds, estimator=final,
+            calibrator=calibrator if keep_cal else None, calibrated=keep_cal,
+            n_train=len(full), created_ts=int(time.time() * 1000),
+            metrics={"holdout": candidate["holdout"],
+                     "brier_before": round(before["brier"], 6),
+                     "brier_after": round(after["brier"], 6),
+                     "calibration_kept": keep_cal},
+            validation={"candidate": candidate["name"],
+                        "accuracy_independent": candidate.get("accuracy"),
+                        "p_adjusted": candidate.get("p_adjusted"),
+                        "walk_forward_samples": candidate.get("samples"),
+                        "fold_consistency": candidate.get("consistency")})
+
+        previous = self.champion_id
+        self.champion_id = model_id
+        self.champion_model = model
+        self.champion_metrics = dict(model.metrics)
+        self.promotions += 1
+
+        if self.db is not None:
+            row = model.to_row()
+            row["is_champion"] = 1
+            self.db.upsert("model_versions", row)
+            self.db.add("model_metrics", {
+                "model_id": model_id, "ts": model.created_ts,
+                "scope": "holdout_fresco",
+                "samples": candidate["holdout"]["samples"],
+                "accuracy": candidate["holdout"]["win_rate"],
+                "win_rate": candidate["holdout"]["win_rate"],
+                "brier": round(after["brier"] if keep_cal else before["brier"], 6),
+                "log_loss": round(after["log_loss"] if keep_cal
+                                  else before["log_loss"], 6)})
+            # La curva di affidabilita', una riga per fascia: e' la forma in
+            # cui la calibrazione si puo' davvero leggere ("quando dice 62%,
+            # quante volte ha vinto?"), non un solo numero riassuntivo.
+            for band in reliability_curve(cal_probs if keep_cal else hold_probs,
+                                          holdout.y):
+                self.db.add("calibration", {
+                    "model_id": model_id, "ts": model.created_ts,
+                    "bucket": band["bucket"], "samples": band["samples"],
+                    "stated": band["stated"], "realised": band["realised"],
+                    "ci_low": band["ci_low"], "ci_high": band["ci_high"]})
+            self.db.event("research", "INFO",
+                          f"modello {model_id} promosso a campione",
+                          {"previous": previous, "candidate": candidate["name"]})
+
+        return {
+            "status": "PROMOSSO", "model_id": model_id,
+            "previous": previous, "candidate": candidate["name"],
+            "features": feats, "n_train": len(full),
+            "calibration_applied": keep_cal,
+            "brier": round(after["brier"] if keep_cal else before["brier"], 6),
+            "holdout": candidate["holdout"],
+            "note": ("Il modello entra nella decisione con peso 0.5 se "
+                     "calibrato, 0.25 altrimenti: non sostituisce gli agenti, "
+                     "si aggiunge a loro."),
+        }
+
+    def demote(self, reason: str) -> dict[str, Any]:
+        """Ritiro del campione: si torna alle sole euristiche.
+
+        Serve quando il modello promosso comincia a sbagliare in produzione.
+        Tornare indietro deve essere semplice e immediato quanto promuovere,
+        altrimenti nella pratica non si torna indietro mai.
+        """
+        old = self.champion_id
+        self.champion_id = None
+        self.champion_model = None
+        self.champion_metrics = {}
+        self.rollbacks += 1
+        if self.db is not None and old:
+            self.db.upsert("model_versions", {"model_id": old, "is_champion": 0})
+            self.db.event("research", "WARNING",
+                          f"campione {old} ritirato", {"reason": reason})
+        return {"status": "RITIRATO", "model_id": old, "reason": reason}
 
     # ------------------------------------------------------------- study mode
     def study(self, wallet, signals, decision_engine, booster) -> dict[str, Any]:
