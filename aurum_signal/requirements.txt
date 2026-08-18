@@ -1,0 +1,17 @@
+# Il sistema gira con la sola libreria standard di Python 3.10+.
+# Queste dipendenze sono FACOLTATIVE e migliorano cio' che gia' funziona.
+
+# Dashboard con WebSocket. Senza, parte comunque un server della libreria
+# standard con le stesse rotte (senza aggiornamenti push).
+#
+# `uvicorn[standard]`, non `uvicorn`: uvicorn da solo NON parla WebSocket e
+# risponde 404 all'aggiornamento di protocollo su /ws. La pagina continua a
+# funzionare interrogando il motore, ma perde gli aggiornamenti immediati —
+# e su un segnale che vive 30 secondi la differenza si sente.
+fastapi>=0.110
+uvicorn[standard]>=0.27
+
+# Modelli alternativi alla regressione logistica scritta a mano.
+# Senza, il sistema usa la propria implementazione pura.
+numpy>=1.24
+scikit-learn>=1.3

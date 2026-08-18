@@ -1,0 +1,12 @@
+# Il database e' un artefatto di esecuzione, non del progetto: contiene la
+# storia della TUA sessione e cresce di migliaia di righe al minuto.
+*.db
+*.db-wal
+*.db-shm
+
+# Le chiavi non entrano mai nel repository. Si parte da .env.example.
+.env
+
+__pycache__/
+*.pyc
+exports/
