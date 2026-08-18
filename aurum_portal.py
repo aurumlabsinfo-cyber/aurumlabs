@@ -4704,6 +4704,21 @@ class SignalEngine:
                 "entry_mode": self.cfg.entry_mode,
                 "cooldown_ms": self.cfg.cooldown_ms,
             },
+            # I due filtri del rumore, e soprattutto SE stiano mordendo. Un
+            # filtro che non blocca mai non e' un filtro: e' un ritardo. Con
+            # `max_concurrent = 1` il motore e' spesso saturo e la persistenza
+            # non toglie segnali, sposta solo l'ingresso - va visto, non
+            # supposto.
+            "noise_filters": {
+                "persistence_required": self.cfg.signal_persistence_windows,
+                "persistence_blocked": self.gate_counter.get(
+                    gate_key("direzione non ancora stabile: N finestre di fila su N "
+                             "richieste"), 0),
+                "noise_factor": self.cfg.min_move_over_noise,
+                "noise_blocked": sum(v for k, v in self.gate_counter.items()
+                                     if "rumore di fondo" in k),
+                "max_concurrent": self.cfg.max_concurrent,
+            },
             "last_decision_reasons": (
                 self.last_decision.no_trade_reasons if self.last_decision else []
             ),
@@ -9464,6 +9479,17 @@ def cmd_diagnose(cfg: Config, args) -> int:
         if rate is not None and rate > 0.15:
             print("                      ^ troppe: con --entry market non "
                   "dovrebbero essercene")
+
+    nf = d.get("noise_filters") or {}
+    if nf:
+        print(f"  filtri del rumore : persistenza {nf.get('persistence_required')} "
+              f"finestre (ha bloccato {nf.get('persistence_blocked')}x) · "
+              f"soglia x{nf.get('noise_factor')} (ha bloccato "
+              f"{nf.get('noise_blocked')}x)")
+        if not nf.get("persistence_blocked") and nf.get("max_concurrent") == 1:
+            print("                      ^ non sta filtrando: con un'operazione "
+                  "alla volta il motore\n                        e' saturo e la "
+                  "persistenza sposta solo l'ingresso")
 
     gates = d.get("blocking_gates") or []
     if gates:
