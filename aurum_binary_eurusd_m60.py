@@ -73,7 +73,7 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable, Iterator
 
-VERSION = "1.4.1-BINARY-EURUSD-M60"
+VERSION = "1.5.0-BINARY-EURUSD-M60"
 MODEL_VALIDATION_POLICY = "m60_fx_context_news_v4"
 
 # --------------------------------------------------------------------------- #
@@ -143,6 +143,42 @@ class Config:
     news_block_risk: float = 0.92
     news_block_minutes: float = 10.0
     require_news_context: bool = True
+
+    # ------------------------------------------------- calendario economico
+    #: Il sentiment dice cosa si sta DICENDO. Il calendario dice quando esce un
+    #: NUMERO - e su una binaria da 60 secondi un dato macro non e' un rischio
+    #: di sentiment, e' un salto: il prezzo si sposta di decine di punti base in
+    #: meno di un secondo e qualunque vantaggio microstrutturale sparisce.
+    #: Per questo il calendario non e' una feature in piu': e' un divieto a
+    #: tempo attorno all'evento.
+    calendar_enabled: bool = True
+    #: Sorgenti gratuite, provate in ordine finche' una risponde. Nessuna
+    #: richiede una chiave; se cambia il formato di una, si passa alla dopo.
+    calendar_sources: str = "faireconomy,tradingeconomics"
+    calendar_poll_s: float = 900.0
+    #: Valute che contano per questo strumento. Un dato australiano non muove
+    #: EUR/USD abbastanza da giustificare un fermo.
+    calendar_currencies: str = "EUR,USD,ALL"
+    #: Finestra di divieto attorno a un evento ad alto impatto, in minuti.
+    calendar_block_before_min: float = 15.0
+    calendar_block_after_min: float = 10.0
+    #: Anche gli eventi di impatto medio meritano una finestra, piu' stretta.
+    calendar_block_medium: bool = True
+    calendar_medium_before_min: float = 4.0
+    calendar_medium_after_min: float = 3.0
+
+    # -------------------------------------------- sorveglianza delle quotazioni
+    #: Piu' fonti indipendenti per lo stesso cambio. Serve a rispondere a tre
+    #: domande che una fonte sola non puo' rispondere: la latenza qual e', e'
+    #: stabile, e le fonti sono d'accordo? Una fonte che diverge dalle altre non
+    #: e' un dettaglio: e' il prezzo su cui staresti decidendo.
+    quotes_enabled: bool = True
+    quotes_sources: str = "binance,frankfurter,exchangerate"
+    quotes_poll_s: float = 5.0
+    #: Oltre questa divergenza dalla mediana, una fonte e' dichiarata anomala.
+    quotes_max_divergence_bps: float = 8.0
+    #: Oltre questa eta' una quotazione non descrive piu' il presente.
+    quotes_max_age_s: float = 120.0
     require_fx_context: bool = True
     fx_context_min_breadth: float = 0.50
 
@@ -3645,6 +3681,16 @@ class DecisionEngine:
         # News ad altissimo impatto: per una binaria a 60 secondi il rischio di
         # salto domina qualsiasi edge microstrutturale. Sentiment moderato resta
         # una feature predittiva; solo il rischio estremo diventa NO TRADE.
+        # Calendario macro: attorno alla pubblicazione di un dato il prezzo
+        # salta. Non e' un punteggio da mescolare, e' una finestra in cui la
+        # microstruttura non predice piu' niente.
+        if f.get("cal_in_blackout"):
+            mins = f.get("cal_minutes_to_next")
+            reasons.append(
+                "calendario: dato macro ad alto impatto"
+                + (f" fra {float(mins):.0f} minuti" if mins is not None else "")
+            )
+
         news_risk = f.get("news_event_risk")
         news_age = f.get("news_latest_age_s")
         if (news_risk is not None and float(news_risk) >= cfg.news_block_risk and
@@ -7296,6 +7342,39 @@ footer{margin-top:22px;padding-top:14px;border-top:1px solid var(--line);
     <div class="pb" id="health"></div></div>
 </div>
 
+<!-- ------------------------------------ CALENDARIO / SORVEGLIANZA PREZZI -->
+<div class="grid g2 mb">
+
+  <div class="panel">
+    <div class="ph">
+      <div><h2>Calendario macro</h2>
+        <div class="sub" id="cal-sub">attorno a un dato il prezzo salta</div></div>
+      <span class="pill" id="cal-state">—</span>
+    </div>
+    <div class="pb" id="cal-body"><div class="empty">in attesa</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="ph">
+      <div><h2>Sorveglianza prezzi</h2>
+        <div class="sub" id="qt-sub">piu' fonti indipendenti sullo stesso cambio</div></div>
+      <span class="pill" id="qt-state">—</span>
+    </div>
+    <div class="pb">
+      <div id="qt-verdict" style="font-size:12px;line-height:1.55;margin-bottom:10px"></div>
+      <div style="overflow-x:auto">
+        <table id="qt-table"><thead><tr>
+          <th>Fonte</th><th>Tipo</th><th class="n">Prezzo</th>
+          <th class="n">Divergenza</th><th class="n">Latenza</th>
+          <th class="n">p95</th><th class="n">Jitter</th><th class="n">Errori</th>
+        </tr></thead><tbody></tbody></table>
+      </div>
+      <canvas id="qt-chart" height="150" style="margin-top:10px"></canvas>
+    </div>
+  </div>
+
+</div>
+
 <!-- --------------------------------------- CONTESTO FX / MACRO / BRIDGE -->
 <div class="grid g3 mb">
 
@@ -7968,6 +8047,132 @@ function tickFast(){
     }).catch(function(e){ $("verdict").textContent = "motore non raggiungibile: "+e; });
 }
 
+// ------------------------------------ CALENDARIO / SORVEGLIANZA PREZZI
+
+function renderCalendar(cal){
+  var st = $("cal-state");
+  if(!cal.enabled){ st.textContent = "spento"; st.className = "pill"; }
+  else if(cal.in_blackout){ st.textContent = "FERMO"; st.className = "pill off"; }
+  else if(cal.available){ st.textContent = cal.events_known + " eventi"; st.className = "pill on"; }
+  else { st.textContent = "non disponibile"; st.className = "pill warn"; }
+
+  $("cal-sub").textContent = cal.available
+    ? ("da " + (cal.source||"—") + " \u00b7 aggiornato "
+       + (cal.age_s!=null ? Math.round(cal.age_s)+"s fa" : "mai"))
+    : "senza calendario il rischio di salto non e\u2019 conoscibile";
+
+  var html = "";
+  if(cal.in_blackout && cal.blackout_event){
+    var be = cal.blackout_event;
+    html += '<div class="empty warn" style="margin-bottom:10px">'
+      + '<b>Motore fermo</b> \u00b7 ' + esc(be.currency||"") + " " + esc(be.title||"")
+      + '<br>riprende fra ' + Math.round(cal.blackout_ends_in_s||0) + 's</div>';
+  }
+  var up = cal.upcoming || [];
+  if(up.length){
+    html += '<div class="sub" style="margin-bottom:6px">Prossimi eventi rilevanti</div>';
+    html += up.slice(0,6).map(function(e){
+      var cls = e.impact==="ALTO" ? "down" : (e.impact==="MEDIO" ? "warn" : "muted");
+      var when = e.in_minutes < 0 ? "in corso"
+               : (e.in_minutes < 90 ? Math.round(e.in_minutes)+" min"
+                                    : (e.in_minutes/60).toFixed(1)+" h");
+      return '<div class="kv"><span>'
+        + '<span class="'+cls+'">\u25cf</span> '
+        + esc(e.currency||"") + " " + esc((e.title||"").slice(0,42))
+        + '</span><span class="n tnum">'+when+'</span></div>';
+    }).join("");
+  } else if(cal.available){
+    html += '<div class="empty">nessun evento rilevante in vista</div>';
+  }
+  if(cal.last_error){
+    html += '<div class="empty warn" style="margin-top:8px">calendario: '
+      + esc(String(cal.last_error).slice(0,160)) + '</div>';
+  }
+  $("cal-body").innerHTML = html || '<div class="empty">in attesa</div>';
+}
+
+function qtDrawChart(curve, names){
+  var cv = $("qt-chart"); if(!cv) return;
+  var dpr = window.devicePixelRatio || 1;
+  var W = cv.clientWidth || 500, H = 150;
+  cv.width = W*dpr; cv.height = H*dpr;
+  var cx = cv.getContext("2d"); cx.setTransform(dpr,0,0,dpr,0,0);
+  cx.clearRect(0,0,W,H);
+  var pts = (curve||[]).filter(function(r){
+    return names.some(function(n){ return r[n]!=null; }); });
+  if(pts.length < 2){
+    cx.fillStyle = "#6d7a90"; cx.font = "11px system-ui"; cx.textAlign = "center";
+    cx.fillText("in attesa di almeno due letture", W/2, H/2);
+    return;
+  }
+  var vals = [];
+  pts.forEach(function(r){ names.forEach(function(n){
+    if(r[n]!=null) vals.push(r[n]); }); });
+  var lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+  if(hi===lo) hi = lo + 1e-5;
+  var pad = 24;
+  var X = function(i){ return pad + i*(W-pad*2)/(pts.length-1); };
+  var Y = function(v){ return H-pad - (v-lo)*(H-pad*2)/(hi-lo); };
+  cx.strokeStyle = "#1a2231"; cx.lineWidth = 1;
+  for(var i=0;i<3;i++){
+    var y = pad + i*(H-pad*2)/2;
+    cx.beginPath(); cx.moveTo(pad,y); cx.lineTo(W-pad,y); cx.stroke();
+  }
+  var cols = ["#4c8dff","#f0a12e","#8b5cf6","#26c281"];
+  names.forEach(function(n,idx){
+    cx.beginPath(); cx.strokeStyle = cols[idx%cols.length]; cx.lineWidth = 1.6;
+    var started = false;
+    pts.forEach(function(r,i){
+      if(r[n]==null) return;
+      if(!started){ cx.moveTo(X(i),Y(r[n])); started = true; }
+      else cx.lineTo(X(i),Y(r[n]));
+    });
+    cx.stroke();
+    cx.fillStyle = cols[idx%cols.length]; cx.font = "10px system-ui";
+    cx.textAlign = "left";
+    cx.fillText(n, pad + idx*78, 12);
+  });
+}
+
+function renderQuotes(q){
+  var st = $("qt-state");
+  if(!q.enabled){ st.textContent = "spenta"; st.className = "pill"; }
+  else if(q.outliers && q.outliers.length){
+    st.textContent = q.outliers.length + " anomala"; st.className = "pill off"; }
+  else if(q.live_sources >= 2){
+    st.textContent = q.live_sources + " fonti vive"; st.className = "pill on"; }
+  else { st.textContent = "meno di 2 fonti"; st.className = "pill warn"; }
+
+  $("qt-sub").textContent = q.spread_bps!=null
+    ? ("scarto massimo " + Number(q.spread_bps).toFixed(2) + " bps fra le fonti vive")
+    : "servono almeno due fonti per confrontare";
+
+  $("qt-verdict").textContent = q.verdict || "";
+  $("qt-verdict").className = (q.outliers && q.outliers.length) ? "warn" : "muted";
+
+  var body = $("qt-table").querySelector("tbody");
+  var rows = q.sources || [];
+  body.innerHTML = rows.length ? rows.map(function(r){
+    var cls = r.outlier ? "down" : (r.stale ? "warn" : "");
+    return '<tr>'
+      + '<td>'+esc(r.name)+(r.error?' <span class="warn">!</span>':'')+'</td>'
+      + '<td class="muted">'+esc(r.kind||"")+'</td>'
+      + '<td class="n tnum">'+px(r.price)+'</td>'
+      + '<td class="n tnum '+cls+'">'
+        +(r.divergence_bps!=null?Number(r.divergence_bps).toFixed(2)+" bps":"—")+'</td>'
+      + '<td class="n tnum">'+(r.latency_ms!=null?Math.round(r.latency_ms)+" ms":"—")+'</td>'
+      + '<td class="n tnum">'+(r.latency_p95_ms!=null?Math.round(r.latency_p95_ms)+" ms":"—")+'</td>'
+      + '<td class="n tnum'+((r.jitter_ms||0)>500?" warn":"")+'">'
+        +(r.jitter_ms!=null?Math.round(r.jitter_ms)+" ms":"—")+'</td>'
+      + '<td class="n tnum'+((r.failure_rate||0)>0.2?" down":"")+'">'
+        +((r.failure_rate||0)*100).toFixed(0)+'%</td>'
+      + '</tr>';
+  }).join("") : '<tr><td colspan="8" class="muted">nessuna fonte configurata</td></tr>';
+
+  qtDrawChart(q.curve, rows.filter(function(r){ return r.kind==="sito"; })
+                            .map(function(r){ return r.name; }));
+}
+
 // ------------------------------------------- CONTESTO FX / MACRO / BRIDGE
 
 // La forza di una valuta e' la media dei suoi cross: se EUR sale contro tutti
@@ -8119,6 +8324,12 @@ function tickSlow(){
   // Contesto FX, macro e bridge hanno ciascuno il proprio fetch: dipendono da
   // reti di terzi, ed e' proprio quello che non deve poter svuotare il resto
   // della pagina quando una delle tre non risponde.
+  get("/calendar").then(renderCalendar).catch(function(){
+    $("cal-state").textContent = "non raggiungibile";
+    $("cal-state").className = "pill off"; });
+  get("/quotes").then(renderQuotes).catch(function(){
+    $("qt-state").textContent = "non raggiungibile";
+    $("qt-state").className = "pill off"; });
   get("/fx-context").then(renderFx).catch(function(){
     $("fx-state").textContent = "non raggiungibile";
     $("fx-state").className = "pill off"; });
@@ -8454,6 +8665,19 @@ def make_http_server(engine: "Engine"):
                         "server_ts": now_ms()},
             if path == "/news":
                 return engine.news.status(),
+            if path == "/calendar":
+                return engine.calendar.status(),
+            if path == "/quotes":
+                # Il prezzo del motore e quello del broker entrano nel confronto
+                # come sorgenti a pieno titolo: e' proprio quello su cui si
+                # opera che va confrontato con gli altri.
+                br = engine.pocket.status()
+                return engine.quotes.report(
+                    engine_price=engine.market.snapshot().get("price"),
+                    engine_name=engine.feed.name,
+                    extra=({"broker": br.get("price") or br.get("last_price")}
+                           if br.get("configured") else None),
+                ),
             if path == "/pocket":
                 return engine.pocket.status(),
             if path == "/fx-context":
@@ -8584,7 +8808,8 @@ def make_http_server(engine: "Engine"):
             return {"error": "endpoint sconosciuto", "try": [
                 "/", "/health", "/diagnostics", "/market", "/signals",
                 "/signals/current", "/burst/session", "/statistics", "/shadow",
-                "/retrain", "/agents", "/research",
+                "/retrain", "/agents", "/research", "/news", "/calendar",
+                "/quotes", "/fx-context", "/pocket",
                 "/models", "/config", "/db"]}, 404
 
     server = ThreadingHTTPServer((engine.cfg.http_host, engine.cfg.http_port), Handler)
@@ -8595,6 +8820,547 @@ def make_http_server(engine: "Engine"):
 # --------------------------------------------------------------------------- #
 #  CONTESTO NEWS + BRIDGE POCKET
 # --------------------------------------------------------------------------- #
+
+
+class QuoteMonitor:
+    """Lo stesso cambio, letto da piu' siti indipendenti.
+
+    Una fonte sola non puo' rispondere alle tre domande che contano prima di
+    decidere su sessanta secondi:
+
+      * **quanto e' vecchio** il prezzo su cui sto decidendo;
+      * **quanto e' stabile** la latenza, perche' una fonte che di solito
+        risponde in 80 ms e ogni tanto in 3 secondi e' peggio di una lenta e
+        regolare: il ritardo arriva quando il mercato si muove;
+      * **le fonti sono d'accordo?** Se due siti indipendenti quotano EUR/USD a
+        dieci punti base di distanza, almeno uno dei due sta descrivendo un
+        momento diverso - e non si sa quale.
+
+    Il monitor non produce segnali e non tocca il prezzo su cui il motore
+    opera. Misura, e basta. La mediana serve solo da riferimento per dire quale
+    fonte diverge: sostituire il feed con una media di sorgenti lente
+    peggiorerebbe la latenza invece di migliorarla.
+
+    Tutte le sorgenti qui sono gratuite e senza chiave.
+    """
+
+    #: name -> (url, parser, descrizione)
+    SOURCES: dict[str, tuple[str, str, str]] = {
+        # Book reale e veloce: EURUSDT e' il proxy cripto del cambio, quotato
+        # in continuo con bid/ask veri.
+        "binance": ("https://api.binance.com/api/v3/ticker/bookTicker?symbol=EURUSDT",
+                    "binance", "book EURUSDT, bid/ask reali"),
+        # Riferimento BCE: lento (giornaliero) ma indipendente e autorevole -
+        # serve da ancora, non da prezzo operativo.
+        "frankfurter": ("https://api.frankfurter.app/latest?from=EUR&to=USD",
+                        "frankfurter", "riferimento BCE, aggiornamento lento"),
+        # Aggregatore gratuito senza chiave.
+        "exchangerate": ("https://open.er-api.com/v6/latest/EUR",
+                         "erapi", "aggregatore gratuito"),
+    }
+
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread: threading.Thread | None = None
+        names = [x.strip().lower() for x in cfg.quotes_sources.split(",") if x.strip()]
+        self.names = [n for n in names if n in self.SOURCES]
+        self._state: dict[str, dict[str, Any]] = {
+            n: {
+                "name": n, "price": None, "ts": None, "bid": None, "ask": None,
+                "latency_ms": None, "reads": 0, "failures": 0, "error": None,
+                "note": self.SOURCES[n][2], "latencies": deque(maxlen=120),
+            } for n in self.names
+        }
+        self.history: deque = deque(maxlen=900)
+
+    # ------------------------------------------------------------- ciclo
+    def start(self) -> None:
+        if not self.cfg.quotes_enabled or not self.names or self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, name="quotes",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+
+    def _loop(self) -> None:
+        while self._running:
+            for name in self.names:
+                if not self._running:
+                    return
+                try:
+                    self.poll_one(name)
+                except Exception as exc:  # noqa: BLE001 - una fonte non ferma le altre
+                    with self._lock:
+                        st = self._state[name]
+                        st["failures"] += 1
+                        st["error"] = f"{type(exc).__name__}: {exc}"
+            self._snapshot_history()
+            for _ in range(int(max(1.0, self.cfg.quotes_poll_s) * 2)):
+                if not self._running:
+                    return
+                time.sleep(0.5)
+
+    # ---------------------------------------------------------- lettura
+    def poll_one(self, name: str) -> dict[str, Any]:
+        """Una lettura, cronometrata. Il tempo di risposta E' un dato."""
+        url, parser, _ = self.SOURCES[name]
+        started = time.perf_counter()
+        try:
+            payload = http_get_json(url, self.cfg.proxy, timeout=8.0)
+        except Exception as exc:  # noqa: BLE001
+            with self._lock:
+                st = self._state[name]
+                st["failures"] += 1
+                st["error"] = f"{type(exc).__name__}: {exc}"
+                st["latency_ms"] = None
+            raise
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        quote = getattr(self, f"_parse_{parser}")(payload)
+        with self._lock:
+            st = self._state[name]
+            st.update(quote)
+            st["ts"] = now_ms()
+            st["latency_ms"] = round(latency_ms, 1)
+            st["latencies"].append(latency_ms)
+            st["reads"] += 1
+            st["error"] = None
+            return {k: v for k, v in st.items() if k != "latencies"}
+
+    @staticmethod
+    def _parse_binance(payload: Any) -> dict[str, Any]:
+        bid = float(payload["bidPrice"])
+        ask = float(payload["askPrice"])
+        if bid <= 0 or ask <= 0:
+            raise ValueError("book vuoto")
+        return {"bid": bid, "ask": ask, "price": (bid + ask) / 2.0}
+
+    @staticmethod
+    def _parse_frankfurter(payload: Any) -> dict[str, Any]:
+        rate = (payload.get("rates") or {}).get("USD")
+        if rate is None:
+            raise ValueError("nessun cambio USD nella risposta")
+        return {"bid": None, "ask": None, "price": float(rate)}
+
+    @staticmethod
+    def _parse_erapi(payload: Any) -> dict[str, Any]:
+        rates = payload.get("rates") or payload.get("conversion_rates") or {}
+        rate = rates.get("USD")
+        if rate is None:
+            raise ValueError("nessun cambio USD nella risposta")
+        return {"bid": None, "ask": None, "price": float(rate)}
+
+    # ------------------------------------------------------- valutazione
+    def _snapshot_history(self) -> None:
+        row: dict[str, Any] = {"t": now_ms()}
+        with self._lock:
+            for name, st in self._state.items():
+                row[name] = st.get("price")
+        self.history.append(row)
+
+    def report(self, engine_price: float | None = None,
+               engine_name: str = "motore",
+               extra: dict[str, float | None] | None = None) -> dict[str, Any]:
+        """Latenza, stabilita' e divergenza, fonte per fonte.
+
+        `engine_price` e `extra` (per esempio il broker) entrano nel confronto
+        come sorgenti a pieno titolo: e' proprio il prezzo su cui si opera che
+        va confrontato con gli altri, non solo i siti fra loro.
+        """
+        now = now_ms()
+        rows: list[dict[str, Any]] = []
+        with self._lock:
+            for name in self.names:
+                st = self._state[name]
+                lat = list(st["latencies"])
+                age = ((now - st["ts"]) / 1000.0) if st["ts"] else None
+                rows.append({
+                    "name": name, "kind": "sito",
+                    "price": st["price"], "bid": st["bid"], "ask": st["ask"],
+                    "age_s": round(age, 1) if age is not None else None,
+                    "latency_ms": st["latency_ms"],
+                    "latency_p50_ms": (round(percentile(lat, 0.50), 1)
+                                       if lat else None),
+                    "latency_p95_ms": (round(percentile(lat, 0.95), 1)
+                                       if lat else None),
+                    "jitter_ms": (round(percentile(lat, 0.95) - percentile(lat, 0.50), 1)
+                                  if len(lat) >= 4 else None),
+                    "reads": st["reads"], "failures": st["failures"],
+                    "failure_rate": (round(st["failures"] / max(1, st["reads"] + st["failures"]), 4)),
+                    "error": st["error"], "note": st["note"],
+                })
+        if engine_price:
+            rows.insert(0, {"name": engine_name, "kind": "feed operativo",
+                            "price": engine_price, "age_s": 0.0,
+                            "note": "il prezzo su cui il motore decide"})
+        for name, price in (extra or {}).items():
+            rows.append({"name": name, "kind": "broker", "price": price,
+                         "note": "il prezzo dove si opererebbe"})
+
+        prices = [r["price"] for r in rows if r.get("price")]
+        median = percentile(sorted(prices), 0.5) if prices else None
+        for r in rows:
+            p = r.get("price")
+            r["divergence_bps"] = (round(abs(p - median) / median * 10_000.0, 3)
+                                   if p and median else None)
+            r["stale"] = bool(r.get("age_s") is not None
+                              and r["age_s"] > self.cfg.quotes_max_age_s)
+            r["outlier"] = bool(r["divergence_bps"] is not None
+                                and r["divergence_bps"] > self.cfg.quotes_max_divergence_bps)
+
+        live = [r for r in rows if r.get("price") and not r.get("stale")]
+        spread_bps = None
+        if len(live) >= 2 and median:
+            lo = min(r["price"] for r in live)
+            hi = max(r["price"] for r in live)
+            spread_bps = round((hi - lo) / median * 10_000.0, 3)
+
+        outliers = [r["name"] for r in rows if r.get("outlier")]
+        unstable = [r["name"] for r in rows
+                    if r.get("jitter_ms") is not None and r["jitter_ms"] > 500.0]
+        failing = [r["name"] for r in rows if r.get("failure_rate", 0) > 0.2]
+
+        if len(live) < 2:
+            verdict = ("Meno di due fonti vive: la coerenza dei prezzi non e' "
+                       "verificabile. Non e' un via libera, e' un'assenza di prova.")
+        elif outliers:
+            verdict = (f"{', '.join(outliers)} diverge dalla mediana oltre "
+                       f"{self.cfg.quotes_max_divergence_bps:g}bps: almeno una "
+                       "fonte sta descrivendo un momento diverso.")
+        elif unstable:
+            verdict = (f"Prezzi coerenti, ma la latenza di {', '.join(unstable)} "
+                       "e' irregolare: il ritardo arriva quando il mercato si muove.")
+        elif failing:
+            verdict = f"Prezzi coerenti; {', '.join(failing)} fallisce spesso."
+        else:
+            verdict = (f"{len(live)} fonti vive e concordi entro "
+                       f"{spread_bps if spread_bps is not None else 0:.2f}bps.")
+
+        return {
+            "enabled": self.cfg.quotes_enabled,
+            "sources": rows,
+            "live_sources": len(live),
+            "median": median,
+            "spread_bps": spread_bps,
+            "outliers": outliers,
+            "unstable": unstable,
+            "verdict": verdict,
+            "limits": {"max_divergence_bps": self.cfg.quotes_max_divergence_bps,
+                       "max_age_s": self.cfg.quotes_max_age_s},
+            "curve": list(self.history)[-300:],
+            "note": ("Il monitor MISURA e basta: non tocca il prezzo su cui il "
+                     "motore opera. Sostituirlo con una media di sorgenti lente "
+                     "peggiorerebbe la latenza invece di migliorarla."),
+        }
+
+
+class EconomicCalendar:
+    """Il calendario macro come DIVIETO A TEMPO, non come feature in piu'.
+
+    Il sentiment delle notizie dice cosa si sta dicendo del mercato. Il
+    calendario dice quando esce un numero - e sono due rischi diversi. Su una
+    binaria da 60 secondi la pubblicazione di un dato macro non e' un
+    cambiamento di sentiment: e' un salto. Il prezzo si sposta di decine di
+    punti base in meno di un secondo, lo spread si allarga, e qualunque
+    vantaggio microstrutturale misurato sui minuti precedenti smette di valere.
+
+    Per questo qui non si produce un punteggio da mescolare agli altri: si
+    produce una FINESTRA in cui il motore non opera. E' l'unica risposta
+    proporzionata a un rischio che non e' stimabile dal book.
+
+    Le sorgenti sono gratuite e senza chiave, provate in ordine: se la prima
+    cambia formato o smette di rispondere, si passa alla seconda. Quando non
+    risponde nessuna il calendario si dichiara NON DISPONIBILE - e a quel punto
+    la scelta se operare comunque e' esplicita (`require_calendar`), non un
+    silenzio che sembra "nessun evento in vista".
+    """
+
+    #: Sorgenti gratuite note. Ognuna ha il suo parser perche' le forme sono
+    #: diverse; quello che devono produrre e' identico.
+    PROVIDERS: dict[str, str] = {
+        # ForexFactory settimanale, JSON pubblico, nessuna chiave.
+        "faireconomy": "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+        # Trading Economics con accesso ospite documentato.
+        "tradingeconomics": "https://api.tradingeconomics.com/calendar?c=guest:guest&f=json",
+    }
+
+    HIGH, MEDIUM, LOW = "ALTO", "MEDIO", "BASSO"
+
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self._lock = threading.Lock()
+        self._events: list[dict[str, Any]] = []
+        self._source: str | None = None
+        self._fetched_ts: int = 0
+        self.last_error: str | None = None
+        self.fetches = 0
+        self._running = False
+        self._thread: threading.Thread | None = None
+        raw = [x.strip().upper() for x in cfg.calendar_currencies.split(",") if x.strip()]
+        self.currencies = set(raw) or {"EUR", "USD"}
+
+    # ------------------------------------------------------------- ciclo
+    def start(self) -> None:
+        if not self.cfg.calendar_enabled or self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, name="calendar",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+
+    def _loop(self) -> None:
+        while self._running:
+            try:
+                self.refresh()
+            except Exception as exc:  # noqa: BLE001 - il calendario non ferma il motore
+                self.last_error = f"{type(exc).__name__}: {exc}"
+            for _ in range(int(max(30.0, self.cfg.calendar_poll_s) * 2)):
+                if not self._running:
+                    return
+                time.sleep(0.5)
+
+    # ----------------------------------------------------------- lettura
+    def refresh(self) -> dict[str, Any]:
+        """L'unico punto che tocca la rete. Mai da un handler HTTP."""
+        wanted = [x.strip().lower() for x in self.cfg.calendar_sources.split(",")
+                  if x.strip()]
+        errors: list[str] = []
+        for name in wanted:
+            url = self.PROVIDERS.get(name)
+            if not url:
+                errors.append(f"{name}: sorgente sconosciuta")
+                continue
+            try:
+                payload = http_get_json(url, self.cfg.proxy, timeout=12.0)
+                events = self._parse(name, payload)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{name}: {type(exc).__name__}: {exc}")
+                continue
+            if not events:
+                errors.append(f"{name}: nessun evento riconosciuto")
+                continue
+            events.sort(key=lambda e: e["ts"])
+            with self._lock:
+                self._events = events
+                self._source = name
+                self._fetched_ts = now_ms()
+                self.fetches += 1
+                self.last_error = None
+            return self.status()
+        self.last_error = "; ".join(errors) or "nessuna sorgente configurata"
+        return self.status()
+
+    # ---------------------------------------------------------- parsing
+    @classmethod
+    def _parse(cls, source: str, payload: Any) -> list[dict[str, Any]]:
+        rows = payload if isinstance(payload, list) else None
+        if rows is None and isinstance(payload, dict):
+            for key in ("events", "data", "result"):
+                if isinstance(payload.get(key), list):
+                    rows = payload[key]
+                    break
+        if not isinstance(rows, list):
+            raise ValueError("risposta senza elenco di eventi")
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            parsed = (cls._parse_faireconomy(row) if source == "faireconomy"
+                      else cls._parse_tradingeconomics(row))
+            if parsed is not None:
+                out.append(parsed)
+        return out
+
+    @classmethod
+    def _parse_faireconomy(cls, row: dict) -> dict[str, Any] | None:
+        ts = cls._parse_iso(row.get("date"))
+        if ts is None:
+            return None
+        return {
+            "ts": ts,
+            "currency": str(row.get("country") or "").upper(),
+            "title": str(row.get("title") or "").strip(),
+            "impact": cls._impact(row.get("impact")),
+            "forecast": row.get("forecast") or None,
+            "previous": row.get("previous") or None,
+        }
+
+    @classmethod
+    def _parse_tradingeconomics(cls, row: dict) -> dict[str, Any] | None:
+        ts = cls._parse_iso(row.get("Date") or row.get("date"))
+        if ts is None:
+            return None
+        # Trading Economics usa il nome del paese, non la valuta.
+        country = str(row.get("Country") or row.get("country") or "")
+        currency = {
+            "euro area": "EUR", "germany": "EUR", "france": "EUR",
+            "italy": "EUR", "spain": "EUR", "netherlands": "EUR",
+            "united states": "USD",
+        }.get(country.strip().lower(), country.strip().upper()[:3])
+        importance = row.get("Importance", row.get("importance"))
+        return {
+            "ts": ts,
+            "currency": currency,
+            "title": str(row.get("Event") or row.get("event") or "").strip(),
+            "impact": cls._impact(importance),
+            "forecast": row.get("Forecast") or row.get("forecast") or None,
+            "previous": row.get("Previous") or row.get("previous") or None,
+        }
+
+    @classmethod
+    def _impact(cls, raw: Any) -> str:
+        """Le sorgenti scrivono l'impatto in modi diversi: parole o numeri."""
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            n = int(raw)
+            return cls.HIGH if n >= 3 else cls.MEDIUM if n == 2 else cls.LOW
+        text = str(raw or "").strip().lower()
+        if text.startswith("high") or text in ("3", "alto"):
+            return cls.HIGH
+        if text.startswith("med") or text in ("2", "medio"):
+            return cls.MEDIUM
+        return cls.LOW
+
+    @staticmethod
+    def _parse_iso(raw: Any) -> int | None:
+        """Timestamp in millisecondi UTC.
+
+        Le sorgenti mandano l'ora con fuso ("...-04:00"), senza fuso, o con la
+        Z. Una data senza fuso viene letta come UTC e DICHIARATA tale: tirare a
+        indovinare il fuso locale sposterebbe le finestre di divieto di ore.
+        """
+        if raw in (None, ""):
+            return None
+        text = str(raw).strip().replace("Z", "+00:00")
+        from datetime import datetime, timezone
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S",
+                        "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                try:
+                    dt = datetime.strptime(text, fmt)
+                    break
+                except ValueError:
+                    continue
+            else:
+                return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+
+    # ------------------------------------------------------- valutazione
+    def _relevant(self, ev: dict) -> bool:
+        """Un dato australiano non muove EUR/USD abbastanza da fermare il motore.
+
+        Attenzione al codice "ALL": nel calendario significa *evento globale*
+        (un vertice OPEC, un G7), non "tutte le valute". Trattarlo come un
+        jolly faceva passare qualunque paese, e un fermo per il commercio
+        estero australiano e' un fermo regalato. Il jolly vero, se lo si vuole,
+        e' "*".
+        """
+        cur = (ev.get("currency") or "").upper()
+        return "*" in self.currencies or cur in self.currencies
+
+    def window_for(self, impact: str) -> tuple[float, float] | None:
+        """Quanti minuti prima e dopo l'evento il motore sta fermo."""
+        cfg = self.cfg
+        if impact == self.HIGH:
+            return (cfg.calendar_block_before_min, cfg.calendar_block_after_min)
+        if impact == self.MEDIUM and cfg.calendar_block_medium:
+            return (cfg.calendar_medium_before_min, cfg.calendar_medium_after_min)
+        return None
+
+    def assess(self, ts: int | None = None) -> dict[str, Any]:
+        """Siamo dentro una finestra di divieto? E quanto manca alla prossima?"""
+        ts = ts or now_ms()
+        with self._lock:
+            events = list(self._events)
+            source = self._source
+            fetched = self._fetched_ts
+        out: dict[str, Any] = {
+            "available": bool(events),
+            "source": source,
+            "events_known": len(events),
+            "age_s": (round((now_ms() - fetched) / 1000.0, 1) if fetched else None),
+            "in_blackout": False,
+            "blackout_event": None,
+            "blackout_ends_in_s": None,
+            "next_event": None,
+            "minutes_to_next": None,
+            "next_impact": None,
+            "upcoming": [],
+        }
+        if not events:
+            return out
+
+        blocking: list[tuple[dict, float]] = []
+        upcoming: list[dict] = []
+        for ev in events:
+            if not self._relevant(ev):
+                continue
+            delta_min = (ev["ts"] - ts) / 60_000.0
+            window = self.window_for(ev["impact"])
+            if window is not None:
+                before, after = window
+                if -after <= delta_min <= before:
+                    blocking.append((ev, (ev["ts"] + after * 60_000 - ts) / 1000.0))
+            if delta_min >= -1.0:
+                upcoming.append({**ev, "in_minutes": round(delta_min, 1)})
+
+        upcoming.sort(key=lambda e: e["ts"])
+        out["upcoming"] = upcoming[:8]
+        if upcoming:
+            nxt = upcoming[0]
+            out["next_event"] = nxt
+            out["minutes_to_next"] = nxt["in_minutes"]
+            out["next_impact"] = nxt["impact"]
+        if blocking:
+            # Se piu' eventi si sovrappongono, comanda quello che finisce dopo.
+            ev, ends_in = max(blocking, key=lambda x: x[1])
+            out["in_blackout"] = True
+            out["blackout_event"] = ev
+            out["blackout_ends_in_s"] = round(ends_in, 1)
+        return out
+
+    def features(self, ts: int | None = None) -> dict[str, Any]:
+        """Le stesse informazioni come feature causali, per il dataset."""
+        a = self.assess(ts)
+        impact_num = {self.HIGH: 3.0, self.MEDIUM: 2.0, self.LOW: 1.0}
+        return {
+            "cal_available": 1.0 if a["available"] else 0.0,
+            "cal_in_blackout": 1.0 if a["in_blackout"] else 0.0,
+            "cal_minutes_to_next": (float(a["minutes_to_next"])
+                                    if a["minutes_to_next"] is not None else None),
+            "cal_next_impact": impact_num.get(a["next_impact"] or "", None),
+            "cal_events_known": float(a["events_known"]),
+        }
+
+    def status(self) -> dict[str, Any]:
+        return {
+            **self.assess(),
+            "enabled": self.cfg.calendar_enabled,
+            "sources": self.cfg.calendar_sources,
+            "currencies": sorted(self.currencies),
+            "fetches": self.fetches,
+            "last_error": self.last_error,
+            "windows_min": {
+                "alto": [self.cfg.calendar_block_before_min,
+                         self.cfg.calendar_block_after_min],
+                "medio": ([self.cfg.calendar_medium_before_min,
+                           self.cfg.calendar_medium_after_min]
+                          if self.cfg.calendar_block_medium else None),
+            },
+            "note": ("Il calendario e' un DIVIETO A TEMPO, non un punteggio: "
+                     "attorno a un dato macro il prezzo salta e la "
+                     "microstruttura non predice piu' niente."),
+        }
 
 
 class MacroNewsScanner:
@@ -8861,6 +9627,8 @@ class Engine:
         self.feed = build_feed(cfg)
         self.market = MarketData(cfg, self.feed, self.store)
         self.news = MacroNewsScanner(cfg)
+        self.calendar = EconomicCalendar(cfg)
+        self.quotes = QuoteMonitor(cfg)
         self.pocket = PocketBridge(cfg)
         self.features = FeatureEngine(cfg, self.market, self._external_features)
         self.model: Model | None = None
@@ -8885,6 +9653,7 @@ class Engine:
         if callable(fn):
             out.update(fn() or {})
         out.update(self.news.snapshot())
+        out.update(self.calendar.features())
         return out
 
     # ------------------------------------------------------------------ setup
@@ -8959,6 +9728,8 @@ class Engine:
     def start(self) -> None:
         self.store.start()
         self.news.start()
+        self.calendar.start()
+        self.quotes.start()
         self.pocket.start()
         if self.store.migrated:
             self._log(f"database aggiornato: aggiunte {len(self.store.migrated)} "
@@ -8995,6 +9766,8 @@ class Engine:
         self._running = False
         self.retrainer.stop()
         self.news.stop()
+        self.calendar.stop()
+        self.quotes.stop()
         self.pocket.stop()
         if self.http:
             self.http.shutdown()
@@ -9576,6 +10349,59 @@ def cmd_shadow(cfg: Config, args) -> int:
     return 0
 
 
+def cmd_sources(cfg: Config, args) -> int:
+    """Calendario e sorgenti di prezzo, provati sul serio.
+
+    E' il comando da lanciare sulla TUA macchina: nell'ambiente in cui questo
+    codice e' stato scritto il proxy nega ogni host esterno, quindi il parsing
+    e' stato verificato contro risposte locali fedeli e la rete vera non l'ha
+    mai vista nessuno. Qui la si vede.
+    """
+    print(f"AURUM {VERSION} - sorgenti esterne\n")
+
+    print("CALENDARIO ECONOMICO")
+    cal = EconomicCalendar(cfg)
+    cal.refresh()
+    a = cal.assess()
+    print(f"  sorgenti provate    : {cfg.calendar_sources}")
+    print(f"  sorgente attiva     : {a['source'] or 'NESSUNA'}")
+    print(f"  eventi conosciuti   : {a['events_known']}")
+    print(f"  valute rilevanti    : {', '.join(sorted(cal.currencies))}")
+    if cal.last_error:
+        print(f"  errore              : {cal.last_error}")
+    if a["in_blackout"]:
+        ev = a["blackout_event"] or {}
+        print(f"  FERMO               : {ev.get('currency')} {ev.get('title')} "
+              f"(riprende fra {a['blackout_ends_in_s']:.0f}s)")
+    for ev in a["upcoming"][:6]:
+        print(f"    {ev['in_minutes']:>8.1f} min  {ev['currency']:4s} "
+              f"{ev['impact']:6s} {ev['title'][:46]}")
+
+    print("\nSORGENTI DI PREZZO")
+    mon = QuoteMonitor(cfg)
+    if not mon.names:
+        print("  nessuna sorgente configurata (--quotes-sources)")
+    for _ in range(3):
+        for name in mon.names:
+            try:
+                mon.poll_one(name)
+            except Exception as exc:  # noqa: BLE001 - e' un diagnostico
+                print(f"  {name:14s} ERRORE {type(exc).__name__}: {exc}")
+        mon._snapshot_history()
+        time.sleep(0.4)
+    rep = mon.report()
+    print(f"  {'fonte':14s}{'prezzo':>11}{'div bps':>9}{'lat ms':>8}"
+          f"{'p95':>7}{'jitter':>8}{'errori':>8}")
+    for r in rep["sources"]:
+        print(f"  {r['name']:14s}{(r.get('price') or 0):>11.5f}"
+              f"{(r.get('divergence_bps') if r.get('divergence_bps') is not None else 0):>9.2f}"
+              f"{(r.get('latency_ms') or 0):>8.0f}{(r.get('latency_p95_ms') or 0):>7.0f}"
+              f"{(r.get('jitter_ms') or 0):>8.0f}"
+              f"{(r.get('failure_rate') or 0)*100:>7.0f}%")
+    print(f"\n  {rep['verdict']}")
+    return 0
+
+
 def cmd_config(cfg: Config, args) -> int:
     """La configurazione RISOLTA, con la versione del file in cima.
 
@@ -10061,6 +10887,149 @@ def cmd_selftest(cfg: Config, args) -> int:
                 f"senza rete, cambio simulato {move:.1f}bps/60s, "
                 f"prezzi dal tick, 3 pannelli presenti")
 
+    # ------------------------- calendario macro e sorveglianza dei prezzi
+    def t_calendar_quotes() -> str:
+        """Calendario e monitor multi-fonte, contro API finte ma fedeli.
+
+        Il proxy di questo ambiente nega ogni host esterno, quindi il parsing
+        si prova contro risposte servite in locale che riproducono la FORMA di
+        quelle vere. Prova il codice, non la rete - ed e' dichiarato.
+        """
+        import tempfile
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from datetime import datetime, timezone, timedelta
+
+        now = datetime.now(timezone.utc)
+
+        def iso(minutes):
+            return (now + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%S") + "+00:00"
+
+        ff = [
+            {"title": "ECB Press Conference", "country": "EUR",
+             "date": iso(5), "impact": "High"},
+            {"title": "Trade Balance", "country": "AUD",
+             "date": iso(3), "impact": "High"},
+            {"title": "Core CPI m/m", "country": "USD",
+             "date": iso(300), "impact": "High"},
+        ]
+        te = [{"Date": (now + timedelta(minutes=200)).strftime("%Y-%m-%dT%H:%M:%S"),
+               "Country": "United States", "Event": "Fed Rate Decision",
+               "Importance": 3}]
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):  # noqa: N802
+                if "ff_calendar" in self.path:
+                    body: Any = ff
+                elif "tradingeconomics" in self.path:
+                    body = te
+                elif "bookTicker" in self.path:
+                    body = {"bidPrice": "1.08531", "askPrice": "1.08535"}
+                elif "frankfurter" in self.path:
+                    body = {"rates": {"USD": 1.08540}}
+                elif "er-api" in self.path:
+                    body = {"rates": {"USD": 1.08600}}
+                elif "broken" in self.path:
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b"no")
+                    return
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                raw = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+        saved_cal = dict(EconomicCalendar.PROVIDERS)
+        saved_q = dict(QuoteMonitor.SOURCES)
+        try:
+            EconomicCalendar.PROVIDERS = {
+                "faireconomy": base + "/ff_calendar_thisweek.json",
+                "tradingeconomics": base + "/tradingeconomics",
+            }
+            cal = EconomicCalendar(Config(db_path=":memory:"))
+            cal.refresh()
+            a = cal.assess()
+            assert a["available"] and a["source"] == "faireconomy", a
+            # Un dato australiano NON deve fermare EUR/USD: "ALL" nel calendario
+            # significa evento globale, non "tutte le valute".
+            titles = [e["title"] for e in a["upcoming"]]
+            assert "Trade Balance" not in titles, titles
+            assert a["in_blackout"], "la BCE fra 5 minuti deve fermare il motore"
+            assert (a["blackout_event"] or {})["currency"] == "EUR", a["blackout_event"]
+            feats = cal.features()
+            assert feats["cal_in_blackout"] == 1.0 and feats["cal_available"] == 1.0
+
+            # Fuori dalla finestra non si blocca.
+            far = cal.assess(ts=now_ms() - 60 * 60_000)
+            assert not far["in_blackout"], "blocco fuori finestra"
+
+            # La seconda sorgente ha una forma diversa e deve funzionare uguale.
+            cal2 = EconomicCalendar(Config(db_path=":memory:",
+                                           calendar_sources="tradingeconomics"))
+            cal2.refresh()
+            a2 = cal2.assess()
+            assert a2["available"] and a2["events_known"] == 1, a2
+            assert (a2["next_event"] or {})["currency"] == "USD", a2["next_event"]
+
+            # Nessuna sorgente raggiungibile: NON DISPONIBILE, non "tutto bene".
+            cal3 = EconomicCalendar(Config(db_path=":memory:",
+                                           calendar_sources="inesistente"))
+            cal3.refresh()
+            a3 = cal3.assess()
+            assert not a3["available"] and cal3.last_error, a3
+            assert cal3.features()["cal_in_blackout"] == 0.0
+
+            # ---------------------------------------------- monitor prezzi
+            QuoteMonitor.SOURCES = {
+                "binance": (base + "/api/v3/ticker/bookTicker", "binance", "book"),
+                "frankfurter": (base + "/frankfurter", "frankfurter", "BCE"),
+                "exchangerate": (base + "/broken", "erapi", "rotta"),
+            }
+            q = QuoteMonitor(Config(db_path=":memory:"))
+            for _ in range(3):
+                for name in q.names:
+                    try:
+                        q.poll_one(name)
+                    except Exception:  # noqa: BLE001 - la rotta deve fallire
+                        pass
+                q._snapshot_history()
+            rep = q.report(engine_price=1.08533, engine_name="motore",
+                           extra={"broker": 1.08700})
+            by = {r["name"]: r for r in rep["sources"]}
+            assert by["binance"]["price"] and by["binance"]["bid"], by["binance"]
+            assert by["frankfurter"]["price"] == 1.08540, by["frankfurter"]
+            # Una fonte rotta non deve fermare le altre, e deve dire perche'.
+            assert by["exchangerate"]["price"] is None, by["exchangerate"]
+            assert by["exchangerate"]["failure_rate"] == 1.0, by["exchangerate"]
+            assert by["exchangerate"]["error"], "guasto senza motivo"
+            # Il broker diverge di ~15bps: deve essere dichiarato anomalo.
+            assert by["broker"]["outlier"], by["broker"]
+            assert "broker" in rep["outliers"], rep["outliers"]
+            assert by["binance"]["latency_ms"] is not None, "latenza non misurata"
+            assert rep["live_sources"] >= 3, rep["live_sources"]
+        finally:
+            EconomicCalendar.PROVIDERS = saved_cal
+            QuoteMonitor.SOURCES = saved_q
+            srv.shutdown()
+
+        for panel in ("cal-body", "qt-table", "renderCalendar", "renderQuotes"):
+            assert panel in DASHBOARD_HTML, f"manca {panel} nel front end"
+        return (f"2 sorgenti di calendario, AUD ignorato, blackout BCE attivo; "
+                f"{rep['live_sources']} fonti prezzo, broker anomalo a "
+                f"{by['broker']['divergence_bps']:.1f}bps, fonte rotta isolata")
+
     # -------------------------------- database di una versione precedente
     def t_migration() -> str:
         """Un `aurum.db` vecchio deve continuare a funzionare.
@@ -10462,6 +11431,7 @@ def cmd_selftest(cfg: Config, args) -> int:
     check("prodotto a 1 minuto (segnali, conti, annullate)", t_one_minute)
     check("database di una versione precedente (migrazione)", t_migration)
     check("feed FX (normalizzazione, contesto, cosa non inventa)", t_fx_feed)
+    check("calendario macro e sorveglianza prezzi", t_calendar_quotes)
     check("portale EUR/USD (news, bridge, prezzi, pannelli)", t_eurusd_portal)
 
     print(f"\nAURUM ENGINE {VERSION} - selftest\n")
@@ -10490,6 +11460,7 @@ COMMANDS: dict[str, Callable[[Config, Any], int]] = {
     "mercato": cmd_market,
     "wallet": cmd_wallet,
     "config": cmd_config,
+    "sorgenti": cmd_sources,
     "selftest": cmd_selftest,
 }
 
@@ -10571,6 +11542,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="una riga JSON per evento")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--seed", type=int, help="seme del simulatore")
+    p.add_argument("--no-calendar", action="store_true",
+                   help="non fermarsi attorno ai dati macro")
+    p.add_argument("--calendar-sources",
+                   help="sorgenti del calendario, es. faireconomy,tradingeconomics")
+    p.add_argument("--quotes-sources",
+                   help="siti di confronto prezzo, es. binance,frankfurter,exchangerate")
+    p.add_argument("--no-quotes", action="store_true",
+                   help="disattiva la sorveglianza multi-fonte")
     p.add_argument("--timeout", type=float, default=8.0,
                    help="timeout di rete per `check`, in secondi")
     return p
@@ -10594,6 +11573,15 @@ def apply_args(cfg: Config, args) -> Config:
         cfg.news_enabled = False
     if getattr(args, "pocket_bridge", None):
         cfg.pocket_bridge_url = args.pocket_bridge
+    if getattr(args, "no_calendar", False):
+        cfg.calendar_enabled = False
+    if getattr(args, "no_quotes", False):
+        cfg.quotes_enabled = False
+    for attr, name in (("calendar_sources", "calendar_sources"),
+                       ("quotes_sources", "quotes_sources")):
+        value = getattr(args, attr, None)
+        if value:
+            setattr(cfg, name, value)
     if args.horizon is not None:
         cfg.set_explicit("horizon_s", args.horizon)
     if args.payout is not None:
