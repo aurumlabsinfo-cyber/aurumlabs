@@ -1,0 +1,44 @@
+# Motore AURUM EUR/USD a 60 secondi. SOLO CARTA.
+#
+#   cp deploy/aurum-engine.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now aurum-engine
+#   systemctl --user status aurum-engine
+#
+# Perche' il motore continui a girare anche quando NON sei collegato via ssh:
+#   sudo loginctl enable-linger $USER
+# Senza quel comando systemd chiude i servizi utente all'ultimo logout - ed e'
+# esattamente il problema del "chiudo il terminale e si ferma tutto".
+
+[Unit]
+Description=AURUM - motore EUR/USD 60s (solo carta)
+After=network-online.target aurum-bridge.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/aurum
+
+# Le chiavi stanno in un file di ambiente con permessi 600, non nella riga di
+# comando: la riga di comando e' visibile a chiunque faccia `ps`.
+EnvironmentFile=%h/.aurum/env
+
+ExecStart=/usr/bin/python3 %h/aurum/aurum_binary_eurusd_m60.py run \
+    --payout 0.8 \
+    --capital 500 --stake-amount 25 \
+    --db %h/aurum/aurum.db \
+    --host 127.0.0.1 --port 8002 \
+    --pocket-bridge http://127.0.0.1:8010
+
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aurum-engine
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,46 @@
+# Bridge Pocket Option -> AURUM. SOLA LETTURA: nessun ordine viene mai inviato.
+#
+# Installazione (utente normale, NON root):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/aurum-bridge.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now aurum-bridge
+#
+# Perche' un servizio "--user" e non uno di sistema: il bridge legge la TUA
+# sessione, che sta nella tua home con permessi 600. Farlo girare come root
+# significherebbe dare a un servizio di sistema accesso a una credenziale
+# personale, senza alcun vantaggio.
+
+[Unit]
+Description=AURUM - bridge Pocket Option (sola lettura)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/aurum
+ExecStart=/usr/bin/python3 %h/aurum/pocket_bridge_service.py \
+    --auth %h/.aurum/pocket.auth \
+    --asset EURUSD \
+    --host 127.0.0.1 --port 8010
+
+# Se cade, riparte: un bridge fermo fa apparire il conto "non connesso" sulla
+# dashboard, ed e' meglio che riprovi da solo.
+Restart=always
+RestartSec=5
+
+# Il token non deve finire nel journal: il bridge non lo stampa, e qui il log
+# resta comunque limitato al minimo.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aurum-bridge
+
+# Restringimenti: questo processo non ha bisogno di scrivere quasi nulla.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/aurum
+
+[Install]
+WantedBy=default.target
