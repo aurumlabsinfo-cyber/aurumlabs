@@ -42,7 +42,7 @@ from .execution.cost_model import CostModel
 from .execution.exploration import ExplorationTrader
 from .execution.paper_broker import PaperBroker
 from .features.engine import FeatureEngine
-from .logging_setup import get_logger
+from .logging_setup import get_logger, install_asyncio_noise_filter
 from .market.data_engine import DataEngine
 from .research.director import ResearchDirector
 from .risk.manager import RiskManager
@@ -114,6 +114,7 @@ class AurumRuntime:
             return
         self.running = True
         self.started_ms = now_ms()
+        install_asyncio_noise_filter()
         self.repos.system.log(
             "runtime", "start", f"{self.config.app.name} {self.config.app.version} starting",
             detail={"feed": self.config.market.feed, "symbols": len(self.config.market.symbols)},

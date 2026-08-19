@@ -8,6 +8,7 @@ plausible-looking numbers rather than an error.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -209,3 +210,37 @@ def test_build_feed_selects_the_configured_adapter(config: Config, tmp_path: Pat
         build_feed(config)
     config.market.replay_path = str(tmp_path / "x.jsonl")
     assert isinstance(build_feed(config), ReplayFeed)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_connection_does_not_bury_its_cause_in_tracebacks() -> None:
+    """An unreachable venue must read as one warning, not a page of stack.
+
+    The adapter catches the connection failure, records it and retries. The
+    transport can then fail again inside its own teardown, and asyncio prints
+    that second failure as an unhandled-callback traceback with no context. The
+    retry loop is fine, so those are noise — but a page of them makes a system
+    behaving exactly as designed look like one that has crashed, and scrolls
+    the real one-line cause away.
+    """
+    from aurum.logging_setup import install_asyncio_noise_filter
+
+    install_asyncio_noise_filter()
+    loop = asyncio.get_running_loop()
+    handler = loop.get_exception_handler()
+    assert handler is not None, "the filter did not install"
+
+    handled: list[dict] = []
+    loop.default_exception_handler = lambda ctx: handled.append(ctx)  # type: ignore[method-assign]
+
+    handler(loop, {
+        "message": "Exception in callback UVTransport._call_connection_lost",
+        "exception": AttributeError("'NoneType' object has no attribute 'status_code'"),
+    })
+    assert handled == [], "transport teardown noise reached the default handler"
+
+    # Anything else must still be reported in full: this quietens one known
+    # path, it is not a blanket suppressor.
+    real = {"message": "Task exception was never retrieved", "exception": ValueError("boom")}
+    handler(loop, real)
+    assert handled == [real], "a genuine error was swallowed"

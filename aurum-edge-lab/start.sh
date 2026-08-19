@@ -9,6 +9,11 @@
 #   ./start.sh --replay FILE        replay a recorded or generated file
 #   ./start.sh --demo               generate a synthetic file and replay it
 #   ./start.sh --frontend           also build and serve the dashboard
+#   ./start.sh --yes                start even if the venue does not verify
+#
+# The engine always starts if it can. A missing npm, a dashboard that will not
+# build, or an unreachable venue costs you that piece and says so — none of
+# them silently take the backend down with them.
 #
 set -euo pipefail
 
@@ -19,6 +24,7 @@ VENV=".venv"
 REPLAY=""
 DEMO=0
 FRONTEND=0
+ASSUME_YES=0
 EXTRA=()
 
 while [[ $# -gt 0 ]]; do
@@ -26,12 +32,14 @@ while [[ $# -gt 0 ]]; do
     --replay)   REPLAY="$2"; shift 2 ;;
     --demo)     DEMO=1; shift ;;
     --frontend) FRONTEND=1; shift ;;
+    --yes|-y)   ASSUME_YES=1; shift ;;
     *)          EXTRA+=("$1"); shift ;;
   esac
 done
 
-say() { printf '\n\033[1;33m==>\033[0m %s\n' "$*"; }
-die() { printf '\n\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+say()  { printf '\n\033[1;33m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33mWARNING:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\n\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ---------------------------------------------------------------- prerequisites
 
@@ -91,19 +99,40 @@ else
     printf '  * the venue moved an endpoint — check its current official docs and set\n'
     printf '    AURUM_REST_BASE / AURUM_WS_BASE, or market.rest_base / market.ws_base\n'
     printf 'Or start with --demo to run against a generated file instead.\n\n'
-    read -r -p 'Start anyway? [y/N] ' answer
-    [[ "$answer" == "y" || "$answer" == "Y" ]] || exit 1
+    # Only ask when there is someone to answer. Run from a script, a pipe or a
+    # service manager there is no terminal, and a blocking read would hang the
+    # start with no output explaining why — which looks exactly like a backend
+    # that failed to boot.
+    if [[ "$ASSUME_YES" == "1" ]]; then
+      warn "--yes given: starting anyway. Expect the feed to stay DISCONNECTED."
+    elif [[ -t 0 ]]; then
+      read -r -p 'Start anyway? [y/N] ' answer
+      [[ "$answer" == "y" || "$answer" == "Y" ]] || exit 1
+    else
+      die "no terminal to ask. Re-run with --yes to start regardless, or --demo for a generated feed."
+    fi
   }
 fi
 
 # ------------------------------------------------------------------- frontend
 
+# The engine is the product; the dashboard only looks at it. Nothing in here
+# may prevent the engine from starting — a missing npm or a failed build costs
+# you the browser view, not the run. Every branch below warns and carries on.
 if [[ "$FRONTEND" == "1" ]]; then
-  command -v npm >/dev/null || die "npm not found, but --frontend was requested"
-  say "Building the dashboard"
-  (cd frontend && npm install --silent && npm run build)
-  say "Serving the dashboard on http://localhost:3000"
-  (cd frontend && npm run start >../data/frontend.log 2>&1 &)
+  if ! command -v npm >/dev/null; then
+    warn "npm not found — skipping the dashboard. The engine and its API still start."
+  else
+    say "Building the dashboard"
+    if (cd frontend && npm install --silent && npm run build); then
+      say "Serving the dashboard on http://localhost:3000"
+      (cd frontend && npm run start >../data/frontend.log 2>&1 &)
+    else
+      warn "the dashboard failed to build — see the output above. Skipping it;"
+      warn "the engine and its API still start. Everything is on the API:"
+      warn "  curl -s http://127.0.0.1:${AURUM_API_PORT:-8002}/health | python3 -m json.tool"
+    fi
+  fi
 fi
 
 # ------------------------------------------------------------------------ run
