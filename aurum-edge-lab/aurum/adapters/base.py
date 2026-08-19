@@ -9,8 +9,9 @@ that adding a second venue never means re-implementing them.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
 from ..domain import FeedState, MarketEvent
 

@@ -24,8 +24,8 @@ the number in this batch, which would reset the clock every cycle.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
 from ..domain import MetricSet
 
@@ -200,7 +200,7 @@ def percentile(values: Sequence[float], pct: float) -> float:
     if not values:
         return 0.0
     ordered = sorted(values)
-    index = min(len(ordered) - 1, max(0, int(round(pct / 100.0 * (len(ordered) - 1)))))
+    index = min(len(ordered) - 1, max(0, round(pct / 100.0 * (len(ordered) - 1))))
     return ordered[index]
 
 

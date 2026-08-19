@@ -7,7 +7,6 @@ test; only feeding it known-good and known-bad data separates them.
 
 from __future__ import annotations
 
-import math
 import random
 
 import pytest

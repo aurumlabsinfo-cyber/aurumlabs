@@ -43,11 +43,11 @@ def build_feed(config: Config) -> MarketFeed:
 
 
 __all__ = [
-    "MarketFeed",
+    "BinanceFuturesFeed",
     "DepthSnapshot",
     "DepthUpdate",
     "FeedStats",
-    "BinanceFuturesFeed",
+    "MarketFeed",
     "ReplayFeed",
     "build_feed",
 ]

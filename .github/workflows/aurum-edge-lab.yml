@@ -1,0 +1,82 @@
+name: AURUM EDGE LAB
+
+# The engine has its own suite, its own selftest and its own frontend, none of
+# which the repository's other CI job knows about.
+on:
+  push:
+    branches: [main]
+    paths: ["aurum-edge-lab/**", ".github/workflows/aurum-edge-lab.yml"]
+  pull_request:
+    paths: ["aurum-edge-lab/**", ".github/workflows/aurum-edge-lab.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: aurum-edge-lab-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: aurum-edge-lab
+
+jobs:
+  engine:
+    name: Engine (pytest + selftest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: aurum-edge-lab/requirements-dev.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check aurum tools tests main.py
+
+      - name: Tests
+        # No test in this suite reaches a network. Feeds are exercised through
+        # recorded frames and the replay adapter, which is the same boundary the
+        # live adapter is written against.
+        run: pytest -q --durations=10
+
+      - name: Self-test
+        run: python3 main.py selftest
+
+      - name: Refuse a synthetic feed in production
+        # The one safety property worth asserting in CI directly: production
+        # must not be able to read generated market data.
+        run: |
+          if AURUM_ENV=production AURUM_FEED=replay python3 main.py config >/dev/null 2>&1; then
+            echo "production accepted a replay feed" >&2
+            exit 1
+          fi
+          echo "production refuses a replay feed, as expected"
+
+  frontend:
+    name: Dashboard (typecheck + build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: aurum-edge-lab/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: aurum-edge-lab/frontend/package-lock.json
+
+      - run: npm ci
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Build
+        run: npm run build

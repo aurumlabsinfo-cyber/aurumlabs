@@ -13,13 +13,13 @@ run on a fresh machine before trusting anything else.
 
 from __future__ import annotations
 
-import math
 import tempfile
 import time
 import traceback
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from ..config import Config, ConfigError, apply_setting, load_config
 
@@ -109,7 +109,7 @@ class SelfTest:
             self.report.checks.append(
                 Check(name, group, False, "assertion failed", (time.monotonic() - start) * 1000, str(exc))
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.report.checks.append(
                 Check(
                     name, group, False, f"{type(exc).__name__}", (time.monotonic() - start) * 1000,
@@ -506,11 +506,11 @@ class SelfTest:
                 snapshot = FeatureSnapshot(
                     "BTCUSDT", 0, {"vol_5s": 6.0}, Regime.NORMAL_RANGE, 0.95, True, 60000.5, 60000.6, 0.167
                 )
-                common = dict(
-                    symbol="BTCUSDT", direction=Direction.LONG, horizon_ms=5_000, snapshot=snapshot,
-                    open_positions={}, cycle_active=True, usdt_per_eur=config.fx.usdt_per_eur,
-                    at_ms=1_000,
-                )
+                common = {
+                    "symbol": "BTCUSDT", "direction": Direction.LONG, "horizon_ms": 5_000,
+                    "snapshot": snapshot, "open_positions": {}, "cycle_active": True,
+                    "usdt_per_eur": config.fx.usdt_per_eur, "at_ms": 1_000,
+                }
                 bad_quality = risk.evaluate(
                     expected_edge_bps=500.0, book=book(), quality_ok=False,
                     quality_detail="feed is STALE", **common
@@ -586,13 +586,13 @@ class SelfTest:
         assert self.config is not None
 
         def hypothesis(**kw) -> Hypothesis:
-            base = dict(
-                hypothesis_id=new_hypothesis_id("selftest"), agent="microstructure",
-                family="microstructure", signal_symbol="BTCUSDT", execution_symbol="BTCUSDT",
-                direction=Direction.LONG,
-                conditions=[PercentileCondition("ofi_norm_1s", ">=", 80.0, threshold=0.4)],
-                horizon_ms=5_000,
-            )
+            base: dict[str, Any] = {
+                "hypothesis_id": new_hypothesis_id("selftest"), "agent": "microstructure",
+                "family": "microstructure", "signal_symbol": "BTCUSDT",
+                "execution_symbol": "BTCUSDT", "direction": Direction.LONG,
+                "conditions": [PercentileCondition("ofi_norm_1s", ">=", 80.0, threshold=0.4)],
+                "horizon_ms": 5_000,
+            }
             base.update(kw)
             return Hypothesis(**base)
 

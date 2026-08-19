@@ -23,7 +23,8 @@ import asyncio
 import json
 import random
 import time
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 import httpx
 
@@ -147,7 +148,7 @@ class BinanceFuturesFeed(MarketFeed):
         for task in self._tasks:
             try:
                 await task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - shutdown must not raise
+            except (asyncio.CancelledError, Exception):
                 pass
         self._tasks.clear()
         if self._client is not None:
@@ -173,7 +174,7 @@ class BinanceFuturesFeed(MarketFeed):
                     await self._read_loop(socket)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001 - every failure is a reconnect
+            except Exception as exc:
                 self.stats.errors += 1
                 self.stats.last_error = f"{type(exc).__name__}: {exc}"
                 self._shard_state[index] = FeedState.ERROR
@@ -192,7 +193,7 @@ class BinanceFuturesFeed(MarketFeed):
         while self._running:
             try:
                 raw = await asyncio.wait_for(socket.recv(), timeout=self.heartbeat_timeout_s)
-            except (TimeoutError, asyncio.TimeoutError) as exc:
+            except TimeoutError as exc:
                 # No frame within the heartbeat window: the venue pings every few
                 # minutes and these streams tick far faster, so silence means a
                 # half-open socket. Drop it and let the backoff reconnect.
@@ -358,7 +359,7 @@ class BinanceFuturesFeed(MarketFeed):
             result["ok"] = not missing
             if missing:
                 result["error"] = f"not tradable perpetuals on this venue: {', '.join(missing)}"
-        except Exception as exc:  # noqa: BLE001 - the verdict is the return value
+        except Exception as exc:
             result["ok"] = False
             result["error"] = f"{type(exc).__name__}: {exc}"
             result["hint"] = (

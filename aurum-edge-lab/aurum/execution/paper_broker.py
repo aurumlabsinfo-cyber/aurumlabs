@@ -20,8 +20,9 @@ What it refuses to do is flatter itself:
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
 from ..config import Config
 from ..domain import (
@@ -32,7 +33,6 @@ from ..domain import (
     PaperTrade,
     Position,
     Regime,
-    Side,
     Signal,
     now_ms,
 )

@@ -4,10 +4,10 @@ from .postmortem import Cycle, CycleManager
 from .virtual_wallet import InsufficientFunds, LedgerKind, VirtualWallet, WalletState
 
 __all__ = [
+    "Cycle",
+    "CycleManager",
+    "InsufficientFunds",
+    "LedgerKind",
     "VirtualWallet",
     "WalletState",
-    "LedgerKind",
-    "InsufficientFunds",
-    "CycleManager",
-    "Cycle",
 ]

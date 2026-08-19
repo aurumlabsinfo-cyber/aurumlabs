@@ -20,9 +20,10 @@ an inline ``VAR=x cmd`` assignment, because identifiers cannot contain dots.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -149,7 +150,7 @@ class MarketConfig(_Model):
         return v
 
     @model_validator(mode="after")
-    def _check_symbols(self) -> "MarketConfig":
+    def _check_symbols(self) -> MarketConfig:
         if not self.symbols:
             raise ValueError("market.symbols must not be empty")
         seen = {s.symbol for s in self.symbols}
@@ -191,7 +192,7 @@ class RegimeConfig(_Model):
     high_vol_percentile: float = Field(default=67.0, ge=1, le=99)
 
     @model_validator(mode="after")
-    def _order(self) -> "RegimeConfig":
+    def _order(self) -> RegimeConfig:
         if self.low_vol_percentile >= self.high_vol_percentile:
             raise ValueError("regime.low_vol_percentile must be below high_vol_percentile")
         return self
@@ -287,7 +288,7 @@ class ValidationConfig(_Model):
     degrade_min_signals: int = Field(default=20, ge=1)
 
     @model_validator(mode="after")
-    def _fracs(self) -> "ValidationConfig":
+    def _fracs(self) -> ValidationConfig:
         total = self.train_frac + self.validation_frac + self.holdout_frac
         if total >= 1.0:
             raise ValueError(
@@ -353,7 +354,7 @@ class Config(_Model):
     # ---------------------------------------------------------------- derived
 
     @model_validator(mode="after")
-    def _production_rules(self) -> "Config":
+    def _production_rules(self) -> Config:
         if self.app.env == "production" and self.market.feed != "live":
             raise ValueError(
                 "market.feed='replay' is refused when app.env='production': the production "

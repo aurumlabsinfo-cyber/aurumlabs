@@ -23,8 +23,9 @@ Nothing is deleted on reset.  A new cycle is a new row beside the old one.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Sequence
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Any
 
 from ..agents.postmortem import CyclePostMortemAgent, PostMortem
 from ..config import Config

@@ -170,7 +170,12 @@ class SymbolQualityTracker:
             flags.append(QualityFlag.NO_SNAPSHOT)
             factors.append(0.0)
 
-        # Snapshot freshness
+        # Snapshot freshness. A book held READY by an unbroken sequence chain is
+        # correct, so an ageing snapshot is not itself a fault — the engine
+        # schedules a refresh at half this age. Reaching the full limit means
+        # that refresh is not completing, which is a real problem worth blocking
+        # on: it usually means the REST endpoint is unreachable while the
+        # WebSocket still flows.
         if snapshot_age_s > self.config.snapshot_max_age_s:
             flags.append(QualityFlag.NO_SNAPSHOT)
             factors.append(0.3)

@@ -15,7 +15,7 @@ BTC, so the percentile is taken against that symbol's own distribution.
 from __future__ import annotations
 
 from collections import deque
-from typing import TYPE_CHECKING, Any, Deque
+from typing import TYPE_CHECKING, Any
 
 from ..config import Config
 from ..domain import Regime
@@ -31,11 +31,11 @@ class RegimeClassifier:
         #: Enough readings to make a percentile meaningful without letting a
         #: whole day of a different market dominate today's classification.
         capacity = 2000
-        self._vol_history: dict[str, Deque[float]] = {}
+        self._vol_history: dict[str, deque[float]] = {}
         self._capacity = capacity
         self.current: dict[str, Regime] = {}
 
-    def classify(self, symbol: str, history: "SymbolHistory", values: dict[str, float]) -> Regime:
+    def classify(self, symbol: str, history: SymbolHistory, values: dict[str, float]) -> Regime:
         lookback_ms = self.config.regime.vol_lookback_s * 1000
         trend_ms = self.config.regime.trend_lookback_s * 1000
 
@@ -73,7 +73,7 @@ class RegimeClassifier:
         return regime
 
     @staticmethod
-    def _percentile_of(readings: Deque[float], value: float) -> float:
+    def _percentile_of(readings: deque[float], value: float) -> float:
         count = len(readings)
         if count == 0:
             return 50.0

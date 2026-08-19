@@ -15,8 +15,9 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Deque
+from typing import Any
 
 from ..adapters.base import MarketFeed
 from ..bus import TOPIC_BOOK, TOPIC_MARKET_EVENT, TOPIC_TRADE, EventBus
@@ -65,9 +66,9 @@ class SymbolState:
     symbol: str
     book: OrderBook
     quality: SymbolQualityTracker
-    trades: Deque[TradeTick] = field(default_factory=lambda: deque(maxlen=4000))
-    tops: Deque[TopOfBook] = field(default_factory=lambda: deque(maxlen=6000))
-    liquidity: Deque[LiquidityDelta] = field(default_factory=lambda: deque(maxlen=6000))
+    trades: deque[TradeTick] = field(default_factory=lambda: deque(maxlen=4000))
+    tops: deque[TopOfBook] = field(default_factory=lambda: deque(maxlen=6000))
+    liquidity: deque[LiquidityDelta] = field(default_factory=lambda: deque(maxlen=6000))
     mark_price: float = 0.0
     index_price: float = 0.0
     funding_rate: float = 0.0
@@ -119,6 +120,8 @@ class DataEngine:
 
         self._ingest = bus.subscribe(TOPIC_MARKET_EVENT, "data-engine", capacity=config.market.queue_size)
         self._tasks: list[asyncio.Task[None]] = []
+        #: Live resync tasks, held so the event loop cannot collect one early.
+        self._resync_tasks: set[asyncio.Task[None]] = set()
         self._running = False
         self.started_ms = 0
         self.endpoint_check: dict[str, Any] = {"checked": False}
@@ -181,7 +184,7 @@ class DataEngine:
         for task in self._tasks:
             try:
                 await task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            except (asyncio.CancelledError, Exception):
                 pass
         self._tasks.clear()
 
@@ -210,7 +213,7 @@ class DataEngine:
                     self._process(event, persist_events)
                     if self.on_tick is not None:
                         self.on_tick(self.data_time_ms)
-                except Exception as exc:  # noqa: BLE001 - one bad frame must not kill ingestion
+                except Exception as exc:
                     log.exception("event processing failed", extra={"symbol": event.symbol})
                     self.repos.system.log(
                         "market", "process_error", str(exc), level="ERROR", detail={"symbol": event.symbol}
@@ -289,14 +292,13 @@ class DataEngine:
 
         if state.book.ready:
             view = state.book.top(self.config.market.depth_levels)
-            if view.bids and view.asks:
-                # Depth diffs also refresh top-of-book, which matters when the
-                # bookTicker stream is not subscribed.
-                if not state.tops or state.tops[-1].ts_ms < event.ts_ms:
-                    state.tops.append(
-                        TopOfBook(event.ts_ms, view.bids[0].price, view.bids[0].qty,
-                                  view.asks[0].price, view.asks[0].qty)
-                    )
+            # Depth diffs also refresh top-of-book, which matters when the
+            # bookTicker stream is not subscribed.
+            if view.bids and view.asks and (not state.tops or state.tops[-1].ts_ms < event.ts_ms):
+                state.tops.append(
+                    TopOfBook(event.ts_ms, view.bids[0].price, view.bids[0].qty,
+                              view.asks[0].price, view.asks[0].qty)
+                )
             self.bus.publish(TOPIC_BOOK, view)
 
     # ---------------------------------------------------------------- resync
@@ -306,7 +308,12 @@ class DataEngine:
         if state.resync_pending:
             return
         state.resync_pending = True
-        asyncio.create_task(self._resync(symbol, reason=reason), name=f"resync-{symbol}")
+        # The reference matters: asyncio keeps only a weak reference to a
+        # running task, so a fire-and-forget resync can be garbage-collected
+        # mid-flight and leave the book desynced with nothing coming to fix it.
+        task = asyncio.create_task(self._resync(symbol, reason=reason), name=f"resync-{symbol}")
+        self._resync_tasks.add(task)
+        task.add_done_callback(self._resync_tasks.discard)
 
     async def _resync(self, symbol: str, *, reason: str) -> None:
         """Fetch a fresh snapshot and rejoin the diff stream deterministically."""
@@ -340,7 +347,7 @@ class DataEngine:
             for attempt in range(3):
                 try:
                     snapshot = await self.feed.fetch_depth_snapshot(symbol, self.config.market.snapshot_limit)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     log.warning(
                         "snapshot fetch failed",
                         extra={"symbol": symbol, "attempt": attempt + 1, "error": str(exc)},
@@ -396,6 +403,18 @@ class DataEngine:
                 self.qualities[symbol] = quality
                 if state.book.state is BookState.DESYNCED and not state.resync_pending:
                     self._schedule_resync(symbol, reason="desynced book")
+                elif (
+                    state.book.ready
+                    and not state.resync_pending
+                    and feed_silent_ms <= self.config.market.stale_after_ms
+                    and snapshot_age > self.config.quality.snapshot_max_age_s * 0.5
+                ):
+                    # The diff chain keeps the book correct, but only against
+                    # what the venue sent — a level the venue silently dropped
+                    # would persist forever. Re-seeding from an authoritative
+                    # snapshot periodically is what makes the staleness flag
+                    # self-healing: it fires only if this refresh cannot happen.
+                    self._schedule_resync(symbol, reason="periodic snapshot refresh")
             # One quality row per symbol per 10 s is plenty for forensics.
             if stamp // 10_000 != getattr(self, "_last_quality_persist", 0):
                 self._last_quality_persist = stamp // 10_000
@@ -441,7 +460,7 @@ class DataEngine:
                 epoch_now = time.time() * 1000.0
                 drift = received - sent
                 self.clock.observe(venue_ms, epoch_now - drift, epoch_now)
-        except Exception as exc:  # noqa: BLE001 - a failed sync is reported, not fatal
+        except Exception as exc:
             log.warning("time sync failed", extra={"error": str(exc)})
 
     # ---------------------------------------------------------------- reader

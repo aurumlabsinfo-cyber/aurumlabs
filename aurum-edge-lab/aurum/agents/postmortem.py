@@ -24,10 +24,11 @@ is computed from the cycle's own trades rather than asserted:
 from __future__ import annotations
 
 import statistics
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 
-from ..domain import PaperTrade, Regime, now_ms
+from ..domain import PaperTrade, now_ms
 from ..logging_setup import get_logger
 from ..storage.repositories import ResearchRepository
 

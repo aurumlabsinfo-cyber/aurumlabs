@@ -10,7 +10,7 @@ import pytest
 from aurum.adapters.replay import ReplayFeed
 from aurum.bus import EventBus
 from aurum.config import Config
-from aurum.domain import FeedState
+from aurum.domain import FeedState, now_ms
 from aurum.market.data_engine import DataEngine
 from aurum.market.orderbook import BookState
 from aurum.storage.repositories import Repositories
@@ -103,5 +103,81 @@ async def test_events_are_persisted_and_readable(
         assert count > 500
         row = repos.db.query_one("SELECT * FROM market_events WHERE symbol = 'BTCUSDT' LIMIT 1")
         assert row is not None and row["source"] == "replay"
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_book_snapshot_is_refreshed_before_it_can_go_stale(
+    config: Config, replay_file: Path, repos: Repositories
+) -> None:
+    """An ageing snapshot schedules a resync rather than silently blocking.
+
+    The diff chain keeps a READY book correct against what the venue sent, but
+    only a fresh snapshot re-verifies it. Without the refresh, every symbol
+    eventually flags NO_SNAPSHOT and the data-quality gate blocks the entire
+    system on a book that is provably in sync.
+    """
+    config.market.symbols = [s for s in config.market.symbols if s.symbol in SYMBOLS]
+    # Force the refresh threshold to fire almost immediately, and remove the
+    # inter-resync cooldown so the test does not wait out a production delay.
+    config.quality.snapshot_max_age_s = 2.0
+    config.market.resync_cooldown_s = 0.0
+    engine = await run_engine(config, replay_file, repos, seconds=6.0)
+    try:
+        # The refresh only fires while the feed is flowing, and this replay is
+        # consumed as fast as the loop allows, so hold the feed's liveness
+        # marker fresh across the window under test.
+        for _ in range(20):
+            engine.last_recv_ms = now_ms()
+            await asyncio.sleep(0.1)
+        resyncs = sum(engine.states[s].book.stats.resyncs for s in SYMBOLS)
+        assert resyncs > len(SYMBOLS), (
+            "no periodic refresh was scheduled; snapshots would age out and block trading"
+        )
+        for symbol in SYMBOLS:
+            assert engine.states[symbol].book.state is not BookState.DESYNCED
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_dead_feed_does_not_trigger_a_pointless_resync(
+    config: Config, replay_file: Path, repos: Repositories
+) -> None:
+    """Refreshing a snapshot needs a feed. Without one it only destroys the book.
+
+    ``begin_resync`` clears the book and waits for a snapshot to rejoin. When
+    the feed has already stopped, no diff will ever arrive to join it, so the
+    refresh converts a correct-but-idle book into a permanently desynced one and
+    the reported reason becomes DESYNCED instead of the truth, which is that the
+    feed died.
+    """
+    config.market.symbols = [s for s in config.market.symbols if s.symbol in SYMBOLS]
+    config.quality.snapshot_max_age_s = 1.0
+    config.market.resync_cooldown_s = 0.0
+    engine = await run_engine(config, replay_file, repos, seconds=6.0)
+    try:
+        # Let the replay finish so the feed is silent, then let several quality
+        # ticks pass.
+        while not engine.feed.finished.is_set():
+            await asyncio.sleep(0.1)
+        engine.last_recv_ms = 1  # far in the past: the feed is unmistakably dead
+        before = sum(engine.states[s].book.stats.resyncs for s in SYMBOLS)
+        await asyncio.sleep(1.6)
+        after = sum(engine.states[s].book.stats.resyncs for s in SYMBOLS)
+        assert after == before, "a dead feed triggered a resync that can never complete"
+
+        for symbol in SYMBOLS:
+            quality = engine.quality(symbol)
+            assert quality is not None
+            # DISCONNECTED when the adapter said so, STALE when it simply went
+            # quiet. Either is the truth; DESYNCED would not be, because the
+            # book was correct until a pointless refresh cleared it.
+            assert quality.state in (FeedState.DISCONNECTED, FeedState.STALE), (
+                f"{symbol} reports {quality.state.value}; a dead feed must not be "
+                "reported as a desync caused by our own refresh"
+            )
+            assert not quality.tradable
     finally:
         await engine.stop()

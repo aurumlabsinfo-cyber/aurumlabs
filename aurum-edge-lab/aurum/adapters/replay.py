@@ -110,7 +110,7 @@ class ReplayFeed(MarketFeed):
             self._task.cancel()
             try:
                 await self._task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            except (asyncio.CancelledError, Exception):
                 pass
             self._task = None
         self._set_state(FeedState.DISCONNECTED, "stopped")

@@ -33,19 +33,19 @@ def build_agents(
 
 
 __all__ = [
-    "ResearchAgent",
+    "AGENT_CLASSES",
     "AgentContext",
     "AgentMetrics",
+    "Cause",
+    "CrossCryptoAgent",
+    "CyclePostMortemAgent",
     "FeatureRank",
-    "slice_view",
+    "MeanReversionAgent",
     "MicrostructureAgent",
     "MomentumAgent",
-    "CyclePostMortemAgent",
     "PostMortem",
-    "Cause",
-    "MeanReversionAgent",
-    "CrossCryptoAgent",
     "RelativeValueAgent",
-    "AGENT_CLASSES",
+    "ResearchAgent",
     "build_agents",
+    "slice_view",
 ]

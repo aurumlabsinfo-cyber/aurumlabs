@@ -52,11 +52,11 @@ class MarketRepository:
                 "best_ask": snapshot.best_ask,
                 "mid": snapshot.mid,
                 "spread_bps": snapshot.spread_bps(),
-                "bid_depth_10": sum(l.qty for l in snapshot.bids[:10]),
-                "ask_depth_10": sum(l.qty for l in snapshot.asks[:10]),
+                "bid_depth_10": sum(level.qty for level in snapshot.bids[:10]),
+                "ask_depth_10": sum(level.qty for level in snapshot.asks[:10]),
                 "is_crossed": snapshot.is_crossed,
-                "bids": [[l.price, l.qty] for l in snapshot.bids[:levels]],
-                "asks": [[l.price, l.qty] for l in snapshot.asks[:levels]],
+                "bids": [[level.price, level.qty] for level in snapshot.bids[:levels]],
+                "asks": [[level.price, level.qty] for level in snapshot.asks[:levels]],
             },
         )
 
@@ -597,11 +597,11 @@ class Repositories:
 
 
 __all__ = [
+    "ExecutionRepository",
     "MarketRepository",
+    "Repositories",
     "ResearchRepository",
     "StrategyRepository",
-    "ExecutionRepository",
-    "WalletRepository",
     "SystemRepository",
-    "Repositories",
+    "WalletRepository",
 ]

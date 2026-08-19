@@ -108,7 +108,7 @@ class CrossMarketEngine:
             self._task.cancel()
             try:
                 await self._task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            except (asyncio.CancelledError, Exception):
                 pass
             self._task = None
 
@@ -119,7 +119,7 @@ class CrossMarketEngine:
                 # The matrix work is numpy-bound and would otherwise stall the
                 # event loop for tens of milliseconds while the feed is running.
                 await asyncio.to_thread(self.refresh)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 log.exception("cross-market refresh failed")
 
     # ---------------------------------------------------------------- compute
@@ -150,7 +150,7 @@ class CrossMarketEngine:
         if prepared is None:
             return self.state
         symbols, returns, mids = prepared
-        count, length = returns.shape
+        length = returns.shape[1]
 
         centred = returns - returns.mean(axis=1, keepdims=True)
         norms = np.sqrt((centred**2).sum(axis=1))

@@ -21,11 +21,10 @@ trading on that symbol until a resync completes.
 from __future__ import annotations
 
 import heapq
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
-
-from typing import Callable
 
 from ..adapters.base import DepthSnapshot, DepthUpdate
 from ..domain import BookLevel, BookSnapshot, Side
@@ -76,7 +75,7 @@ class OrderBook:
         self,
         symbol: str,
         max_levels: int = 1000,
-        on_liquidity: "LiquidityCallback | None" = None,
+        on_liquidity: LiquidityCallback | None = None,
     ) -> None:
         self.symbol = symbol.upper()
         self.max_levels = max_levels

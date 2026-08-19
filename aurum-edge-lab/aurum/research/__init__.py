@@ -32,17 +32,17 @@ def __getattr__(name: str) -> Any:
 
 
 __all__ = [
+    "CycleReport",
     "Hypothesis",
-    "PercentileCondition",
-    "new_hypothesis_id",
-    "ResearchMemory",
-    "Outcome",
-    "ResearchView",
     "Observation",
-    "build_observations",
+    "Outcome",
+    "PercentileCondition",
+    "ResearchDirector",
+    "ResearchMemory",
+    "ResearchView",
+    "Stage",
     "ValidationLab",
     "ValidationReport",
-    "Stage",
-    "ResearchDirector",
-    "CycleReport",
+    "build_observations",
+    "new_hypothesis_id",
 ]

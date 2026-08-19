@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -46,13 +47,13 @@ class LiveBroadcaster:
             self._task.cancel()
             try:
                 await self._task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            except (asyncio.CancelledError, Exception):
                 pass
             self._task = None
         for client in list(self.clients):
             try:
                 await client.close()
-            except Exception:  # noqa: BLE001 - shutdown must not raise
+            except Exception:
                 pass
         self.clients.clear()
 
@@ -64,7 +65,7 @@ class LiveBroadcaster:
         # the next tick.
         try:
             await websocket.send_text(json.dumps(self._payload(), default=str))
-        except Exception:  # noqa: BLE001
+        except Exception:
             self.clients.discard(websocket)
 
     def disconnect(self, websocket: WebSocket) -> None:
@@ -74,7 +75,7 @@ class LiveBroadcaster:
     def _payload(self) -> dict[str, Any]:
         try:
             return self.build_payload()
-        except Exception as exc:  # noqa: BLE001 - a broken payload must not kill the socket
+        except Exception as exc:
             log.exception("ws payload build failed")
             return {"type": "error", "error": f"{type(exc).__name__}: {exc}"}
 
@@ -89,7 +90,7 @@ class LiveBroadcaster:
                 try:
                     await client.send_text(message)
                     self.sent += 1
-                except (WebSocketDisconnect, RuntimeError, Exception):  # noqa: BLE001
+                except (WebSocketDisconnect, RuntimeError, Exception):
                     stale.append(client)
             for client in stale:
                 self.clients.discard(client)

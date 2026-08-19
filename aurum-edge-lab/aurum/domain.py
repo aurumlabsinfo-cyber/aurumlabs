@@ -40,7 +40,7 @@ class Side(str, Enum):
     SELL = "SELL"
 
     @property
-    def opposite(self) -> "Side":
+    def opposite(self) -> Side:
         return Side.SELL if self is Side.BUY else Side.BUY
 
     @property
@@ -378,7 +378,7 @@ class Condition:
         return {"feature": self.feature, "op": self.op, "threshold": self.threshold}
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Condition":
+    def from_dict(cls, data: dict[str, Any]) -> Condition:
         return cls(feature=data["feature"], op=data["op"], threshold=float(data["threshold"]))
 
     def describe(self) -> str:
@@ -435,8 +435,8 @@ class MetricSet:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "MetricSet":
-        known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
+    def from_dict(cls, data: dict[str, Any]) -> MetricSet:
+        known = set(cls.__dataclass_fields__)  # type: ignore[attr-defined]
         return cls(**{k: v for k, v in data.items() if k in known})
 
 

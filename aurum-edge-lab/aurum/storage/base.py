@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
-from typing import Any, Iterable, Sequence
+from collections.abc import Iterable, Sequence
+from typing import Any
 
 from .schema import HIGH_FREQUENCY_TABLES, TABLES_BY_NAME, insert_sql
 

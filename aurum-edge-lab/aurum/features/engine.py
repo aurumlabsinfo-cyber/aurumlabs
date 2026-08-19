@@ -36,7 +36,7 @@ import asyncio
 import math
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque
+from typing import Any
 
 from ..bus import TOPIC_FEATURES, EventBus
 from ..config import Config
@@ -61,10 +61,10 @@ class SymbolHistory:
     symbol: str
     cadence_ms: int
     capacity: int
-    ts: Deque[int] = field(default_factory=deque)
-    mid: Deque[float] = field(default_factory=deque)
-    micro: Deque[float] = field(default_factory=deque)
-    ret: Deque[float] = field(default_factory=deque)  # per-step return, bps
+    ts: deque[int] = field(default_factory=deque)
+    mid: deque[float] = field(default_factory=deque)
+    micro: deque[float] = field(default_factory=deque)
+    ret: deque[float] = field(default_factory=deque)  # per-step return, bps
 
     def __post_init__(self) -> None:
         self.ts = deque(maxlen=self.capacity)
@@ -146,7 +146,7 @@ class FeatureEngine:
         }
         self.regime = RegimeClassifier(config)
         self.latest: dict[str, FeatureSnapshot] = {}
-        self.snapshots: dict[str, Deque[FeatureSnapshot]] = {
+        self.snapshots: dict[str, deque[FeatureSnapshot]] = {
             symbol: deque(maxlen=capacity) for symbol in data_engine.symbols
         }
         self._task: asyncio.Task[None] | None = None
@@ -183,7 +183,7 @@ class FeatureEngine:
             self._task.cancel()
             try:
                 await self._task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            except (asyncio.CancelledError, Exception):
                 pass
             self._task = None
 
@@ -195,7 +195,7 @@ class FeatureEngine:
             await asyncio.sleep(interval)
             try:
                 self.pump(self.data.data_time_ms or now_ms())
-            except Exception:  # noqa: BLE001 - a bad tick must not stop the cadence
+            except Exception:
                 log.exception("feature computation failed")
 
     #: A pump that has fallen further behind than this is recovering from a feed

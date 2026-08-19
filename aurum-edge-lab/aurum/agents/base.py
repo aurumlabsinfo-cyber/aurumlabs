@@ -25,8 +25,9 @@ judge it, which is why the slice is enforced here rather than requested politely
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 import numpy as np
 
@@ -152,7 +153,7 @@ class ResearchAgent(ABC):
             return []
         try:
             proposals = self.build(context)
-        except Exception as exc:  # noqa: BLE001 - one agent must not stop the cycle
+        except Exception as exc:
             self.metrics.errors += 1
             self.metrics.last_error = f"{type(exc).__name__}: {exc}"
             log.exception("agent failed", extra={"agent": self.name})
@@ -351,10 +352,10 @@ def slice_view(view: ResearchView, start_fraction: float, end_fraction: float) -
 
 
 __all__ = [
-    "ResearchAgent",
+    "PERCENTILE_BUCKETS",
     "AgentContext",
     "AgentMetrics",
     "FeatureRank",
+    "ResearchAgent",
     "slice_view",
-    "PERCENTILE_BUCKETS",
 ]

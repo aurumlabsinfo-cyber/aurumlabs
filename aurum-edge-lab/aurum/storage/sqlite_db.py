@@ -17,8 +17,9 @@ import queue
 import sqlite3
 import threading
 import time
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from ..logging_setup import get_logger
 from .base import Database
@@ -78,7 +79,7 @@ class SqliteDatabase(Database):
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=%d" % int(self.timeout_s * 1000))
+        conn.execute(f"PRAGMA busy_timeout={int(self.timeout_s * 1000)}")
         conn.execute("PRAGMA cache_size=-32000")  # ~32 MB page cache
         return conn
 

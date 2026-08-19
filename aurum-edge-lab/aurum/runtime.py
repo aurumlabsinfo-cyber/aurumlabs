@@ -32,7 +32,6 @@ from .config import Config
 from .cross_market.engine import CrossMarketEngine
 from .diagnostics.collector import DiagnosticsCollector
 from .domain import (
-    Direction,
     ExitReason,
     FeatureSnapshot,
     RejectionReason,
@@ -156,7 +155,7 @@ class AurumRuntime:
         for task in self._tasks:
             try:
                 await task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            except (asyncio.CancelledError, Exception):
                 pass
         self._tasks.clear()
 
@@ -179,7 +178,7 @@ class AurumRuntime:
             for snapshot in batch:
                 try:
                     self.evaluate(snapshot)
-                except Exception as exc:  # noqa: BLE001 - a bad decision must not stop the loop
+                except Exception as exc:
                     self._record_error("decision", exc)
 
     def evaluate(self, snapshot: FeatureSnapshot) -> list[Signal]:
@@ -347,7 +346,7 @@ class AurumRuntime:
             await asyncio.sleep(interval)
             try:
                 self._manage_positions()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 self._record_error("positions", exc)
 
     def _manage_positions(self) -> None:
@@ -384,7 +383,7 @@ class AurumRuntime:
             await asyncio.sleep(2.0)
             try:
                 self._manage_cycle()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 self._record_error("cycle", exc)
 
     def _manage_cycle(self) -> None:
@@ -418,7 +417,7 @@ class AurumRuntime:
                 removed = self.db.prune(self.config.storage.retention.model_dump())
                 if any(removed.values()):
                     log.info("retention pruned", extra=removed)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 self._record_error("maintenance", exc)
 
     # ------------------------------------------------------------------ state

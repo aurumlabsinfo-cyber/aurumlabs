@@ -21,10 +21,11 @@ fires when the book is wide is charged for it.
 from __future__ import annotations
 
 import bisect
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any
 
-from ..domain import Direction, FeatureSnapshot, Regime
+from ..domain import FeatureSnapshot, Regime
 from ..execution.cost_model import CostModel
 from .hypotheses import Hypothesis
 
@@ -78,7 +79,7 @@ class ResearchView:
     @classmethod
     def capture(
         cls, snapshots: dict[str, Iterable[FeatureSnapshot]], *, cadence_ms: int
-    ) -> "ResearchView":
+    ) -> ResearchView:
         series: dict[str, SymbolSeries] = {}
         for symbol, history in snapshots.items():
             entry = SymbolSeries(symbol=symbol)

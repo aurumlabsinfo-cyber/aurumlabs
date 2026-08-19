@@ -8,8 +8,9 @@ observe a half-built system.  Routes that arrive before startup finishes get a
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -168,7 +169,7 @@ def create_app(config: Config, *, runtime: AurumRuntime | None = None) -> FastAP
                 await websocket.receive_text()
         except WebSocketDisconnect:
             broadcaster.disconnect(websocket)
-        except Exception:  # noqa: BLE001
+        except Exception:
             broadcaster.disconnect(websocket)
 
     return app

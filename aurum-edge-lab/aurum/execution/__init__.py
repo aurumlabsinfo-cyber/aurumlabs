@@ -3,4 +3,4 @@
 from .cost_model import CostModel, FillEstimate
 from .paper_broker import ExitCheck, PaperBroker
 
-__all__ = ["CostModel", "FillEstimate", "PaperBroker", "ExitCheck"]
+__all__ = ["CostModel", "ExitCheck", "FillEstimate", "PaperBroker"]

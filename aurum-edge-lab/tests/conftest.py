@@ -16,9 +16,9 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from aurum.config import Config, load_config  # noqa: E402
-from aurum.storage import SqliteDatabase  # noqa: E402
-from aurum.storage.repositories import Repositories  # noqa: E402
+from aurum.config import Config, load_config
+from aurum.storage import SqliteDatabase
+from aurum.storage.repositories import Repositories
 
 
 @pytest.fixture
@@ -43,7 +43,7 @@ def replay_file(tmp_path_factory) -> Path:
     ``aurum`` package — the runtime has no market-data generator to import.
     """
     sys.path.insert(0, str(ROOT / "tools"))
-    from make_replay import generate  # noqa: PLC0415
+    from make_replay import generate
 
     path = tmp_path_factory.mktemp("replay") / "replay.jsonl"
     generate(

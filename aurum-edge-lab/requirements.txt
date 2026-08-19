@@ -1,0 +1,14 @@
+# AURUM EDGE LAB — runtime dependencies.
+#
+# Deliberately short. No pandas, no scipy, no scikit-learn: the statistics this
+# system depends on (Student's t, incomplete beta, Benjamini-Hochberg, purged
+# walk-forward) are implemented in aurum/research/statistics.py, where they can
+# be read and tested against known values rather than trusted.
+
+fastapi>=0.115
+uvicorn[standard]>=0.30
+websockets>=13.0
+httpx>=0.27
+pydantic>=2.8
+PyYAML>=6.0
+numpy>=1.26

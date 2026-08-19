@@ -24,8 +24,8 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from aurum.config import Config, ConfigError, load_config  # noqa: E402
-from aurum.logging_setup import get_logger, setup_logging  # noqa: E402
+from aurum.config import Config, ConfigError, load_config
+from aurum.logging_setup import get_logger, setup_logging
 
 log = get_logger("main")
 
@@ -179,7 +179,7 @@ def command_diagnose(args: argparse.Namespace) -> int:
             "counts": db.table_counts(),
         }
         db.close()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         report["ok"] = False
         report["database"] = {"error": f"{type(exc).__name__}: {exc}"}
         report["problems"].append("database could not be opened")
@@ -202,7 +202,7 @@ def command_diagnose(args: argparse.Namespace) -> int:
                 "market endpoints did not verify: "
                 + str(report["endpoints"].get("error", "unknown reason"))
             )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         report["ok"] = False
         report["endpoints"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         report["problems"].append("endpoint verification raised")

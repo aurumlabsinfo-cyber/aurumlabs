@@ -27,19 +27,20 @@ from __future__ import annotations
 
 import asyncio
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 
 from ..agents import build_agents
 from ..agents.base import AgentContext, ResearchAgent
 from ..config import Config
 from ..cross_market.engine import CrossMarketEngine
-from ..domain import Direction, MetricSet, StrategyState, ValidationStatus, now_ms
+from ..domain import StrategyState, now_ms
 from ..execution.cost_model import CostModel
 from ..features.engine import FeatureEngine
 from ..logging_setup import get_logger
 from ..storage.repositories import Repositories
-from ..strategies.lifecycle import ShadowRecord, Strategy, StrategyLifecycle
+from ..strategies.lifecycle import ShadowRecord, StrategyLifecycle
 from .dataset import ResearchView, build_observations
 from .hypotheses import Hypothesis
 from .memory import Outcome, ResearchMemory
@@ -135,7 +136,7 @@ class ResearchDirector:
             self._task.cancel()
             try:
                 await self._task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            except (asyncio.CancelledError, Exception):
                 pass
             self._task = None
 
@@ -164,7 +165,7 @@ class ResearchDirector:
                 # and every candidate feature) and would otherwise stall the
                 # ingest loop for the length of a full pass.
                 await asyncio.to_thread(self.run_cycle)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 log.exception("research cycle failed")
                 self.repos.system.log("research", "cycle_error", "cycle raised", level="ERROR")
 

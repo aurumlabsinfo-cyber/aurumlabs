@@ -13,10 +13,9 @@ it is changes what you should do about it.
 
 from __future__ import annotations
 
-import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque
+from typing import Any
 
 from ..domain import RejectionReason, now_ms
 
@@ -139,7 +138,7 @@ class DiagnosticsCollector:
     accepted: int = 0
     evaluated: int = 0
     shadow_signals: int = 0
-    _events: Deque[_Event] = field(default_factory=lambda: deque(maxlen=200_000))
+    _events: deque[_Event] = field(default_factory=lambda: deque(maxlen=200_000))
     started_ms: int = field(default_factory=now_ms)
 
     def record_rejection(self, reason: RejectionReason | str, *, at_ms: int | None = None) -> None:

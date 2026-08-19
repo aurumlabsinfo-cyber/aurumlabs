@@ -105,7 +105,7 @@ class LatencyTracker:
         if not self._values:
             return 0.0
         ordered = sorted(self._values)
-        idx = min(len(ordered) - 1, max(0, int(round(pct / 100.0 * (len(ordered) - 1)))))
+        idx = min(len(ordered) - 1, max(0, round(pct / 100.0 * (len(ordered) - 1))))
         return ordered[idx]
 
     def to_dict(self) -> dict[str, float]:

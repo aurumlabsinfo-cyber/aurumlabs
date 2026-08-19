@@ -57,7 +57,7 @@ class PercentileCondition:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "PercentileCondition":
+    def from_dict(cls, data: dict[str, Any]) -> PercentileCondition:
         return cls(
             feature=data["feature"],
             op=data["op"],
@@ -174,7 +174,7 @@ class Hypothesis:
         }
 
     @classmethod
-    def from_row(cls, row: dict[str, Any]) -> "Hypothesis":
+    def from_row(cls, row: dict[str, Any]) -> Hypothesis:
         regime = row.get("regime_filter")
         return cls(
             hypothesis_id=row["hypothesis_id"],
@@ -223,7 +223,7 @@ def resolve_thresholds(
         if not values or len(values) < 20:
             return False
         ordered = sorted(values)
-        index = min(len(ordered) - 1, max(0, int(round(condition.percentile / 100.0 * (len(ordered) - 1)))))
+        index = min(len(ordered) - 1, max(0, round(condition.percentile / 100.0 * (len(ordered) - 1))))
         condition.threshold = ordered[index]
         condition.samples = len(ordered)
     return True

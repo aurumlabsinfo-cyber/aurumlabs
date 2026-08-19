@@ -8,4 +8,4 @@ from .lifecycle import (
     StrategyLifecycle,
 )
 
-__all__ = ["Strategy", "StrategyLifecycle", "ShadowRecord", "TRANSITIONS", "IllegalTransition"]
+__all__ = ["TRANSITIONS", "IllegalTransition", "ShadowRecord", "Strategy", "StrategyLifecycle"]

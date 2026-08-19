@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
 T = TypeVar("T")
@@ -88,7 +88,7 @@ class Channel(Generic[T]):
                 first = await self._queue.get()
             else:
                 first = await asyncio.wait_for(self._queue.get(), timeout)
-        except (TimeoutError, asyncio.TimeoutError):
+        except TimeoutError:
             return []
         self._queue.task_done()
         self.stats.delivered += 1

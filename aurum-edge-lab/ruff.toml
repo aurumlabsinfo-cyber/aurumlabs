@@ -1,0 +1,32 @@
+# Lint configuration for AURUM EDGE LAB.
+line-length = 110
+target-version = "py311"
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]
+ignore = [
+  # Line length is a judgement call in prose-heavy modules; the docstrings here
+  # carry the reasoning and wrapping them at a hard column hurts them.
+  "E501",
+  # FastAPI expresses Depends/Query defaults as call expressions by design.
+  "B008",
+  # A ternary is not always clearer than an if/else.
+  "SIM108",
+  # `except (asyncio.CancelledError, Exception)` on shutdown is deliberate and
+  # not equivalent to suppress(Exception): CancelledError is a BaseException.
+  "SIM105",
+  # `str, Enum` is intentional throughout: these values are serialised to JSON
+  # and compared against strings from the database. StrEnum would change the
+  # repr that appears in stored rows.
+  "UP042",
+  # Prose in docstrings uses α, × and — deliberately.
+  "RUF001", "RUF002", "RUF003",
+  # Constant tables read better without ClassVar noise.
+  "RUF012",
+]
+
+[lint.per-file-ignores]
+# sys.path is adjusted before importing the package, deliberately, so both run
+# from a bare checkout.
+"tests/*" = ["E402", "C408", "RUF059", "RUF043"]
+"main.py" = ["E402"]

@@ -21,7 +21,7 @@ would call it a 5% loss.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from ..domain import now_ms

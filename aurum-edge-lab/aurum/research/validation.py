@@ -25,8 +25,9 @@ a reassuring name.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 
 from ..config import Config
 from ..domain import MetricSet, ValidationStatus, now_ms
