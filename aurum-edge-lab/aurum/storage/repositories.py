@@ -422,6 +422,28 @@ class ExecutionRepository:
             row["features"] = decode_json(row.get("features"), {})
         return row
 
+    def list_signals(
+        self,
+        *,
+        symbol: str | None = None,
+        accepted: bool | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses, params = [], []
+        if symbol:
+            clauses.append("symbol = ?")
+            params.append(symbol)
+        if accepted is not None:
+            clauses.append("accepted = ?")
+            params.append(1 if accepted else 0)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.db.query(
+            f"SELECT * FROM signals {where} ORDER BY ts_ms DESC LIMIT ?", (*params, limit)
+        )
+        for row in rows:
+            row["features"] = decode_json(row.get("features"), {})
+        return rows
+
     def rejection_counts(self, since_ms: int) -> list[dict[str, Any]]:
         return self.db.query(
             "SELECT rejection, COUNT(*) AS n FROM signals "
