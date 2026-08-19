@@ -83,10 +83,14 @@ else
   # A failure here is usually the venue being unreachable, which is worth
   # seeing in full before the engine starts rather than as silence afterwards.
   python3 main.py diagnose || {
+    venue="$(python3 main.py config 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["config"]["market"]["venue"])' 2>/dev/null || echo "the configured venue")"
     printf '\n\033[1;31mThe venue endpoints did not verify.\033[0m\n'
-    printf 'Check market.rest_base / market.ws_base in config.yaml against the current\n'
-    printf 'official Binance USD-M Futures documentation, or start with --demo to run\n'
-    printf 'against a generated file instead.\n\n'
+    printf 'Selected venue: %s\n' "$venue"
+    printf 'The report above names the exact URL that failed. Usual causes, in order:\n'
+    printf '  * no route to the venue (firewall, proxy, or a country block)\n'
+    printf '  * the venue moved an endpoint — check its current official docs and set\n'
+    printf '    AURUM_REST_BASE / AURUM_WS_BASE, or market.rest_base / market.ws_base\n'
+    printf 'Or start with --demo to run against a generated file instead.\n\n'
     read -r -p 'Start anyway? [y/N] ' answer
     [[ "$answer" == "y" || "$answer" == "Y" ]] || exit 1
   }
