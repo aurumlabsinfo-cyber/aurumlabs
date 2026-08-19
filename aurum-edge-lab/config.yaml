@@ -1,0 +1,177 @@
+﻿# AURUM EDGE LAB — default configuration.
+#
+# Every value here can be overridden from the environment with
+#   AURUM_SET__<dotted.path>=<value>      e.g. AURUM_SET__api.port=8010
+# plus the friendly aliases documented in .env.example.
+#
+# Values that affect what the system is allowed to trade are hard-bounded in
+# aurum/config.py; the frontend may only move them inside those bounds.
+
+app:
+  name: AURUM EDGE LAB
+  version: "1.0.0"
+  env: development          # development | production
+  data_dir: ./data
+  log_level: INFO
+  log_json: false
+
+api:
+  host: 127.0.0.1
+  port: 8002
+  cors_origins:
+    - http://localhost:3000
+    - http://127.0.0.1:3000
+  ws_broadcast_interval_ms: 500
+
+market:
+  venue: binance_usdm
+  # live   = public Binance USD-M Futures WebSocket market streams
+  # replay = deterministic file replay, refused when app.env=production
+  feed: live
+
+  # Endpoint routing is configuration, never a hard-coded constant: Binance has
+  # changed WebSocket routing before and the blueprint requires that endpoints
+  # be checked against the current official documentation at build time.
+  rest_base: https://fapi.binance.com
+  ws_base: wss://fstream.binance.com
+  ws_path: /stream
+  rest_depth_path: /fapi/v1/depth
+  rest_exchange_info_path: /fapi/v1/exchangeInfo
+  rest_time_path: /fapi/v1/time
+
+  symbols:
+    - {symbol: BTCUSDT,  tier: CORE,    role: Market anchor, use: Microstructure + cross-market leader}
+    - {symbol: ETHUSDT,  tier: CORE,    role: Market anchor, use: Microstructure + cross-market leader}
+    - {symbol: BNBUSDT,  tier: MAJOR,   role: Major alt,     use: Relative strength / lag}
+    - {symbol: SOLUSDT,  tier: MAJOR,   role: Major alt,     use: Lead-lag / momentum}
+    - {symbol: XRPUSDT,  tier: MAJOR,   role: Major alt,     use: Lead-lag / liquidity regimes}
+    - {symbol: DOGEUSDT, tier: DYNAMIC, role: High beta,     use: Delayed reaction / bursts}
+    - {symbol: ADAUSDT,  tier: DYNAMIC, role: Alt,           use: Cross-market / mean reversion}
+    - {symbol: LINKUSDT, tier: DYNAMIC, role: Alt,           use: Cross-market / momentum}
+    - {symbol: AVAXUSDT, tier: DYNAMIC, role: Alt,           use: Cross-market / volatility}
+    - {symbol: TRXUSDT,  tier: DYNAMIC, role: Alt,           use: Diversification / lag study}
+
+  depth_levels: 20             # levels kept in the local book view
+  depth_stream_speed: 100ms    # 100ms | 250ms | 500ms
+  snapshot_limit: 1000         # REST depth snapshot size used to seed the book
+  streams: [depth, aggTrade, bookTicker, markPrice]
+
+  queue_size: 20000            # bounded ingest queue (backpressure, never blocks the socket)
+  heartbeat_timeout_s: 20
+  stale_after_ms: 3000         # no event for this long => symbol is STALE
+  resync_cooldown_s: 5
+  max_resyncs_per_hour: 30
+  reconnect:
+    initial_delay_s: 1.0
+    max_delay_s: 60.0
+    factor: 2.0
+    jitter: 0.25
+  time_sync_interval_s: 300
+
+features:
+  cadence_ms: 250
+  return_horizons_ms: [250, 500, 1000, 2000, 5000, 10000, 30000, 60000]
+  volatility_windows_ms: [1000, 5000, 10000, 30000, 60000]
+  ofi_windows_ms: [500, 1000, 5000, 10000]
+  depth_levels: [1, 5, 10]
+  buffer_seconds: 900          # in-memory feature history per symbol
+  persist_every_n: 4           # store 1 of every N snapshots (raw events stay authoritative)
+
+regime:
+  vol_lookback_s: 300
+  trend_lookback_s: 120
+  low_vol_percentile: 33
+  high_vol_percentile: 67
+
+cross_market:
+  lead_lag_ms: [100, 250, 500, 750, 1000, 2000, 3000, 5000, 10000, 30000, 60000]
+  window_s: 300
+  min_samples: 240
+  refresh_s: 15
+
+quality:
+  min_score_to_trade: 0.60
+  max_spread_bps: 20.0
+  max_latency_ms: 1500
+  min_book_levels: 5
+  min_events_per_min: 30
+  max_sequence_gaps_per_min: 3
+  snapshot_max_age_s: 900
+
+fx:
+  # The wallet is denominated in EUR; Binance USD-M contracts are quoted in
+  # USDT. This is the assumed conversion and it is reported by /config and
+  # /health so it is never silently applied.
+  usdt_per_eur: 1.08
+  source: static
+
+wallet:
+  starting_balance_eur: 100.00
+  currency: EUR
+
+risk:
+  risk_per_trade_pct: 1.0        # bounds enforced server-side: 0.10 .. 2.00
+  max_concurrent_positions: 3
+  max_exposure_pct: 30.0
+  max_symbol_exposure_pct: 15.0
+  daily_loss_limit_pct: 10.0
+  max_drawdown_pct: 25.0
+  wallet_failure_equity_pct: 40.0   # equity below this share of start => cycle failure
+  cooldown_s: 45
+  duplicate_window_s: 30
+  min_notional_eur: 5.0
+  max_leverage: 3.0
+  max_holding_s: 900
+
+costs:
+  version: "cost-v1"
+  taker_fee_bps: 4.5             # Binance USD-M taker 0.045%
+  maker_fee_bps: 2.0
+  extra_slippage_bps: 0.5
+  latency_ms: 120
+  latency_penalty_bps_per_100ms: 0.15
+  impact_model: book_walk        # book_walk | fixed
+
+research:
+  enabled: true
+  cycle_interval_s: 45
+  min_warmup_s: 120
+  max_hypotheses_per_agent_per_cycle: 6
+  max_open_hypotheses: 400
+  min_samples_to_evaluate: 120
+  memory_similarity_threshold: 0.90
+  retest_cooldown_h: 6
+
+validation:
+  train_frac: 0.40
+  validation_frac: 0.20
+  holdout_frac: 0.20            # never touched during hypothesis creation
+  walkforward_folds: 4
+  embargo_multiple: 3.0         # embargo = horizon * this, applied around each fold
+  min_fold_samples: 25
+  fdr_alpha: 0.10
+  min_net_edge_bps: 0.5
+  min_profit_factor: 1.05
+  max_drawdown_bps: 400.0
+  shadow_min_signals: 25
+  shadow_min_minutes: 20
+  champion_replace_margin: 0.15  # challenger must beat champion score by this
+  degrade_edge_ratio: 0.40       # live edge below this share of validated => DEGRADED
+  degrade_min_signals: 20
+
+storage:
+  driver: sqlite                 # sqlite | postgres (abstraction is dialect-aware)
+  url: ""                        # empty => <data_dir>/aurum.db
+  batch_size: 500
+  flush_interval_ms: 500
+  queue_size: 50000
+  retention:
+    market_events_hours: 6
+    features_hours: 24
+    orderbook_snapshots_hours: 6
+    aggregate_before_delete: true
+  vacuum_interval_h: 24
+
+diagnostics:
+  rejection_window_s: 3600
+  export_dir: ./data/exports

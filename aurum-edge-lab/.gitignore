@@ -1,0 +1,12 @@
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.jsonl
+data/exports/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+frontend/node_modules/
+frontend/.next/
+frontend/out/
