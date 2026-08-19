@@ -7,6 +7,14 @@ Two rules drive this module.
 2.  Values the frontend is allowed to change are bounded *server side*.  The
     ``SETTABLE`` table below is the whole list of what a UI may move and how far;
     anything else is structural and requires a restart with a new config file.
+
+Environment overrides accept either separator::
+
+    AURUM_SET__market__replay_speed=8      # works with every shell
+    env 'AURUM_SET__market.replay_speed=8' # dotted form needs `env`
+
+The dotted form reads better in documentation but a shell will not accept it as
+an inline ``VAR=x cmd`` assignment, because identifiers cannot contain dots.
 """
 
 from __future__ import annotations
@@ -454,7 +462,11 @@ def env_overrides(environ: dict[str, str] | None = None) -> dict[str, Any]:
         if key.startswith(ENV_PREFIX):
             path = key[len(ENV_PREFIX) :]
             if path:
-                _set_path(tree, path, _coerce(value))
+                # Both separators are accepted. A shell cannot set a variable
+                # whose name contains a dot with the inline `VAR=x cmd` form —
+                # bash rejects it as an invalid identifier — so the dotted style
+                # only works through `env`. The double underscore always works.
+                _set_path(tree, path.replace("__", "."), _coerce(value))
     return tree
 
 

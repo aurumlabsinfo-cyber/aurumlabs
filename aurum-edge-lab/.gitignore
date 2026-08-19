@@ -10,3 +10,7 @@ __pycache__/
 frontend/node_modules/
 frontend/.next/
 frontend/out/
+frontend/.next/
+frontend/node_modules/
+frontend/tsconfig.tsbuildinfo
+frontend/next-env.d.ts

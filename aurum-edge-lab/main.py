@@ -46,6 +46,8 @@ def load(args: argparse.Namespace) -> Config:
     if getattr(args, "replay", None):
         overrides.setdefault("market", {})["replay_path"] = str(args.replay)
         overrides["market"]["feed"] = "replay"
+    if getattr(args, "replay_speed", None) is not None:
+        overrides.setdefault("market", {})["replay_speed"] = args.replay_speed
     if getattr(args, "port", None):
         overrides.setdefault("api", {})["port"] = args.port
     if getattr(args, "host", None):
@@ -310,6 +312,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--port", type=int, default=None)
     run.add_argument("--feed", choices=["live", "replay"], default=None)
     run.add_argument("--replay", type=Path, default=None, help="replay file (implies --feed replay)")
+    run.add_argument(
+        "--replay-speed", type=float, default=None,
+        help="replay pacing: 0 = as fast as possible, 1 = original wall-clock, 8 = eight times",
+    )
     run.add_argument("--no-research", action="store_true", help="run the feed without research cycles")
     run.set_defaults(func=command_run)
 

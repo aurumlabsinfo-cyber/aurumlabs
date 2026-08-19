@@ -27,7 +27,8 @@ def healthy_tracker(now: int = 1_000_000) -> SymbolQualityTracker:
 
 
 def evaluate(tracker: SymbolQualityTracker, *, now: int = 1_000_000, snapshot: BookSnapshot | None = None,
-             ready: bool = True, state: str = "READY", snapshot_age_s: float = 5.0):
+             ready: bool = True, state: str = "READY", snapshot_age_s: float = 5.0,
+             feed_silent_ms: float = 0.0, measure_latency: bool = True):
     return tracker.evaluate(
         now_ms=now,
         book=snapshot if snapshot is not None else book(),
@@ -35,6 +36,8 @@ def evaluate(tracker: SymbolQualityTracker, *, now: int = 1_000_000, snapshot: B
         book_state=state,
         stale_after_ms=3000,
         snapshot_age_s=snapshot_age_s,
+        feed_silent_ms=feed_silent_ms,
+        measure_latency=measure_latency,
     )
 
 
@@ -113,3 +116,58 @@ def test_gate_summary_names_the_blocked_symbols() -> None:
     assert summary["symbols"] == 2
     assert summary["tradable"] == 1
     assert "ETHUSDT" in summary["blocked"]
+
+
+def test_a_symbol_is_aged_against_the_data_clock_not_the_wall_clock() -> None:
+    """A feed whose timestamps are not "now" must not read as permanently stale.
+
+    This is the failure a replayed or delayed feed produces: every symbol is
+    ticking, every book is ready, and judging each event against wall time
+    marks all of them STALE and blocks the whole system.
+    """
+    historical = 1_600_000_000_000  # well in the past relative to any wall clock
+    tracker = SymbolQualityTracker("BTCUSDT", QualityConfig())
+    tracker.feed_state = FeedState.LIVE
+    for i in range(200):
+        stamp = historical + i * 300
+        tracker.record_event(stamp, stamp)
+
+    quality = evaluate(tracker, now=historical + 200 * 300, feed_silent_ms=120.0,
+                       measure_latency=False)
+    assert quality.state is FeedState.LIVE
+    assert QualityFlag.STALE_FEED not in quality.flags
+    assert quality.tradable, f"a healthy replayed symbol was blocked: {quality.flags}"
+
+
+def test_a_silent_feed_is_stale_even_when_its_own_clock_froze() -> None:
+    """The other half: when nothing arrives at all, the data clock stops too.
+
+    Ageing only against the data clock would make a dead feed look perfect, so
+    wall-clock silence is measured separately and overrides.
+    """
+    historical = 1_600_000_000_000
+    tracker = SymbolQualityTracker("BTCUSDT", QualityConfig())
+    tracker.feed_state = FeedState.LIVE
+    for i in range(200):
+        stamp = historical + i * 300
+        tracker.record_event(stamp, stamp)
+
+    quality = evaluate(tracker, now=historical + 200 * 300, feed_silent_ms=30_000.0,
+                       measure_latency=False)
+    assert quality.state is FeedState.STALE
+    assert QualityFlag.STALE_FEED in quality.flags
+    assert not quality.tradable
+
+
+def test_latency_is_not_scored_when_it_cannot_mean_anything() -> None:
+    """Under a recorded feed the venue/local gap is the age of the file."""
+    tracker = SymbolQualityTracker("BTCUSDT", QualityConfig(max_latency_ms=100.0))
+    tracker.feed_state = FeedState.LIVE
+    for i in range(200):
+        tracker.record_event(1_000_000 - 60_000 + i * 300, 1_000_000 - 60_000 + i * 300 + 900_000)
+    tracker.record_event(999_900, 1_900_000)
+
+    flagged = evaluate(tracker, measure_latency=True)
+    assert QualityFlag.HIGH_LATENCY in flagged.flags
+    ignored = evaluate(tracker, measure_latency=False)
+    assert QualityFlag.HIGH_LATENCY not in ignored.flags

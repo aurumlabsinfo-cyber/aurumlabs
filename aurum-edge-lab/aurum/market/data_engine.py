@@ -128,6 +128,10 @@ class DataEngine:
         #: tracks wall time; under replay it is the only clock that means
         #: anything, which is why downstream sampling reads it and not ``now``.
         self.data_time_ms = 0
+        #: Wall-clock instant the last event arrived, on any symbol. This is the
+        #: only staleness measure that survives a dead feed: when the venue goes
+        #: silent the data clock freezes with it, but this keeps ticking.
+        self.last_recv_ms = 0
         #: Optional per-event hook, used by the feature engine in replay mode so
         #: sampling follows the data instead of the wall clock. Left unset in
         #: live mode: nothing that can block belongs on the ingest path.
@@ -219,8 +223,10 @@ class DataEngine:
         self.processed += 1
         if event.ts_ms > self.data_time_ms:
             self.data_time_ms = event.ts_ms
+        self.last_recv_ms = now_ms()
         state.quality.record_event(event.ts_ms, event.recv_ms)
-        state.latency.record(event.latency_ms)
+        if self.feed.kind == "live":
+            state.latency.record(event.latency_ms)
 
         if persist:
             self.repos.market.record_event(event)
@@ -363,19 +369,29 @@ class DataEngine:
         interval = 0.5
         while self._running:
             await asyncio.sleep(interval)
-            stamp = now_ms()
+            wall = now_ms()
+            # Symbols are aged against the data clock; the feed as a whole is
+            # aged against the wall clock. See SymbolQualityTracker.evaluate.
+            reference = self.data_time_ms or wall
+            feed_silent_ms = (wall - self.last_recv_ms) if self.last_recv_ms else float("inf")
+            live_feed = self.feed.kind == "live"
+            stamp = wall
             for symbol, state in self.states.items():
                 view = state.book.top(self.config.quality.min_book_levels) if state.book.ready else None
                 snapshot_age = (
-                    (stamp - state.book.snapshot_ts_ms) / 1000.0 if state.book.snapshot_ts_ms else 1e9
+                    (reference - state.book.snapshot_ts_ms) / 1000.0
+                    if state.book.snapshot_ts_ms
+                    else 1e9
                 )
                 quality = state.quality.evaluate(
-                    now_ms=stamp,
+                    now_ms=reference,
                     book=view,
                     book_ready=state.book.ready,
                     book_state=state.book.state.value,
                     stale_after_ms=self.config.market.stale_after_ms,
                     snapshot_age_s=snapshot_age,
+                    feed_silent_ms=feed_silent_ms,
+                    measure_latency=live_feed,
                 )
                 self.qualities[symbol] = quality
                 if state.book.state is BookState.DESYNCED and not state.resync_pending:

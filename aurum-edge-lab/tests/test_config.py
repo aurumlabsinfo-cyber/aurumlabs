@@ -29,10 +29,15 @@ def test_wallet_starts_at_one_hundred_euro(config: Config) -> None:
     assert config.wallet.currency == "EUR"
 
 
-def test_env_override_uses_dotted_path() -> None:
+def test_env_override_accepts_both_separators() -> None:
     tree = env_overrides({"AURUM_SET__api.port": "9100", "AURUM_FEED": "replay"})
     assert tree["api"]["port"] == 9100
     assert tree["market"]["feed"] == "replay"
+
+    # A shell cannot set a name containing a dot with `VAR=x cmd`, so the
+    # double-underscore form has to work identically.
+    underscored = env_overrides({"AURUM_SET__market__replay_speed": "8"})
+    assert underscored["market"]["replay_speed"] == 8
 
 
 def test_production_refuses_replay_feed(tmp_path: Path) -> None:

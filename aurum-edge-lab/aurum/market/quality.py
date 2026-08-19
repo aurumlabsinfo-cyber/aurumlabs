@@ -94,7 +94,25 @@ class SymbolQualityTracker:
         book_state: str,
         stale_after_ms: int,
         snapshot_age_s: float,
+        feed_silent_ms: float = 0.0,
+        measure_latency: bool = True,
     ) -> SymbolQuality:
+        """Assess one symbol.
+
+        ``now_ms`` is the *data* clock — the newest venue timestamp the engine
+        has seen on any symbol — not the wall clock.  That distinction is what
+        makes the two staleness failures separable:
+
+        * one symbol stalls while the rest tick on: its last event falls behind
+          the data clock, and it alone is marked stale;
+        * the whole feed dies: the data clock freezes with it, so no symbol
+          would ever look stale by that measure.  ``feed_silent_ms`` covers
+          that case, and it is measured on the wall clock by the caller.
+
+        Judging a single symbol against the wall clock would conflate the two
+        and, on any feed whose timestamps are not "now", would report every
+        symbol as permanently stale.
+        """
         self.roll_window(now_ms)
         flags: list[QualityFlag] = []
         factors: list[float] = []
@@ -102,6 +120,11 @@ class SymbolQualityTracker:
         age_ms = now_ms - self.last_event_ms if self.last_event_ms else float("inf")
         if self.feed_state in (FeedState.DISCONNECTED, FeedState.ERROR) or self.last_event_ms == 0:
             state = FeedState.DISCONNECTED if self.last_event_ms == 0 else self.feed_state
+            flags.append(QualityFlag.STALE_FEED)
+            factors.append(0.0)
+        elif feed_silent_ms > stale_after_ms:
+            # Nothing has arrived from the venue at all, on any symbol.
+            state = FeedState.STALE
             flags.append(QualityFlag.STALE_FEED)
             factors.append(0.0)
         elif age_ms > stale_after_ms:
@@ -116,10 +139,13 @@ class SymbolQualityTracker:
             state = FeedState.LIVE
             factors.append(_decay(age_ms, stale_after_ms))
 
-        # Latency
-        if self.latency_ms > self.config.max_latency_ms:
-            flags.append(QualityFlag.HIGH_LATENCY)
-        factors.append(_decay(self.latency_ms, self.config.max_latency_ms))
+        # Latency, which only means anything when the venue's clock and ours
+        # are meant to agree. Under replay the gap is the age of the recording,
+        # not a transport delay, so it is neither flagged nor scored.
+        if measure_latency:
+            if self.latency_ms > self.config.max_latency_ms:
+                flags.append(QualityFlag.HIGH_LATENCY)
+            factors.append(_decay(self.latency_ms, self.config.max_latency_ms))
 
         # Book shape
         spread_bps: float | None = None
