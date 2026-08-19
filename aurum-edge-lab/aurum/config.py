@@ -44,6 +44,8 @@ ENV_ALIASES: dict[str, str] = {
     "AURUM_WS_BASE": "market.ws_base",
     "AURUM_DB_URL": "storage.url",
     "AURUM_RESEARCH_ENABLED": "research.enabled",
+    "AURUM_EXPLORATION": "exploration.enabled",
+    "AURUM_EXPLORATION_TRADES_PER_DAY": "exploration.trades_per_day",
 }
 
 
@@ -336,6 +338,46 @@ class ValidationConfig(_Model):
         return self
 
 
+class ExplorationConfig(_Model):
+    """Trade on a schedule, with no validated edge, to exercise the live path.
+
+    This is deliberately *not* a strategy and the code never pretends it is.
+    Its purpose is the thing research cannot give you: an execution path that
+    has actually executed, fills measured against the cost model on real books,
+    wallet arithmetic that has moved, and a post-mortem with something in it.
+
+    Everything it produces is tagged ``exploration`` — in the signal, in the
+    database, and in every API response — so it can never be counted as
+    evidence of an edge, and so the validated-performance figures stay clean.
+
+    The expected outcome is a loss of roughly the round trip per trade. That is
+    not a defect: it is the measurement. If forced trading were profitable, the
+    research gates would have found the edge and promoted a champion.
+    """
+
+    enabled: bool = False
+    #: Target entries per day. The scheduler paces to 86400/this, and the risk
+    #: caps (concurrent positions, cooldown, exposure) still bind — so this is
+    #: a ceiling, not a promise.
+    trades_per_day: int = Field(default=250, ge=1, le=5000)
+    #: How long an exploration position is held before it is closed on horizon.
+    #: Short holds are what make the target rate reachable inside a handful of
+    #: concurrent slots: 250/day needs one entry every ~345 s.
+    hold_s: float = Field(default=120.0, gt=0)
+    #: Sized far smaller than a real signal by default. 250 round trips a day
+    #: at the normal 1% risk would end the cycle on costs alone before the day
+    #: was out, and a cycle that fails for that reason measures nothing.
+    risk_per_trade_pct: float = Field(default=0.10, ge=0.01, le=2.00)
+    #: Empty means every configured symbol, taken round-robin.
+    symbols: list[str] = Field(default_factory=list)
+    #: Seed for the direction draw, so a run can be reproduced exactly.
+    seed: int = 7
+
+    @property
+    def interval_s(self) -> float:
+        return 86_400.0 / float(self.trades_per_day)
+
+
 class RetentionConfig(_Model):
     market_events_hours: float = Field(default=6.0, gt=0)
     features_hours: float = Field(default=24.0, gt=0)
@@ -386,6 +428,7 @@ class Config(_Model):
     costs: CostsConfig = Field(default_factory=CostsConfig)
     research: ResearchConfig = Field(default_factory=ResearchConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
+    exploration: ExplorationConfig = Field(default_factory=ExplorationConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)
 

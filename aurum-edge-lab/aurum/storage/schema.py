@@ -321,6 +321,7 @@ TABLES: tuple[Table, ...] = (
             _c("regime", TEXT),
             _c("accepted", BOOL),
             _c("shadow", BOOL),
+            _c("exploration", BOOL),
             _c("rejection", TEXT),
             _c("rejection_detail", TEXT),
             _c("features", JSON),

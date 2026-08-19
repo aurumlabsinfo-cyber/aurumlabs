@@ -854,6 +854,46 @@ class SelfTest:
                 assert forbidden not in source, f"the adapter references {forbidden!r}"
             return "the venue adapter reads public market data only"
 
+        def exploration_is_off_and_honest() -> str:
+            """Forced trading must be opt-in, and must never look like an edge.
+
+            Exploration exists to exercise the execution path by trading on a
+            timer with no validated edge. The danger is not the trading — it is
+            paper money — but the record it leaves: 250 tagged trades a day
+            that later read as strategy performance would be worse than no data
+            at all. So the tag is checked here, not just in unit tests.
+            """
+            from ..config import ExplorationConfig
+            from ..domain import FeatureSnapshot, Regime
+            from ..execution.exploration import STRATEGY_ID, ExplorationTrader
+            from ..risk.manager import RiskManager
+
+            assert ExplorationConfig().enabled is False, "exploration must default to off"
+
+            probe = self.config.model_copy(deep=True)
+            probe.exploration.enabled = True
+            trader = ExplorationTrader(probe)
+            snapshot = FeatureSnapshot(
+                symbol=probe.market.symbols[0].symbol,
+                ts_ms=1_000,
+                values={},
+                regime=Regime.NORMAL_RANGE,
+            )
+            signal = trader.build_signal(snapshot.symbol, snapshot, cost_bps=11.0)
+            assert signal.exploration is True, "an exploration signal is not tagged"
+            assert signal.to_dict()["exploration"] is True, "the tag is lost on serialisation"
+            assert signal.expected_edge_bps == 0.0, "an edgeless trade claimed an edge"
+            assert signal.net_edge_bps < 0, "an edgeless trade recorded a positive net edge"
+            assert signal.strategy_id == STRATEGY_ID
+            assert not signal.hypothesis_id, "exploration must not claim a hypothesis"
+
+            source = inspect.getsource(RiskManager.evaluate)
+            assert "require_edge and" in source, (
+                "the edge gate is no longer conditional; exploration would be trading "
+                "through a gate it is supposed to waive explicitly"
+            )
+            return "exploration is off by default, waives only the edge gate, and tags every signal"
+
         def no_placeholders() -> str:
             """The blueprint forbids TODO/stub paths in the production runtime.
 
@@ -884,6 +924,7 @@ class SelfTest:
 
         self._check(group, "the broker cannot reach a venue", no_live_orders)
         self._check(group, "the adapter is public-market-data only", adapter_is_public_only)
+        self._check(group, "exploration cannot pass for an edge", exploration_is_off_and_honest)
         self._check(group, "no placeholders remain in the runtime", no_placeholders)
 
 

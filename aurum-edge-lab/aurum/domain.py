@@ -460,6 +460,10 @@ class Signal:
     rejection: RejectionReason | None = None
     rejection_detail: str = ""
     shadow: bool = False
+    #: Opened by the exploration scheduler, which trades without a validated
+    #: edge to exercise the execution path. Never evidence of an edge; carried
+    #: on the signal so nothing downstream can mistake it for one.
+    exploration: bool = False
 
     @property
     def net_edge_bps(self) -> float:
@@ -481,6 +485,7 @@ class Signal:
             "regime": self.regime.value,
             "accepted": self.accepted,
             "shadow": self.shadow,
+            "exploration": self.exploration,
             "rejection": self.rejection.value if self.rejection else None,
             "rejection_detail": self.rejection_detail,
         }

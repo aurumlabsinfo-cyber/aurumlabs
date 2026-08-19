@@ -39,6 +39,7 @@ from .domain import (
     now_ms,
 )
 from .execution.cost_model import CostModel
+from .execution.exploration import ExplorationTrader
 from .execution.paper_broker import PaperBroker
 from .features.engine import FeatureEngine
 from .logging_setup import get_logger
@@ -98,6 +99,7 @@ class AurumRuntime:
         self.risk = RiskManager(config, self.wallet, self.costs)
         self.broker = PaperBroker(config, self.wallet, self.costs, self.repos.execution)
         self.cycles = CycleManager(config, self.wallet, self.lifecycle, self.repos)
+        self.exploration = ExplorationTrader(config)
 
         # --- observability ----------------------------------------------------
         self.diagnostics = DiagnosticsCollector(window_s=config.diagnostics.rejection_window_s)
@@ -190,6 +192,13 @@ class AurumRuntime:
             signal = self._shadow_signal(strategy, snapshot)
             if signal is not None:
                 signals.append(signal)
+
+        # Exploration runs on its own schedule, independent of whether research
+        # has produced anything. It is checked before the no-champion return so
+        # that having nothing to trade is exactly the case it still covers.
+        exploration = self._exploration_signal(snapshot)
+        if exploration is not None:
+            signals.append(exploration)
 
         if champion is None:
             # Recorded once per snapshot on one symbol only, so the counter
@@ -285,6 +294,93 @@ class AurumRuntime:
         else:
             signal.accepted = True
             self.risk.record_signal(symbol, hypothesis.direction, at_ms=snapshot.ts_ms)
+            self.diagnostics.record_acceptance(at_ms=snapshot.ts_ms)
+        self._publish_signal(signal)
+        return signal
+
+    def _exploration_signal(self, snapshot: FeatureSnapshot) -> Signal | None:
+        """Open a scheduled position with no edge, if one is due.
+
+        Only the edge-versus-costs gate is waived. Data quality, the spread and
+        crossed-book checks, position and exposure caps, the drawdown and
+        daily-loss breakers, sizing and liquidity all still apply — so this can
+        exercise the execution path without becoming a way to trade through a
+        broken feed or a failing wallet.
+
+        Driven off feature snapshots rather than its own timer so it inherits
+        the clock the rest of the decision path uses, which is what makes it
+        behave identically under replay.
+        """
+        if not self.exploration.due(snapshot.ts_ms):
+            return None
+        # One symbol per due tick, chosen round-robin; the snapshot that
+        # happened to trigger the schedule does not get to bias the choice.
+        symbol = self.exploration.next_symbol(set(self.broker.open_positions()))
+        if symbol is None:
+            return None
+        exec_snapshot = self.features.snapshot(symbol)
+        book = self.data.book_view(symbol)
+        if exec_snapshot is None or book is None or book.mid is None:
+            return None
+
+        # Re-arm only once we have a usable book: a symbol skipped for missing
+        # data should not consume the slot, or the achieved rate silently falls
+        # below the target with no record of why.
+        self.exploration.arm_next(snapshot.ts_ms)
+        self.exploration.attempted += 1
+
+        cost_bps = self.costs.round_trip_bps(book.spread_bps() or 1.0)
+        signal = self.exploration.build_signal(symbol, exec_snapshot, cost_bps)
+
+        quality_ok, quality_detail = self.data.is_tradable(symbol)
+        decision = self.risk.evaluate(
+            symbol=symbol,
+            direction=signal.direction,
+            expected_edge_bps=0.0,
+            horizon_ms=signal.horizon_ms,
+            snapshot=exec_snapshot,
+            book=book,
+            open_positions=self.broker.open_positions(),
+            cycle_active=self.cycles.active,
+            quality_ok=quality_ok,
+            quality_detail=quality_detail,
+            usdt_per_eur=self.config.fx.usdt_per_eur,
+            at_ms=snapshot.ts_ms,
+            require_edge=False,
+            risk_pct_override=self.config.exploration.risk_per_trade_pct,
+        )
+
+        if not decision.allowed or decision.plan is None:
+            signal.accepted = False
+            signal.rejection = decision.reason
+            signal.rejection_detail = decision.detail
+            self.exploration.record_rejection(decision.reason, decision.detail)
+            self.diagnostics.record_rejection(
+                decision.reason or RejectionReason.DATA_QUALITY, at_ms=snapshot.ts_ms
+            )
+            self._publish_signal(signal)
+            return signal
+
+        position = self.broker.open(
+            signal, decision.plan, book, exec_snapshot,
+            cycle_id=self.cycles.cycle.cycle_id if self.cycles.cycle else 0,
+            strategy_version=0,
+            at_ms=snapshot.ts_ms,
+        )
+        if position is None:
+            signal.accepted = False
+            signal.rejection = RejectionReason.INSUFFICIENT_LIQUIDITY
+            signal.rejection_detail = "the book could not fill the intended size"
+            self.exploration.record_rejection(
+                RejectionReason.INSUFFICIENT_LIQUIDITY, signal.rejection_detail
+            )
+            self.diagnostics.record_rejection(
+                RejectionReason.INSUFFICIENT_LIQUIDITY, at_ms=snapshot.ts_ms
+            )
+        else:
+            signal.accepted = True
+            self.risk.record_signal(symbol, signal.direction, at_ms=snapshot.ts_ms)
+            self.exploration.record_open()
             self.diagnostics.record_acceptance(at_ms=snapshot.ts_ms)
         self._publish_signal(signal)
         return signal
@@ -457,6 +553,7 @@ class AurumRuntime:
                 "has_champion": champion is not None,
                 "no_edge_reason": self.director.no_edge_reason,
             },
+            "exploration": self.exploration.to_dict(),
             "paper_broker": self.broker.stats(),
             "positions": [p.to_dict() for p in self.broker.open_positions().values()],
             "wallet": self.wallet.to_dict(),
@@ -484,5 +581,9 @@ class AurumRuntime:
         if self.cycles.cycle and self.cycles.cycle.state.value == "AWAITING_EDGE":
             return "AWAITING_EDGE"
         if self.lifecycle.champion() is None:
-            return "NO_VALIDATED_EDGE"
+            # Exploration trades, so "no champion" would read as "idle" when the
+            # wallet is in fact turning over. The status has to say which,
+            # because the two look identical in the trade count and mean
+            # opposite things about what the numbers are worth.
+            return "EXPLORATION" if self.exploration.enabled else "NO_VALIDATED_EDGE"
         return "OK"

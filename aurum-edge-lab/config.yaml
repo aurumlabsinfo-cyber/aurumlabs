@@ -171,6 +171,28 @@ validation:
   degrade_edge_ratio: 0.40       # live edge below this share of validated => DEGRADED
   degrade_min_signals: 20
 
+exploration:
+  # Scheduled entries with NO validated edge, to exercise the execution path.
+  #
+  # This is not a strategy and it will not make money: the direction is a coin
+  # flip, so the expected result is a loss of about one round trip per trade
+  # (~11 bps at the shipped cost model). Its purpose is to prove the live path
+  # works — fills against real books, wallet and margin arithmetic under real
+  # turnover, exits, post-mortem, persistence — before a real signal ever
+  # depends on it.
+  #
+  # Everything it produces is tagged `exploration` in the API and in the
+  # database, so it can never be counted as evidence of an edge.
+  #
+  #   AURUM_EXPLORATION=true
+  #   AURUM_EXPLORATION_TRADES_PER_DAY=250
+  enabled: false
+  trades_per_day: 250            # target entries/day; risk caps still bind
+  hold_s: 120                    # closed on horizon after this long
+  risk_per_trade_pct: 0.10       # far below risk.risk_per_trade_pct, on purpose
+  symbols: []                    # empty = every configured symbol, round-robin
+  seed: 7                        # the direction draw is reproducible
+
 storage:
   driver: sqlite                 # sqlite | postgres (abstraction is dialect-aware)
   url: ""                        # empty => <data_dir>/aurum.db

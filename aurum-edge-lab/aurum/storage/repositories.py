@@ -321,6 +321,7 @@ class ExecutionRepository:
                 "regime": signal.regime.value,
                 "accepted": signal.accepted,
                 "shadow": signal.shadow,
+                "exploration": signal.exploration,
                 "rejection": signal.rejection.value if signal.rejection else None,
                 "rejection_detail": signal.rejection_detail,
                 "features": signal.features,

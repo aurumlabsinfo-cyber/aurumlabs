@@ -113,7 +113,19 @@ class RiskManager:
         quality_detail: str,
         usdt_per_eur: float,
         at_ms: int | None = None,
+        require_edge: bool = True,
+        risk_pct_override: float | None = None,
     ) -> RiskDecision:
+        """Decide whether this entry may happen, and at what size.
+
+        ``require_edge=False`` is used by the exploration scheduler, which
+        trades on a timer with no edge to claim. It waives *only* the
+        edge-versus-costs gate. Every other gate — cycle state, drawdown and
+        daily-loss breakers, data quality, spread, crossed book, position and
+        exposure caps, cooldown, sizing, liquidity, available margin — still
+        applies, because those protect against damage rather than against
+        trading without an edge.
+        """
         stamp = at_ms if at_ms is not None else now_ms()
 
         if not cycle_active:
@@ -179,7 +191,7 @@ class RiskManager:
         # --- the edge has to survive what it costs ---------------------------
         entry_cost = self.costs.entry_cost_bps(spread_bps)
         round_trip = self.costs.round_trip_bps(spread_bps)
-        if expected_edge_bps <= round_trip:
+        if require_edge and expected_edge_bps <= round_trip:
             return self._reject(
                 RejectionReason.EDGE_BELOW_COSTS,
                 f"expected {expected_edge_bps:.2f} bps <= round trip {round_trip:.2f} bps",
@@ -206,6 +218,7 @@ class RiskManager:
             round_trip_bps=round_trip,
             usdt_per_eur=usdt_per_eur,
             exposure_headroom_eur=headroom,
+            risk_pct_override=risk_pct_override,
         )
         if plan is None:
             return self._reject(RejectionReason.NOTIONAL_TOO_SMALL, "computed size rounds to zero")
@@ -248,6 +261,7 @@ class RiskManager:
         round_trip_bps: float,
         usdt_per_eur: float,
         exposure_headroom_eur: float | None = None,
+        risk_pct_override: float | None = None,
     ) -> SizingPlan | None:
         """Risk-first sizing, then capped.
 
@@ -272,7 +286,10 @@ class RiskManager:
         target_bps = max(expected_edge_bps, round_trip_bps * 1.5)
 
         equity = self.wallet.state.equity
-        risk_target = equity * self.config.risk.risk_per_trade_pct / 100.0
+        risk_pct = (
+            self.config.risk.risk_per_trade_pct if risk_pct_override is None else risk_pct_override
+        )
+        risk_target = equity * risk_pct / 100.0
         notional_eur = risk_target / (stop_bps / 10_000.0)
         capped_by = ""
 

@@ -105,6 +105,98 @@ curl -s http://127.0.0.1:8002/diagnostics | python3 -m json.tool
 
 ---
 
+## Exploration mode — trading with no edge, on purpose
+
+Research can tell you a hypothesis does not survive its costs. It cannot tell
+you whether the code that would have traded it works, because that code never
+runs. A system whose execution path has never executed has an **untested
+execution path**, and the first real signal is the worst possible time to find
+that out.
+
+Exploration mode opens paper positions on a timer, with no validated edge, to
+exercise that path.
+
+```bash
+AURUM_EXPLORATION=true AURUM_EXPLORATION_TRADES_PER_DAY=250 python3 main.py run
+```
+
+It is off by default and it is **not a strategy**:
+
+* **The direction is a seeded coin flip**, deliberately. Anything cleverer —
+  momentum, order-flow sign, the best-scoring rejected hypothesis — would make
+  the P&L look like a claim about the market, and it would be a claim the
+  validation lab has already rejected. A coin flip cannot be mistaken for an
+  edge, which is what makes the measurement readable: what comes back is the
+  cost of trading and nothing else.
+* **Everything is tagged `exploration`** — in the signal, in the `signals`
+  table, and in every API response — so validated performance figures can never
+  absorb these trades.
+* **Research does not learn from them.** They create no hypotheses and never
+  enter research memory.
+* `/health` reports `status: EXPLORATION` rather than `NO_VALIDATED_EDGE`,
+  because a turning-over wallet and an idle one must not look alike.
+
+It waives exactly **one** gate — edge versus costs. The drawdown and daily-loss
+breakers, data quality, spread and crossed-book checks, position and exposure
+caps, cooldown, sizing, liquidity and margin all still apply. Those protect
+against damage, not against trading without an edge.
+
+### What it costs, measured
+
+85 exploration trades over 25 minutes of replayed market:
+
+| | |
+|---|---|
+| average gross move | −3.08 bps |
+| average round-trip cost | **10.75 bps** |
+| average net | **−12.08 bps** |
+| total | −3.03 EUR on a 100 EUR wallet |
+| strategies promoted | 0 |
+
+That is the point, not a defect: **the loss is the cost**. If forced trading
+were profitable the research gates would have found the edge and promoted a
+champion.
+
+### Sizing it so it survives the day
+
+Exploration burns the wallet at a predictable rate:
+
+```
+loss/day  ≈  trades_per_day × notional × round_trip_bps / 10000
+notional  ≈  equity × exploration.risk_per_trade_pct / 100 ÷ (stop_bps / 10000)
+```
+
+At the shipped `risk_per_trade_pct: 0.10` that is roughly **−0.036 EUR per
+trade**, so 250 trades/day costs about 9% of a 100 EUR wallet per day — which
+trips `risk.daily_loss_limit_pct: 10.0` in about a day. That breaker firing is
+correct behaviour, not a fault. To run for longer, size down:
+
+```bash
+AURUM_SET__exploration__risk_per_trade_pct=0.02   # ~2.5%/day instead of ~9%
+```
+
+`risk.min_notional_eur: 5.0` is the floor — below about `0.011` every entry is
+refused as `NOTIONAL_TOO_SMALL`.
+
+Two settings interact and it is worth knowing which binds first: the achievable
+rate is capped by `risk.max_concurrent_positions ÷ exploration.hold_s`. At the
+defaults that is 3 ÷ 120 s ≈ 2160/day, comfortably above 250. Raise `hold_s` or
+lower the position cap far enough and entries start returning `MAX_POSITIONS`
+instead — visible in `/health` under `exploration.last_rejection`.
+
+### Run it in its own database
+
+```bash
+AURUM_DATA_DIR=./data/exploration AURUM_EXPLORATION=true python3 main.py run
+```
+
+Exploration P&L reaches the same 100 EUR cycle wallet, so a long forced run can
+end a cycle on costs alone and hand the post-mortem a failure caused by nothing
+but turnover. Keeping it in a separate data directory leaves the clean research
+history and its cycle arithmetic untouched.
+
+---
+
 ## What it actually does
 
 ```
