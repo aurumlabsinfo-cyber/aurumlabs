@@ -221,8 +221,8 @@ class WalletConfig(_Model):
 class RiskConfig(_Model):
     risk_per_trade_pct: float = Field(default=1.0, ge=0.10, le=2.00)
     max_concurrent_positions: int = Field(default=3, ge=1, le=10)
-    max_exposure_pct: float = Field(default=30.0, gt=0, le=100)
-    max_symbol_exposure_pct: float = Field(default=15.0, gt=0, le=100)
+    max_exposure_pct: float = Field(default=150.0, gt=0, le=1000)
+    max_symbol_exposure_pct: float = Field(default=60.0, gt=0, le=1000)
     daily_loss_limit_pct: float = Field(default=10.0, gt=0, le=100)
     max_drawdown_pct: float = Field(default=25.0, gt=0, le=100)
     wallet_failure_equity_pct: float = Field(default=40.0, gt=0, le=100)
@@ -398,8 +398,8 @@ class Settable:
 SETTABLE: tuple[Settable, ...] = (
     Settable("risk.risk_per_trade_pct", float, 0.10, 2.00, "Percent of equity risked per paper trade"),
     Settable("risk.max_concurrent_positions", int, 1, 10, "Simultaneous open paper positions"),
-    Settable("risk.max_exposure_pct", float, 1.0, 100.0, "Total notional exposure cap"),
-    Settable("risk.max_symbol_exposure_pct", float, 1.0, 100.0, "Per-symbol notional exposure cap"),
+    Settable("risk.max_exposure_pct", float, 1.0, 300.0, "Total notional exposure cap, % of equity"),
+    Settable("risk.max_symbol_exposure_pct", float, 1.0, 300.0, "Per-symbol notional exposure cap, % of equity"),
     Settable("risk.daily_loss_limit_pct", float, 1.0, 100.0, "Daily loss circuit breaker"),
     Settable("risk.max_drawdown_pct", float, 1.0, 100.0, "Cycle drawdown circuit breaker"),
     Settable("risk.cooldown_s", float, 0.0, 3600.0, "Per-symbol cooldown after a signal"),
