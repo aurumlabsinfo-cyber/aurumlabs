@@ -39,6 +39,7 @@ ENV_ALIASES: dict[str, str] = {
     "AURUM_API_HOST": "api.host",
     "AURUM_API_PORT": "api.port",
     "AURUM_FEED": "market.feed",
+    "AURUM_VENUE": "market.venue",
     "AURUM_REST_BASE": "market.rest_base",
     "AURUM_WS_BASE": "market.ws_base",
     "AURUM_DB_URL": "storage.url",
@@ -110,18 +111,24 @@ class ReconnectConfig(_Model):
 
 
 class MarketConfig(_Model):
-    venue: str = "binance_usdm"
+    venue: str = "bybit_linear"
     feed: str = "live"
-    rest_base: str = "https://fapi.binance.com"
-    ws_base: str = "wss://fstream.binance.com"
-    ws_path: str = "/stream"
-    rest_depth_path: str = "/fapi/v1/depth"
-    rest_exchange_info_path: str = "/fapi/v1/exchangeInfo"
-    rest_time_path: str = "/fapi/v1/time"
+    # Endpoints are left empty on purpose. An empty field is filled from the
+    # selected venue's defaults (aurum/venues.py); a field set explicitly wins.
+    # Hard-coding one venue's URLs as the default is how you end up pointing a
+    # Bybit run at Binance's host and getting a 404 you have to go looking for.
+    rest_base: str = ""
+    ws_base: str = ""
+    ws_path: str = ""
+    rest_depth_path: str = ""
+    rest_exchange_info_path: str = ""
+    rest_time_path: str = ""
+    #: Product category, where the venue requires one (Bybit does, Binance does not).
+    category: str = ""
     symbols: list[SymbolSpec] = Field(default_factory=list)
     depth_levels: int = Field(default=20, ge=5, le=1000)
     depth_stream_speed: str = "100ms"
-    snapshot_limit: int = Field(default=1000, ge=100, le=1000)
+    snapshot_limit: int = Field(default=500, ge=100, le=1000)
     streams: list[str] = Field(default_factory=lambda: ["depth", "aggTrade", "bookTicker", "markPrice"])
     queue_size: int = Field(default=20_000, ge=1000)
     heartbeat_timeout_s: float = Field(default=20.0, gt=0)
@@ -157,6 +164,37 @@ class MarketConfig(_Model):
         if len(seen) != len(self.symbols):
             raise ValueError("market.symbols contains duplicates")
         return self
+
+    @model_validator(mode="after")
+    def _resolve_venue(self) -> MarketConfig:
+        """Fill every empty endpoint from the selected venue's defaults.
+
+        Uses ``object.__setattr__`` rather than plain assignment: this model has
+        ``validate_assignment`` on, and assigning inside an ``after`` validator
+        would re-enter validation and recurse.
+        """
+        from .venues import endpoints_for  # local import keeps the module cycle-free
+
+        spec = endpoints_for(self.venue)
+        for field in (
+            "rest_base", "ws_base", "ws_path", "rest_depth_path",
+            "rest_exchange_info_path", "rest_time_path", "category",
+        ):
+            if not getattr(self, field):
+                object.__setattr__(self, field, getattr(spec, field))
+        if self.snapshot_limit > spec.max_rest_depth:
+            object.__setattr__(self, "snapshot_limit", spec.max_rest_depth)
+        return self
+
+    @field_validator("venue")
+    @classmethod
+    def _venue(cls, v: str) -> str:
+        from .venues import VENUES
+
+        v = v.strip().lower()
+        if v not in VENUES:
+            raise ValueError(f"unknown venue {v!r}; supported: {', '.join(sorted(VENUES))}")
+        return v
 
     @property
     def symbol_names(self) -> list[str]:

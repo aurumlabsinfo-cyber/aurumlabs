@@ -140,6 +140,55 @@ def test_replay_feed_marks_every_event_as_not_live(tmp_path: Path) -> None:
     assert event is not None and event.source == "replay"
 
 
+@pytest.mark.asyncio
+async def test_replay_snapshot_is_current_as_of_the_cursor(tmp_path: Path) -> None:
+    """A replayed REST snapshot must describe the book *now*, not an hour ago.
+
+    Venues answer a depth request with the current book. The file stores
+    snapshots periodically, so handing back the newest stored one would walk
+    ``lastUpdateId`` backwards against the diffs already delivered — the engine
+    refuses that (rightly), and the replay could then never refresh a snapshot
+    at all.
+    """
+    path = tmp_path / "replay.jsonl"
+    rows = [
+        json.dumps({"aurum_replay": 1, "venue": "test"}),
+        json.dumps({"symbol": "BTCUSDT", "kind": "snapshot", "ts_ms": 0,
+                    "payload": {"lastUpdateId": 100,
+                                "bids": [[10.0, 1.0], [9.0, 5.0]],
+                                "asks": [[11.0, 1.0]]}}),
+        # Adds a level, resizes another, and deletes one with qty 0.
+        json.dumps({"symbol": "BTCUSDT", "kind": "depth", "ts_ms": 10,
+                    "payload": {"U": 101, "u": 140, "pu": 100,
+                                "b": [[10.0, 4.0], [8.0, 2.0]], "a": [[11.0, 0.0]]}}),
+        json.dumps({"symbol": "BTCUSDT", "kind": "depth", "ts_ms": 20,
+                    "payload": {"U": 141, "u": 180, "pu": 140,
+                                "b": [[9.0, 0.0]], "a": [[12.0, 3.0]]}}),
+        # Beyond the cursor set below: must not leak into the answer.
+        json.dumps({"symbol": "BTCUSDT", "kind": "depth", "ts_ms": 30,
+                    "payload": {"U": 181, "u": 200, "pu": 180,
+                                "b": [[7.0, 9.0]], "a": []}}),
+    ]
+    path.write_text("\n".join(rows), encoding="utf-8")
+    replay = ReplayFeed(["BTCUSDT"], path)
+    replay.load()
+
+    # Before anything is replayed, the stored snapshot stands as written.
+    fresh = await replay.fetch_depth_snapshot("BTCUSDT")
+    assert fresh.last_update_id == 100
+    assert dict(fresh.bids) == {10.0: 1.0, 9.0: 5.0}
+
+    replay.cursor_ts_ms = 20
+    rolled = await replay.fetch_depth_snapshot("BTCUSDT")
+    assert rolled.last_update_id == 180, "snapshot did not roll forward to the cursor"
+    assert rolled.ts_ms == 20
+    assert dict(rolled.bids) == {10.0: 4.0, 8.0: 2.0}, "level edits were not applied"
+    assert dict(rolled.asks) == {12.0: 3.0}, "a zero quantity did not remove its level"
+    assert 7.0 not in dict(rolled.bids), "a diff from beyond the cursor leaked in"
+    assert [p for p, _ in rolled.bids] == sorted((p for p, _ in rolled.bids), reverse=True)
+    assert [p for p, _ in rolled.asks] == sorted(p for p, _ in rolled.asks)
+
+
 def test_production_cannot_build_a_replay_feed(tmp_path: Path) -> None:
     with pytest.raises(ConfigError):
         load_config(
@@ -153,6 +202,7 @@ def test_production_cannot_build_a_replay_feed(tmp_path: Path) -> None:
 
 
 def test_build_feed_selects_the_configured_adapter(config: Config, tmp_path: Path) -> None:
+    config.market.venue = "binance_usdm"
     assert isinstance(build_feed(config), BinanceFuturesFeed)
     config.market.feed = "replay"
     with pytest.raises(ValueError, match="replay_path"):

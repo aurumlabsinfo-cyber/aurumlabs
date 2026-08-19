@@ -19,7 +19,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..adapters.base import MarketFeed
+from ..adapters.base import DepthSnapshot, MarketFeed
 from ..bus import TOPIC_BOOK, TOPIC_MARKET_EVENT, TOPIC_TRADE, EventBus
 from ..clock import Clock, LatencyTracker
 from ..config import Config
@@ -77,6 +77,13 @@ class SymbolState:
     snapshot_ts_ms: int = 0
     resync_pending: bool = False
     last_resync_ms: int = 0
+    #: **Wall-clock** instant of the last periodic refresh attempt. How stale a
+    #: snapshot is, is a question about the data; how often we may ask the venue
+    #: for a new one is a question about wall time. Rate-limiting on the data
+    #: clock would be no limit at all under a fast replay, where half a minute of
+    #: data time passes every wall second — the engine would resync every tick
+    #: until the hourly budget was gone and then mark the book desynced.
+    last_refresh_ms: int = 0
     resyncs_this_hour: int = 0
     resync_hour_started_ms: int = 0
     latency: LatencyTracker = field(default_factory=LatencyTracker)
@@ -264,6 +271,34 @@ class DataEngine:
             state.funding_rate = float(event.payload.get("funding_rate", 0.0))
             state.next_funding_ms = int(event.payload.get("next_funding_ms", 0))
             state.last_mark_ms = event.ts_ms
+        elif event.kind is EventKind.SNAPSHOT:
+            self._apply_snapshot_event(state, event)
+
+    def _apply_snapshot_event(self, state: SymbolState, event: MarketEvent) -> None:
+        """Seed the book from a snapshot the venue pushed over the socket.
+
+        Bybit delivers the order-book snapshot on the topic itself rather than
+        making the client pull one over REST, so the book is seeded in-stream
+        and no round trip is needed. A snapshot arriving mid-stream is the
+        venue telling us to start again, which is exactly what
+        ``apply_snapshot`` does with whatever diffs are already buffered.
+        """
+        snapshot = DepthSnapshot(
+            symbol=event.symbol,
+            last_update_id=int(event.payload.get("lastUpdateId", 0)),
+            ts_ms=event.ts_ms,
+            recv_ms=event.recv_ms,
+            bids=[(float(p), float(q)) for p, q in event.payload.get("bids", ())],
+            asks=[(float(p), float(q)) for p, q in event.payload.get("asks", ())],
+        )
+        if state.book.apply_snapshot(snapshot):
+            state.snapshot_ts_ms = snapshot.ts_ms
+            log.debug(
+                "book seeded from stream",
+                extra={"symbol": state.symbol, "update_id": snapshot.last_update_id},
+            )
+        else:
+            log.warning("streamed snapshot did not join", extra={"symbol": state.symbol})
 
     @staticmethod
     def _make_liquidity_sink(state: SymbolState):
@@ -303,7 +338,7 @@ class DataEngine:
 
     # ---------------------------------------------------------------- resync
 
-    def _schedule_resync(self, symbol: str, reason: str) -> None:
+    def _schedule_resync(self, symbol: str, reason: str, *, preserve: bool = False) -> None:
         state = self.states[symbol]
         if state.resync_pending:
             return
@@ -311,19 +346,37 @@ class DataEngine:
         # The reference matters: asyncio keeps only a weak reference to a
         # running task, so a fire-and-forget resync can be garbage-collected
         # mid-flight and leave the book desynced with nothing coming to fix it.
-        task = asyncio.create_task(self._resync(symbol, reason=reason), name=f"resync-{symbol}")
+        task = asyncio.create_task(
+            self._resync(symbol, reason=reason, preserve=preserve), name=f"resync-{symbol}"
+        )
         self._resync_tasks.add(task)
         task.add_done_callback(self._resync_tasks.discard)
 
-    async def _resync(self, symbol: str, *, reason: str) -> None:
-        """Fetch a fresh snapshot and rejoin the diff stream deterministically."""
+    async def _resync(self, symbol: str, *, reason: str, preserve: bool = False) -> None:
+        """Fetch a fresh snapshot and rejoin the diff stream deterministically.
+
+        ``preserve`` distinguishes the two reasons to do this. Recovering from a
+        desync has nothing to protect — the book is already wrong, so it is torn
+        down and rebuilt. A *periodic refresh* runs against a book that is
+        currently correct, and there the snapshot is applied through
+        :meth:`OrderBook.refresh_from`, which rolls back if it cannot be joined.
+        Without that distinction a routine refresh can desync a healthy book
+        whenever the snapshot arrives older than the diffs already buffered.
+        """
         state = self.states[symbol]
         try:
             stamp = now_ms()
             if state.resync_hour_started_ms == 0 or stamp - state.resync_hour_started_ms > 3_600_000:
                 state.resync_hour_started_ms = stamp
                 state.resyncs_this_hour = 0
-            if state.resyncs_this_hour >= self.config.market.max_resyncs_per_hour:
+            # The budget exists to stop a desync loop from hammering the venue,
+            # so it counts real recoveries only. A periodic refresh is already
+            # rate-limited by its own interval and rolls back harmlessly when it
+            # cannot join; charging it against the budget would let routine
+            # maintenance exhaust the allowance and then mark a perfectly
+            # healthy book desynced — the refresh causing the damage it exists
+            # to prevent.
+            if not preserve and state.resyncs_this_hour >= self.config.market.max_resyncs_per_hour:
                 log.error("resync budget exhausted", extra={"symbol": symbol})
                 self.repos.system.log(
                     "market",
@@ -339,9 +392,10 @@ class DataEngine:
             if state.last_resync_ms and since_last < cooldown:
                 await asyncio.sleep(cooldown - since_last)
 
-            state.book.begin_resync()
-            state.quality.record_resync()
-            state.resyncs_this_hour += 1
+            if not preserve:
+                state.book.begin_resync()
+                state.quality.record_resync()
+                state.resyncs_this_hour += 1
             state.last_resync_ms = now_ms()
 
             for attempt in range(3):
@@ -354,15 +408,31 @@ class DataEngine:
                     )
                     await asyncio.sleep(1.0 * (attempt + 1))
                     continue
-                if state.book.apply_snapshot(snapshot):
+                applied = (
+                    state.book.refresh_from(snapshot)
+                    if preserve
+                    else state.book.apply_snapshot(snapshot)
+                )
+                if applied:
                     state.snapshot_ts_ms = snapshot.ts_ms
                     log.info(
                         "book synced",
                         extra={"symbol": symbol, "reason": reason, "update_id": snapshot.last_update_id},
                     )
                     return
+                if preserve:
+                    # The book is untouched and still correct. A refresh that
+                    # cannot join is not an incident; it is a refresh that did
+                    # not happen, and the next one is due in due course.
+                    log.debug(
+                        "snapshot refresh rolled back",
+                        extra={"symbol": symbol, "update_id": snapshot.last_update_id},
+                    )
+                    return
                 # Snapshot too old for the buffered diffs: take a newer one.
                 await asyncio.sleep(0.4)
+            if preserve:
+                return
             log.error("resync failed", extra={"symbol": symbol, "reason": reason})
             self.repos.system.log(
                 "market", "resync_failed", f"{symbol}: could not rejoin the diff stream", level="ERROR"
@@ -383,6 +453,14 @@ class DataEngine:
             feed_silent_ms = (wall - self.last_recv_ms) if self.last_recv_ms else float("inf")
             live_feed = self.feed.kind == "live"
             stamp = wall
+            # Minimum wall-clock spacing between snapshot refreshes for one
+            # symbol. Its only job is to stop a stuck condition from hammering
+            # the venue — the data clock decides when a refresh is actually
+            # due — so it is a small fraction of the age limit rather than
+            # half of it: at the shipped 900 s that is one request per symbol
+            # per 45 s in the worst case, and never more than one per ~450 s
+            # in normal operation, because the age gate governs.
+            refresh_floor_s = max(2.0, self.config.quality.snapshot_max_age_s * 0.05)
             for symbol, state in self.states.items():
                 view = state.book.top(self.config.quality.min_book_levels) if state.book.ready else None
                 snapshot_age = (
@@ -408,13 +486,26 @@ class DataEngine:
                     and not state.resync_pending
                     and feed_silent_ms <= self.config.market.stale_after_ms
                     and snapshot_age > self.config.quality.snapshot_max_age_s * 0.5
+                    and (wall - state.last_refresh_ms) / 1000.0 > refresh_floor_s
                 ):
                     # The diff chain keeps the book correct, but only against
                     # what the venue sent — a level the venue silently dropped
                     # would persist forever. Re-seeding from an authoritative
                     # snapshot periodically is what makes the staleness flag
                     # self-healing: it fires only if this refresh cannot happen.
-                    self._schedule_resync(symbol, reason="periodic snapshot refresh")
+                    #
+                    # Two clocks, two questions. *Whether* the snapshot is old
+                    # enough to re-verify is a question about the data, so it is
+                    # asked of the data clock. *How often we may ask the venue*
+                    # is a question about wall time — but only as a floor, not
+                    # as the cadence: making the wall interval the cadence lets
+                    # a replay running faster than real time age its snapshot
+                    # past the limit between two permitted refreshes and flag
+                    # NO_SNAPSHOT on a book that is provably in sync.
+                    state.last_refresh_ms = wall
+                    self._schedule_resync(
+                        symbol, reason="periodic snapshot refresh", preserve=True
+                    )
             # One quality row per symbol per 10 s is plenty for forensics.
             if stamp // 10_000 != getattr(self, "_last_quality_persist", 0):
                 self._last_quality_persist = stamp // 10_000

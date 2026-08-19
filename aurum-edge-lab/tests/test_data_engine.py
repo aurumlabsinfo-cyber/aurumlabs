@@ -121,22 +121,45 @@ async def test_book_snapshot_is_refreshed_before_it_can_go_stale(
     config.market.symbols = [s for s in config.market.symbols if s.symbol in SYMBOLS]
     # Force the refresh threshold to fire almost immediately, and remove the
     # inter-resync cooldown so the test does not wait out a production delay.
-    config.quality.snapshot_max_age_s = 2.0
+    config.quality.snapshot_max_age_s = 1.0
     config.market.resync_cooldown_s = 0.0
     engine = await run_engine(config, replay_file, repos, seconds=6.0)
     try:
         # The refresh only fires while the feed is flowing, and this replay is
         # consumed as fast as the loop allows, so hold the feed's liveness
-        # marker fresh across the window under test.
-        for _ in range(20):
+        # marker fresh across the window under test. Poll for the outcome rather
+        # than sleeping a fixed time: the quality loop ticks twice a second and a
+        # loaded machine can miss a fixed window without anything being wrong.
+        deadline = asyncio.get_running_loop().time() + 8.0
+        refreshes = 0
+        while asyncio.get_running_loop().time() < deadline:
             engine.last_recv_ms = now_ms()
             await asyncio.sleep(0.1)
-        resyncs = sum(engine.states[s].book.stats.resyncs for s in SYMBOLS)
-        assert resyncs > len(SYMBOLS), (
-            "no periodic refresh was scheduled; snapshots would age out and block trading"
+            refreshes = sum(engine.states[s].book.stats.refreshes for s in SYMBOLS)
+            if refreshes > 0:
+                break
+        assert refreshes > 0, (
+            "no periodic refresh was attempted; snapshots would age out and block trading"
         )
+
+        stats = [engine.states[s].book.stats for s in SYMBOLS]
+        # Attempting is not enough — a refresh that always rolls back leaves the
+        # snapshot ageing exactly as if it had never run.
+        landed = sum(s.refreshes - s.refresh_rollbacks for s in stats)
+        assert landed > 0, (
+            f"every refresh rolled back ({refreshes} attempted); the snapshot never "
+            "actually got any younger"
+        )
+
+        # The refresh must be safe: whether or not the snapshot could be joined,
+        # a book that was correct before is still correct after.
         for symbol in SYMBOLS:
-            assert engine.states[symbol].book.state is not BookState.DESYNCED
+            assert engine.states[symbol].book.state is not BookState.DESYNCED, (
+                f"{symbol} was desynced by its own periodic refresh"
+            )
+        assert sum(s.sequence_gaps for s in stats) == 0, (
+            "the refresh broke the diff chain it was supposed to re-verify"
+        )
     finally:
         await engine.stop()
 

@@ -4,9 +4,13 @@ Autonomous research engine for crypto perpetual futures. Ten markets, live publi
 market data, a €100 virtual wallet, and a research loop whose job is to **falsify**
 trading hypotheses rather than to produce trades.
 
-**Paper trading only.** There is no live-order code path in this repository, no
-credential that could create one, and no private endpoint in the venue adapter.
-The selftest asserts all three.
+**Default venue: Bybit V5 linear perpetuals.** Binance USD-M is equally
+supported, as are both testnets — one line in `config.yaml`.
+
+**Paper trading only, and no API keys.** This system reads *public* market data.
+It never asks for a key, never accepts one, and has no signing code or order
+endpoint to use one with. If you have Bybit API keys, keep them where they are:
+nothing here will read them. The selftest asserts this against both adapters.
 
 > The objective is not "many trades". The objective is **validated net edge — or
 > an explicit NO EDGE**. A run that ends with zero trades and a clear reason is a
@@ -20,7 +24,8 @@ Read this before trusting any number the system produces.
 
 | Claim | Status |
 |---|---|
-| Order book with USD-M sequence validation (`U`/`u`/`pu`) and deterministic resync | Implemented, unit-tested |
+| Bybit V5 and Binance USD-M adapters behind one interface | Implemented, unit-tested |
+| Order book with venue sequence validation and deterministic resync | Implemented, unit-tested |
 | ~90 causal microstructure features at 4 Hz, no lookahead | Implemented, tested for causality |
 | 10×10 cross-market matrix, 11 lead-lag horizons, cost-aware | Implemented, verified against a planted relationship |
 | Five research agents with real inputs, ranking, state, memory and metrics | Implemented |
@@ -28,26 +33,27 @@ Read this before trusting any number the system produces.
 | €100 wallet, ledger, risk gates, PaperBroker with book-walk fills | Implemented, tested |
 | Conditional reset: post-mortem then eligibility, never automatic | Implemented, tested |
 | REST + WebSocket API, ten-view frontend | Implemented, tested against a live runtime |
-| **Verified against the real Binance USD-M feed** | **NO — see below** |
+| **Verified against a real venue feed (either one)** | **NO — see below** |
 | **A profitable edge in crypto perpetuals** | **NOT CLAIMED. Not established.** |
 
-The container this was developed in has **no route to Binance**: `fapi.binance.com`
-and `developers.binance.com` are both refused by the egress policy with
-`403 Forbidden` on CONNECT. So the pipeline was verified end to end against the
-**replay** feed and a synthetic file, not against the venue.
+The container this was developed in has **no route to either venue**.
+`api.bybit.com`, `stream.bybit.com`, `bybit-exchange.github.io`,
+`fapi.binance.com` and `developers.binance.com` are all refused by the egress
+policy with `403 Forbidden` on CONNECT. So the pipeline was verified end to end
+against the **replay** feed and a synthetic file, not against a venue.
 
 What that means concretely:
 
-* The adapter is written to the documented USD-M public streams and REST paths,
-  and its wire-format handling is unit-tested against those documented shapes —
-  but it has **never opened a socket to Binance**.
+* Both adapters are written to the documented public streams and REST paths, and
+  their wire-format handling is unit-tested against those documented shapes —
+  but neither has **ever opened a socket to a venue**.
 * Endpoint routing is configuration, not constants, and is **verified at
-  startup**. Point it at the real venue and `main.py diagnose` will tell you
-  within seconds whether the endpoints answer and whether all ten symbols are
-  listed as tradable perpetuals.
+  startup**. Point it at the real venue and `main.py diagnose` tells you within
+  seconds whether the endpoints answer and whether all ten symbols are listed as
+  tradable perpetuals.
 * Because the docs were unreachable at build time, the configured URLs could not
-  be re-checked against the current official documentation. **Check them.** They
-  are three lines in `config.yaml`.
+  be re-checked against current official documentation. **Check them.** They are
+  a table in `aurum/venues.py`, overridable per field in `config.yaml`.
 
 ```bash
 python3 main.py diagnose   # the first thing to run on a machine with real network
@@ -102,10 +108,10 @@ curl -s http://127.0.0.1:8002/diagnostics | python3 -m json.tool
 ## What it actually does
 
 ```
-Binance USD-M public streams
+Bybit V5 / Binance USD-M public streams
         │
         ▼
-   adapter ──► bounded queue ──► order books (U/u/pu validated, auto-resync)
+   adapter ──► bounded queue ──► order books (sequence-validated, auto-resync)
                                         │
                                         ▼
                               data-quality gate ──────────┐
@@ -317,6 +323,50 @@ correct.
 * The synthetic replay generator is a **test fixture**, not a market. It lives
   outside the `aurum` package, nothing in the runtime imports it, and production
   refuses to read its output.
+
+---
+
+## Venues
+
+```yaml
+market:
+  venue: bybit_linear     # bybit_linear_testnet | binance_usdm | binance_usdm_testnet
+  rest_base: ""           # empty = use the venue's defaults
+  ws_base: ""
+```
+
+Leaving the endpoint fields empty is deliberate: they are filled from the
+selected venue's table in `aurum/venues.py`. That is what stops the mistake this
+system most needs to prevent — switching `venue` while the old venue's hosts sit
+in the config, producing a 404 you have to go hunting for. Set any field
+explicitly and it wins.
+
+Bybit's public API differs from Binance's in four ways that each needed real
+handling rather than a rename, and each is asserted in `tests/test_bybit.py`:
+
+| | Binance USD-M | Bybit V5 |
+|---|---|---|
+| Order-book snapshot | pulled over REST, spliced onto the diff stream | pushed on the socket as `type: "snapshot"` |
+| Sequencing | three fields, `U` / `u` / `pu` | one counter `u`, +1 per delta (`u == 1` means restart) |
+| Heartbeat | protocol ping frames, answered by the library | application-level `{"op":"ping"}` we must send |
+| Trade side | `m` = "buyer is the maker", must be inverted | `S` = the taker's side, stated directly |
+
+The last one is the dangerous one: getting it backwards inverts every order-flow
+feature while leaving all of them plausible. A test asserts the two venues agree
+on the aggressor for the same economic event.
+
+One more Bybit quirk it handles: for linear contracts the `tickers` topic is a
+*delta* stream, so a push carries only what changed. Reading one as complete
+would blank mark price and funding every time the best bid alone moved.
+
+The WebSocket book depth is chosen automatically as the smallest Bybit offers
+that covers `depth_levels` — depth 50 pushes every 20 ms while depth 200 pushes
+every 100 ms, so taking the deeper book "to be safe" would make it five times
+staler for no benefit.
+
+**No API keys.** Neither adapter has a private endpoint, a signing routine or an
+order path, and the selftest greps both for `api_key`, `hmac`, `X-BAPI-SIGN` and
+order URLs on every run.
 
 ---
 

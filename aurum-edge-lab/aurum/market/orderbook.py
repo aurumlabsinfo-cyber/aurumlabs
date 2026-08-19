@@ -47,6 +47,8 @@ class BookStats:
     updates_dropped_old: int = 0
     sequence_gaps: int = 0
     resyncs: int = 0
+    refreshes: int = 0
+    refresh_rollbacks: int = 0
     snapshots_applied: int = 0
     crossed_events: int = 0
     last_gap_detail: str = ""
@@ -58,6 +60,8 @@ class BookStats:
             "updates_dropped_old": self.updates_dropped_old,
             "sequence_gaps": self.sequence_gaps,
             "resyncs": self.resyncs,
+            "refreshes": self.refreshes,
+            "refresh_rollbacks": self.refresh_rollbacks,
             "snapshots_applied": self.snapshots_applied,
             "crossed_events": self.crossed_events,
             "last_gap_detail": self.last_gap_detail,
@@ -314,6 +318,66 @@ class OrderBook:
     def _bump_version(self) -> None:
         self._version += 1
         self._cached_view = None
+
+    def refresh_from(self, snapshot: DepthSnapshot) -> bool:
+        """Re-verify a healthy book against a fresh snapshot, safely.
+
+        A periodic refresh exists to catch drift, and it must never be able to
+        *cause* any. The snapshot can easily arrive too old to join: the diff
+        stream keeps moving during the REST round trip, and a venue under load
+        can answer with a book from before the diffs already buffered here.
+        Applying it blindly would tear down a book that was correct and leave it
+        desynced — the refresh doing exactly the damage it was added to prevent.
+
+        So the whole state is saved first and restored on failure. A refresh is
+        either an improvement or a no-op, and the rollback is counted.
+
+        The subtle case is a snapshot that is *behind* the book rather than
+        ahead of it — a REST node lagging the stream.  ``apply_snapshot`` calls
+        that a success, and correctly so: with nothing buffered there is no
+        evidence of a hole, so the book it builds is internally consistent.  It
+        is just consistent with the past.  The next diff then has to join a
+        ``lastUpdateId`` the stream left behind long ago, fails, and desyncs a
+        book that was correct.  A refresh may only ever move the book forward.
+        """
+        if snapshot.last_update_id < self.last_update_id:
+            self.stats.refreshes += 1
+            self.stats.refresh_rollbacks += 1
+            self.stats.last_gap_detail = (
+                f"refresh snapshot lastUpdateId={snapshot.last_update_id} is behind the book "
+                f"at {self.last_update_id}; kept the book"
+            )
+            return False
+
+        saved = (
+            dict(self._bids),
+            dict(self._asks),
+            self.last_update_id,
+            self.state,
+            self._awaiting_join,
+            list(self._buffer),
+            self.snapshot_ts_ms,
+            self.ts_ms,
+            self.recv_ms,
+        )
+        self.stats.refreshes += 1
+        if self.apply_snapshot(snapshot) and self.ready:
+            return True
+
+        (
+            self._bids,
+            self._asks,
+            self.last_update_id,
+            self.state,
+            self._awaiting_join,
+            self._buffer,
+            self.snapshot_ts_ms,
+            self.ts_ms,
+            self.recv_ms,
+        ) = saved
+        self.stats.refresh_rollbacks += 1
+        self._bump_version()
+        return False
 
     def mark_desynced(self, reason: str = "") -> None:
         self.state = BookState.DESYNCED

@@ -24,20 +24,27 @@ api:
   ws_broadcast_interval_ms: 500
 
 market:
-  venue: binance_usdm
-  # live   = public Binance USD-M Futures WebSocket market streams
+  # bybit_linear | bybit_linear_testnet | binance_usdm | binance_usdm_testnet
+  venue: bybit_linear
+
+  # live   = the venue's public WebSocket market streams
   # replay = deterministic file replay, refused when app.env=production
   feed: live
 
-  # Endpoint routing is configuration, never a hard-coded constant: Binance has
-  # changed WebSocket routing before and the blueprint requires that endpoints
-  # be checked against the current official documentation at build time.
-  rest_base: https://fapi.binance.com
-  ws_base: wss://fstream.binance.com
-  ws_path: /stream
-  rest_depth_path: /fapi/v1/depth
-  rest_exchange_info_path: /fapi/v1/exchangeInfo
-  rest_time_path: /fapi/v1/time
+  # Endpoint routing is configuration, never a hard-coded constant: both venues
+  # have changed routing before. Leave these EMPTY to use the selected venue's
+  # defaults from aurum/venues.py — that is what stops a Bybit run from
+  # silently keeping Binance's hosts. Set one to override it.
+  #
+  # Verify them against the venue's current documentation before a live run:
+  #   python3 main.py diagnose
+  rest_base: ""
+  ws_base: ""
+  ws_path: ""
+  rest_depth_path: ""
+  rest_exchange_info_path: ""
+  rest_time_path: ""
+  category: ""                 # Bybit requires one ("linear"); Binance does not
 
   symbols:
     - {symbol: BTCUSDT,  tier: CORE,    role: Market anchor, use: Microstructure + cross-market leader}
@@ -52,8 +59,10 @@ market:
     - {symbol: TRXUSDT,  tier: DYNAMIC, role: Alt,           use: Diversification / lag study}
 
   depth_levels: 20             # levels kept in the local book view
-  depth_stream_speed: 100ms    # 100ms | 250ms | 500ms
-  snapshot_limit: 1000         # REST depth snapshot size used to seed the book
+  depth_stream_speed: 100ms    # Binance only: 100ms | 250ms | 500ms
+  # REST snapshot size used to re-seed a book. Clamped to what the venue allows
+  # (Bybit 500, Binance 1000).
+  snapshot_limit: 500
   streams: [depth, aggTrade, bookTicker, markPrice]
 
   queue_size: 20000            # bounded ingest queue (backpressure, never blocks the socket)

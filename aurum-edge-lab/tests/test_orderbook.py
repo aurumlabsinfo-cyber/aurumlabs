@@ -179,6 +179,49 @@ def test_update_from_event_reads_the_futures_sequence_fields() -> None:
     assert update.bids == [(1.0, 2.0)]
 
 
+def test_refresh_keeps_a_healthy_book_when_the_snapshot_lags_the_stream() -> None:
+    """A REST snapshot from behind the stream must not be allowed to win.
+
+    ``apply_snapshot`` calls a behind snapshot a success, and it is right to:
+    with nothing buffered there is no evidence of a hole, so the book it builds
+    is internally consistent — with the past. The book's ``lastUpdateId`` walks
+    backwards, the next diff cannot join it, and a book that was correct goes
+    DESYNCED. The refresh must decline instead, and keep what it had.
+    """
+    book = OrderBook("BTCUSDT")
+    assert book.apply_snapshot(snapshot(100)) is True
+    assert book.apply_update(diff(101, 500, 100, bids=[(60000.0, 9.0)])) is True
+    assert book.last_update_id == 500
+
+    assert book.refresh_from(snapshot(180)) is False
+    assert book.state is BookState.READY
+    assert book.last_update_id == 500
+    assert book.top(1).bids[0].qty == 9.0, "the lagging snapshot overwrote live levels"
+    assert book.stats.refreshes == 1
+    assert book.stats.refresh_rollbacks == 1
+
+    # And the stream carries on unbroken, which is the whole point.
+    assert book.apply_update(diff(501, 505, 500)) is True
+    assert book.state is BookState.READY
+    assert book.stats.sequence_gaps == 0
+
+
+def test_refresh_that_moves_the_book_forward_is_accepted() -> None:
+    book = OrderBook("BTCUSDT")
+    assert book.apply_snapshot(snapshot(100)) is True
+    assert book.apply_update(diff(101, 200, 100)) is True
+
+    fresh = snapshot(260)
+    assert book.refresh_from(fresh) is True
+    assert book.last_update_id == 260
+    assert book.state is BookState.READY
+    assert book.stats.refreshes == 1
+    assert book.stats.refresh_rollbacks == 0
+    # The refreshed book rejoins the stream on the documented rule.
+    assert book.apply_update(diff(261, 265, 260)) is True
+    assert book.stats.sequence_gaps == 0
+
+
 def test_buffer_is_bounded() -> None:
     book = OrderBook("BTCUSDT")
     for i in range(OrderBook.MAX_BUFFER + 500):

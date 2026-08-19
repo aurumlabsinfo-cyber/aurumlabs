@@ -157,7 +157,23 @@ class ReplayFeed(MarketFeed):
     # ------------------------------------------------------------------ REST
 
     async def fetch_depth_snapshot(self, symbol: str, limit: int = 1000) -> DepthSnapshot:
-        snaps = self._snapshots.get(symbol.upper())
+        """Answer as the venue would: the book *as of the replay cursor*.
+
+        A REST snapshot is always current — never a book from ten minutes ago.
+        The file's stored snapshots are periodic, so the newest one at or before
+        the cursor is only a starting point; handing it back raw would answer a
+        request made at cursor time with a book the diff stream has long since
+        moved past.  The engine is right to refuse such a snapshot (it would
+        walk ``lastUpdateId`` backwards and break the join on the next diff), so
+        an un-rolled replay could never refresh at all: snapshots would age out
+        and the quality gate would block a book that is provably in sync.
+
+        Rolling the stored snapshot forward over the diffs up to the cursor
+        costs one pass over at most one snapshot interval and makes the replay
+        answer the same shape of question a venue does.
+        """
+        key = symbol.upper()
+        snaps = self._snapshots.get(key)
         if not snaps:
             raise LookupError(f"replay file has no snapshot for {symbol}")
         chosen = snaps[0]
@@ -167,14 +183,41 @@ class ReplayFeed(MarketFeed):
             else:
                 break
         payload = chosen["payload"]
+        base_ts = int(chosen.get("ts_ms", 0))
+        bids = {float(p): float(q) for p, q in payload.get("bids", ()) if float(q) > 0}
+        asks = {float(p): float(q) for p, q in payload.get("asks", ()) if float(q) > 0}
+        last_id = int(payload["lastUpdateId"])
+        snap_ts = base_ts
+
+        for record in self._records:
+            ts_ms = int(record.get("ts_ms", 0))
+            if ts_ms > self.cursor_ts_ms:
+                break
+            if ts_ms < base_ts or record.get("kind") != "depth" or record.get("symbol") != key:
+                continue
+            diff = record.get("payload", {})
+            if int(diff.get("u", 0)) <= last_id:
+                continue
+            for levels, book in ((diff.get("b", ()), bids), (diff.get("a", ()), asks)):
+                for raw_price, raw_qty in levels:
+                    price, qty = float(raw_price), float(raw_qty)
+                    if qty > 0:
+                        book[price] = qty
+                    else:
+                        book.pop(price, None)
+            last_id = int(diff["u"])
+            snap_ts = ts_ms
+
         now = int(time.time() * 1000)
+        top_bids = sorted(bids.items(), key=lambda kv: -kv[0])[:limit]
+        top_asks = sorted(asks.items())[:limit]
         return DepthSnapshot(
-            symbol=symbol.upper(),
-            last_update_id=int(payload["lastUpdateId"]),
-            ts_ms=int(chosen.get("ts_ms", now)),
+            symbol=key,
+            last_update_id=last_id,
+            ts_ms=snap_ts or now,
             recv_ms=now,
-            bids=[(float(p), float(q)) for p, q in payload.get("bids", ())],
-            asks=[(float(p), float(q)) for p, q in payload.get("asks", ())],
+            bids=top_bids,
+            asks=top_asks,
         )
 
     async def sync_time(self) -> int | None:
