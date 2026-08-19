@@ -16,7 +16,7 @@ import asyncio
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque
+from typing import Any, Callable, Deque
 
 from ..adapters.base import MarketFeed
 from ..bus import TOPIC_BOOK, TOPIC_MARKET_EVENT, TOPIC_TRADE, EventBus
@@ -124,6 +124,14 @@ class DataEngine:
         self.endpoint_check: dict[str, Any] = {"checked": False}
         self.processed = 0
         self.persist_sample = 0
+        #: Newest venue timestamp seen on any symbol. Under a live feed this
+        #: tracks wall time; under replay it is the only clock that means
+        #: anything, which is why downstream sampling reads it and not ``now``.
+        self.data_time_ms = 0
+        #: Optional per-event hook, used by the feature engine in replay mode so
+        #: sampling follows the data instead of the wall clock. Left unset in
+        #: live mode: nothing that can block belongs on the ingest path.
+        self.on_tick: Callable[[int], None] | None = None
 
         feed.on_event(self._on_feed_event)
         feed.on_state_change(self._on_feed_state)
@@ -196,6 +204,8 @@ class DataEngine:
             for event in batch:
                 try:
                     self._process(event, persist_events)
+                    if self.on_tick is not None:
+                        self.on_tick(self.data_time_ms)
                 except Exception as exc:  # noqa: BLE001 - one bad frame must not kill ingestion
                     log.exception("event processing failed", extra={"symbol": event.symbol})
                     self.repos.system.log(
@@ -207,6 +217,8 @@ class DataEngine:
         if state is None:
             return
         self.processed += 1
+        if event.ts_ms > self.data_time_ms:
+            self.data_time_ms = event.ts_ms
         state.quality.record_event(event.ts_ms, event.recv_ms)
         state.latency.record(event.latency_ms)
 
