@@ -265,6 +265,14 @@ class CrossMarketEngine:
         rows.sort(key=lambda r: abs(r.get(by, 0.0) or 0.0), reverse=True)
         return rows[:limit]
 
+    def ranked_relations(self, limit: int = 20) -> list[PairRelation]:
+        """The relations themselves, strongest first — what the cross-crypto
+        agent proposes from."""
+        relations = sorted(
+            self.state.relations.values(), key=lambda r: r.predictive_score, reverse=True
+        )
+        return relations[:limit]
+
     def tradable_relations(self, min_net_edge_bps: float = 0.0) -> list[PairRelation]:
         return [
             relation
