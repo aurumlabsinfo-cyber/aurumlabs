@@ -59,6 +59,9 @@ const REQUIRED_STATE_PATHS = [
   "risk.kill_switch",
   "model.champion",
   "model.shadow",
+  "model.champion_state",
+  "model.size_multiplier",
+  "regimes",
   "model.learning",
   "model.events",
   "execution.entries_blocked",
@@ -292,8 +295,15 @@ function renderTrades(d) {
 function renderModel(d) {
   const m = d.model;
   const learning = m.learning || {};
+  const stateLabel = {
+    normal: "normal",
+    reduced: "REDUCED - the champion is underperforming, entries are half size",
+    suspended: "SUSPENDED - the champion is losing, new entries are stopped",
+  }[m.champion_state] || m.champion_state;
   el("model").innerHTML = kv({
     champion: m.champion,
+    "champion state": stateLabel,
+    "entry size": `${(Number(m.size_multiplier) * 100).toFixed(0)}%`,
     shadow: m.shadow || "none",
     "learning status": learning.status || "idle",
     detail: learning.detail || "",
@@ -306,6 +316,18 @@ function renderModel(d) {
     m.events || [],
     (e) => `<td>${timeOf(e.ts_ms)}</td><td>${e.version}</td><td>${e.event}</td>`,
     "no model events yet"
+  );
+  fillTable(
+    "regimes",
+    d.regimes || [],
+    (r) => `
+      <td>${r.regime}</td>
+      <td>${r.trades}</td>
+      <td>${pct(r.win_rate)}</td>
+      <td class="${signClass(r.expectancy_eur)}">${money(r.expectancy_eur, 3)}</td>
+      <td class="${signClass(r.net_pnl_eur)}">${money(r.net_pnl_eur, 2)}</td>
+      <td>${fmt(r.avg_hold_s, 1)}s</td>`,
+    "not enough closed trades to break down by regime"
   );
 }
 

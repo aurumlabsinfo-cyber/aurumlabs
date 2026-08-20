@@ -103,6 +103,7 @@ class Engine:
 
         self.champion: Model = champion_v1()
         self.shadow: Model | None = None
+        self.champion_state = "normal"          # normal | reduced | suspended
         self.running = False
         self.started_at = 0.0
         self.cycles = 0
@@ -115,6 +116,7 @@ class Engine:
         self.last_decisions: list[dict[str, Any]] = []
         self.last_reject_flush = 0.0
         self.last_equity_write = 0.0
+        self.last_champion_review = 0.0
         self.last_decision_log: dict[str, float] = {}
         self.learning_status: dict[str, Any] = {"status": "idle", "detail": "not run yet"}
         self._tasks: list[asyncio.Task[None]] = []
@@ -380,6 +382,9 @@ class Engine:
                 if now - self.last_equity_write >= 5.0:
                     self._write_equity()
                     self.last_equity_write = now
+                if now - self.last_champion_review >= 30.0:
+                    self._review_champion()
+                    self.last_champion_review = now
                 await self._periodic_reconcile(now)
             except asyncio.CancelledError:
                 raise
@@ -394,6 +399,56 @@ class Engine:
         if now_mono - last >= interval:
             self._last_reconcile_mono = now_mono
             await self.reconciler.reconcile("periodic")
+
+    def _review_champion(self) -> None:
+        """A Champion that stops paying trades smaller, then not at all.
+
+        No new entries does not mean idle: the learning pipeline keeps running on
+        the data already collected, which is how a better challenger is found.
+        Normal size returns when a promotion or a rollback changes the champion.
+        """
+        cfg = self.cfg.learn
+        trades = self.repo.recent_trades_for_model(
+            self.champion.version, cfg.degrade_window_trades
+        )
+        if len(trades) < cfg.degrade_window_trades:
+            return
+        stats = compute_stats(trades)
+        previous = self.champion_state
+
+        if stats.expectancy_eur <= cfg.suspend_expectancy_eur:
+            state = "suspended"
+        elif stats.expectancy_eur <= cfg.degrade_expectancy_eur:
+            state = "reduced"
+        else:
+            state = "normal"
+
+        if state == previous:
+            return
+        self.champion_state = state
+        detail = (
+            f"expectancy {stats.expectancy_eur:+.3f} EUR over the last "
+            f"{len(trades)} trades (WR {stats.win_rate:.0%}, "
+            f"net {stats.net_pnl_eur:+.2f} EUR)"
+        )
+        if state == "suspended":
+            self.risk.size_multiplier = cfg.degraded_size_multiplier
+            self.execution.block_entries(f"champion underperforming: {detail}")
+            log.warning("champion SUSPENDED: %s", detail)
+        elif state == "reduced":
+            self.risk.size_multiplier = cfg.degraded_size_multiplier
+            if previous == "suspended":
+                self.execution.allow_entries()
+            log.warning("champion size reduced: %s", detail)
+        else:
+            self.risk.size_multiplier = 1.0
+            if previous == "suspended":
+                self.execution.allow_entries()
+            log.info("champion back to full size: %s", detail)
+        self.repo.log_model_event(
+            self.champion.version, f"champion_{state}",
+            {"detail": detail, "stats": stats.to_dict()},
+        )
 
     def _flush_rejects(self) -> None:
         if not self.reject_window:
@@ -438,6 +493,10 @@ class Engine:
         if promoted is not None:
             self.champion = promoted
             self._load_shadow()
+            # a fresh champion starts at full size with a clean slate
+            self.champion_state = "normal"
+            self.risk.size_multiplier = 1.0
+            self.execution.allow_entries()
         self.learning_status["promotion"] = detail
         return self.learning_status
 
@@ -487,6 +546,7 @@ class Engine:
             "no_trade_reasons": no_trade,
             "reject_summary": self.repo.reject_summary(),
             "stats": stats.to_dict(),
+            "regimes": self.repo.regime_breakdown(),
             "trades": self.repo.trades(limit=25),
             "execution": self.execution.health(),
             "model": {
@@ -494,6 +554,8 @@ class Engine:
                 "champion_kind": self.champion.kind,
                 "champion_metrics": self.champion.metrics,
                 "shadow": self.shadow.version if self.shadow else None,
+                "champion_state": self.champion_state,
+                "size_multiplier": self.risk.size_multiplier,
                 "learning": self.learning_status,
                 "versions": self.repo.model_versions()[:10],
                 "events": self.repo.model_events(10),

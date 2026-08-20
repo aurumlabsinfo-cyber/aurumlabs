@@ -206,6 +206,13 @@ class LearnConfig:
     learning_rate: float = 0.08
     epochs: int = 220
 
+    # When the Champion stops paying, new entries shrink and then stop, and the
+    # pipeline is left to look for a better challenger.
+    degrade_window_trades: int = 25
+    degrade_expectancy_eur: float = 0.0       # below this: half size
+    suspend_expectancy_eur: float = -0.25     # below this: no new entries
+    degraded_size_multiplier: float = 0.5
+
 
 @dataclass(frozen=True)
 class ApiConfig:

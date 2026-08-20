@@ -202,6 +202,25 @@ dati storici -> purged walk-forward -> holdout intatto -> shadow -> paper
 * La promozione richiede in più evidenza **live in shadow**: almeno N decisioni
   ombra con expectancy superiore a quella del champion sulle stesse condizioni.
 
+**Se il Champion perde performance**, il sistema non aspetta il limite di perdita
+giornaliero. Ogni 30 secondi rivaluta l'expectancy sulle ultime 25 operazioni di
+quella versione:
+
+| expectancy recente | conseguenza |
+|---|---|
+| positiva | size piena |
+| ≤ 0 | **size dimezzata** (anche la soglia di expectancy scala, altrimento "metà size" diventerebbe "nessun trade") |
+| ≤ −0,25 € | **nuove entrate sospese** |
+
+Le posizioni aperte restano gestite, la pipeline continua a girare sui dati già
+raccolti, e la size piena torna da sola quando i numeri tornano — o subito, se un
+challenger viene promosso. Ogni passaggio è registrato in `model_events` e
+visibile in dashboard.
+
+Le performance sono studiate **per simbolo** (`symbol_stats`, in `/api/stats`) e
+**per regime di volatilità** (calmo / normale / veloce / selvaggio, misurato sulla
+volatilità del simbolo stesso all'entrata, in `/api/state` e in dashboard).
+
 ### Strategia Champion iniziale
 
 `champion-1.0.0-momentum-of`: momentum + order-flow continuation, scritta a mano
@@ -250,7 +269,7 @@ feed che non sia Bybit reale.
 
 ## Cosa dimostrano i test
 
-`python -m pytest` — 118 test offline, ~100 s, nessuna rete.
+`python -m pytest` — 120 test offline, ~100 s, nessuna rete.
 
 | affermazione | dove |
 |---|---|
@@ -269,6 +288,7 @@ feed che non sia Bybit reale.
 | il database registra tutto e non perde righe in silenzio | `test_storage.py`, `test_end_to_end.py` |
 | il learning crea Challenger senza toccare il Champion | `test_learning.py` |
 | un WR più alto da solo non promuove | `test_learning.py` |
+| un Champion che perde riduce e poi sospende le entrate, e si riprende da solo | `test_learning.py` |
 | il frontend mostra esattamente lo stato del backend | `test_api_and_frontend.py` |
 | la dashboard rende davvero, in Chromium | `test_dashboard_browser.py` |
 | una dashboard senza backend si oscura e lo dichiara | `test_dashboard_browser.py` |

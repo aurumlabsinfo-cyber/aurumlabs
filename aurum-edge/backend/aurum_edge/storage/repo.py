@@ -278,6 +278,58 @@ class Repo:
     def symbol_stats(self) -> list[dict[str, Any]]:
         return self.db.query("SELECT * FROM symbol_stats ORDER BY net_eur DESC")
 
+    def recent_trades_for_model(self, version: str, limit: int) -> list[dict[str, Any]]:
+        """The newest closed trades taken by one model version, across runs."""
+        return self.db.query(
+            "SELECT * FROM trades WHERE model_version=? ORDER BY exit_ts DESC LIMIT ?",
+            (version, limit),
+        )
+
+    def regime_breakdown(self, limit: int = 5_000) -> list[dict[str, Any]]:
+        """Performance by volatility regime, read off the entry snapshot.
+
+        The bucket is the symbol's own volatility at entry, so "calm" and "wild"
+        mean the same thing across a cheap altcoin and BTC.
+        """
+        rows = self.db.query(
+            "SELECT volatility, side, hold_s, net_pnl_eur, fees_eur, slippage_eur, "
+            "gross_pnl_eur FROM ("
+            "  SELECT t.*, json_extract(s.data_json, '$.volatility_bps') AS volatility "
+            "  FROM trades t LEFT JOIN snapshots s ON s.id = t.snapshot_id "
+            "  ORDER BY t.exit_ts DESC LIMIT ?"
+            ")",
+            (limit,),
+        )
+        buckets: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            volatility = row["volatility"]
+            if volatility is None:
+                name = "unknown"
+            elif volatility < 5:
+                name = "calm (<5bps)"
+            elif volatility < 12:
+                name = "normal (5-12bps)"
+            elif volatility < 25:
+                name = "fast (12-25bps)"
+            else:
+                name = "wild (>25bps)"
+            buckets.setdefault(name, []).append(row)
+
+        out = []
+        for name, group in buckets.items():
+            stats = compute_stats(
+                [{**r, "entry_ts": 0.0, "exit_ts": r["hold_s"] * 1000.0} for r in group]
+            )
+            out.append({
+                "regime": name,
+                "trades": stats.trades,
+                "win_rate": round(stats.win_rate, 4),
+                "expectancy_eur": round(stats.expectancy_eur, 4),
+                "net_pnl_eur": round(stats.net_pnl_eur, 4),
+                "avg_hold_s": round(stats.avg_hold_s, 2),
+            })
+        return sorted(out, key=lambda r: -r["trades"])
+
     def slippage_bps_for(self, symbol: str, default: float) -> float:
         row = self.db.query_one(
             "SELECT slippage_bps_mean, trades FROM symbol_stats WHERE symbol=?", (symbol,)

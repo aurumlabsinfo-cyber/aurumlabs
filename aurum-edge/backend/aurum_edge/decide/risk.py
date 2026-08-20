@@ -77,6 +77,8 @@ class RiskEngine:
         self.day_key: str = time.strftime("%Y-%m-%d")
         self.realized_today_eur: float = 0.0
         self.cooldowns: dict[str, float] = {}
+        # Shrunk when the champion stops paying; 1.0 is normal size.
+        self.size_multiplier: float = 1.0
 
     # ---------------------------------------------------------------- switches
     def engage_kill_switch(self, reason: str) -> None:
@@ -176,14 +178,24 @@ class RiskEngine:
         reasons: list[str] = []
 
         free = account.free_after_reserve(cfg.reserve_fraction)
-        # Quality scales the margin inside the configured band, nothing else does.
+        # Quality scales the margin inside the configured band; the multiplier
+        # shrinks the whole band when the champion is underperforming, floor
+        # included - otherwise "half size" would just mean "no trade".
+        scale = clamp(self.size_multiplier, 0.0, 1.0)
         band = cfg.margin_max_eur - cfg.margin_min_eur
-        margin = cfg.margin_min_eur + band * clamp((quality - cfg.min_quality) / 0.35, 0.0, 1.0)
+        floor = cfg.margin_min_eur * scale
+        margin = (
+            cfg.margin_min_eur + band * clamp((quality - cfg.min_quality) / 0.35, 0.0, 1.0)
+        ) * scale
         margin = min(margin, free, cfg.margin_max_eur)
-        if margin < cfg.margin_min_eur:
+        if margin < floor or margin <= 0:
             return Sizing(False, reasons=[
-                f"margin available {margin:.2f} EUR < minimum {cfg.margin_min_eur:.2f} EUR"
+                f"margin available {margin:.2f} EUR < minimum {floor:.2f} EUR"
             ])
+        if scale < 1.0:
+            reasons.append(
+                f"size reduced to {scale:.0%}: the champion is underperforming"
+            )
 
         leverage = min(cfg.leverage_default, max_leverage, cfg.leverage_max)
 
@@ -261,6 +273,7 @@ class RiskEngine:
             "kill_reason": reason,
             "realized_today_eur": round(self.realized_today_eur, 4),
             "daily_max_loss_eur": self.cfg.decide.daily_max_loss_eur,
+            "size_multiplier": round(self.size_multiplier, 3),
             "day": self.day_key,
             "cooldowns": {
                 symbol: round(until, 1) for symbol, until in self.cooldowns.items()

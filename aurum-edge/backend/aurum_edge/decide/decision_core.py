@@ -270,9 +270,12 @@ class DecisionCore:
                 f"worst case {loss_eur:.2f} EUR exceeds the {cfg.max_loss_per_trade_eur:.2f} EUR cap"
             )
         expectancy = probability * target_eur - (1.0 - probability) * loss_eur
-        if expectancy < cfg.min_expectancy_eur:
+        # The floor is an absolute amount at full size, so it has to follow the
+        # ticket down: otherwise "half size" quietly becomes "no trades at all".
+        min_expectancy = cfg.min_expectancy_eur * clamp(self.risk.size_multiplier, 0.1, 1.0)
+        if expectancy < min_expectancy:
             blockers.append(
-                f"expectancy {expectancy:.3f} EUR < {cfg.min_expectancy_eur:.3f} EUR minimum "
+                f"expectancy {expectancy:.3f} EUR < {min_expectancy:.3f} EUR minimum "
                 f"(p={probability:.3f}, win={target_eur:.2f}, loss={loss_eur:.2f})"
             )
 

@@ -287,3 +287,87 @@ def test_model_round_trips_through_the_database(repo: Repo) -> None:
     assert loaded.version == champion.version
     assert loaded.weights == champion.weights
     assert loaded.bias == champion.bias
+
+
+# ------------------------------------------------- champion under pressure
+
+def _closed_trade(repo: Repo, version: str, net: float, i: int) -> None:
+    repo.db.insert("trades", {
+        "run_id": repo.db.run_id, "position_key": f"k{i}", "symbol": "BTCUSDT",
+        "side": "LONG", "decision_id": None, "snapshot_id": None,
+        "model_version": version, "mode": "paper",
+        "entry_ts": 1e6 + i * 1000, "exit_ts": 1e6 + i * 1000 + 500, "hold_s": 0.5,
+        "entry_price": 100.0, "exit_price": 100.0 + net, "entry_ref_price": 100.0,
+        "exit_ref_price": 100.0 + net, "qty": 1.0, "notional_eur": 500.0,
+        "leverage": 10.0, "margin_eur": 50.0, "expected_cost_eur": 0.5,
+        "entry_fee_eur": 0.25, "exit_fee_eur": 0.25, "fees_eur": 0.5,
+        "slippage_entry_bps": 1.0, "slippage_exit_bps": 1.0, "slippage_eur": 0.1,
+        "gross_pnl_eur": net + 0.6, "net_pnl_eur": net, "mfe_eur": max(net, 0),
+        "mae_eur": min(net, 0), "entry_reason": "test", "exit_reason": "TARGET",
+        "prediction_json": "{}", "evolution_json": "[]", "features_json": "{}",
+        "label": 1 if net > 0 else 0,
+    })
+
+
+async def test_a_losing_champion_shrinks_then_stops_entries(cfg: Config, repo: Repo) -> None:
+    """'Se il Champion perde performance, riduci o sospendi nuove entrate.'"""
+    from aurum_edge.engine import Engine
+    from aurum_edge.execute.broker import PaperBroker
+    from aurum_edge.simulator import SimulatedMarketCore
+    from aurum_edge.util.clock import Clock
+
+    small = dataclasses.replace(
+        cfg, learn=dataclasses.replace(cfg.learn, degrade_window_trades=10)
+    )
+    clock = Clock()
+    engine = Engine(
+        small, clock, market=SimulatedMarketCore(small, clock, symbols=3),
+        broker=PaperBroker(small, clock), db=repo.db,
+    )
+    engine.repo = repo
+    version = engine.champion.version
+
+    # a champion that is merely flat: half size, entries still allowed
+    for i in range(10):
+        _closed_trade(repo, version, net=-0.05, i=i)
+    engine._review_champion()
+    assert engine.champion_state == "reduced"
+    assert engine.risk.size_multiplier == small.learn.degraded_size_multiplier
+    assert engine.execution.entries_blocked is False
+
+    # a champion that is actually losing money: no new entries
+    for i in range(10, 20):
+        _closed_trade(repo, version, net=-1.0, i=i)
+    engine._review_champion()
+    assert engine.champion_state == "suspended"
+    assert engine.execution.entries_blocked is True
+    assert "underperforming" in engine.execution.entries_blocked_reason
+
+    # and it recovers on its own when the numbers do
+    for i in range(20, 40):
+        _closed_trade(repo, version, net=2.0, i=i)
+    engine._review_champion()
+    assert engine.champion_state == "normal"
+    assert engine.risk.size_multiplier == 1.0
+    assert engine.execution.entries_blocked is False
+
+    events = {e["event"] for e in repo.model_events()}
+    assert {"champion_reduced", "champion_suspended", "champion_normal"} <= events
+
+
+def test_reduced_size_still_produces_a_trade(cfg: Config) -> None:
+    """Half size must mean a smaller ticket, not a silent NO TRADE."""
+    from aurum_edge.decide.decision_core import DecisionCore
+    from aurum_edge.decide.risk import RiskEngine
+
+    from .test_decision import make_snapshot, opportunity, rich_account
+
+    risk = RiskEngine(cfg)
+    core = DecisionCore(cfg, risk)
+    full = core.evaluate(opportunity(make_snapshot()), champion_v1(), rich_account(), 100.0)
+    risk.size_multiplier = 0.5
+    half = core.evaluate(opportunity(make_snapshot()), champion_v1(), rich_account(), 100.0)
+
+    assert full.is_trade and half.is_trade
+    assert half.margin_eur < full.margin_eur
+    assert any("size reduced" in reason for reason in half.reasons)
