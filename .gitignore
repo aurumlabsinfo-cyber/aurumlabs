@@ -58,3 +58,9 @@ aurum.db
 aurum.db-wal
 aurum.db-shm
 *.db
+
+# AURUM EDGE: the canonical database never belongs in git
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+.pytest_cache/

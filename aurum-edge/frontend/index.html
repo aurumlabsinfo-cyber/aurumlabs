@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AURUM EDGE 1.0</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b0e13'/%3E%3Ctext x='16' y='23' font-family='monospace' font-size='20' font-weight='bold' fill='%23d4af37' text-anchor='middle'%3EA%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">AURUM<span class="accent">EDGE</span></span>
+    <span class="version" id="version">1.0.0</span>
+  </div>
+  <div class="badges">
+    <span class="badge" id="mode-badge">MODE</span>
+    <span class="badge" id="feed-badge">FEED</span>
+    <span class="badge" id="state-badge">STATE</span>
+    <span class="badge" id="link-badge">BACKEND</span>
+  </div>
+  <div class="actions">
+    <label class="endpoint">
+      backend
+      <input id="endpoint" type="text" spellcheck="false" autocomplete="off">
+    </label>
+    <button id="btn-reconnect" class="btn">reconnect</button>
+    <button id="btn-flatten" class="btn warn">flatten</button>
+    <button id="btn-kill" class="btn danger">kill switch</button>
+  </div>
+</header>
+
+<div id="banner" class="banner hidden"></div>
+
+<main>
+  <section class="grid grid-kpi" id="kpis"></section>
+
+  <section class="panel">
+    <h2>Health <small id="health-summary"></small></h2>
+    <div class="components" id="components"></div>
+    <div class="blocking hidden" id="blocking"></div>
+  </section>
+
+  <div class="columns">
+    <section class="panel">
+      <h2>Open positions <small id="positions-count"></small></h2>
+      <div class="table-wrap">
+        <table id="positions">
+          <thead><tr>
+            <th>symbol</th><th>side</th><th>qty</th><th>entry</th><th>mark</th>
+            <th>lev</th><th>margin</th><th>unreal.</th><th>target</th><th>age</th><th>state</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Best opportunities <small id="opps-count"></small></h2>
+      <div class="table-wrap">
+        <table id="opportunities">
+          <thead><tr>
+            <th>symbol</th><th>side</th><th>score</th><th>1s</th><th>5s</th>
+            <th>OFI</th><th>imb</th><th>aggr</th><th>vol x</th><th>spread</th><th>quality</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <div class="columns">
+    <section class="panel">
+      <h2>Why not trading <small id="reasons-count"></small></h2>
+      <div class="table-wrap">
+        <table id="reasons">
+          <thead><tr><th>symbol</th><th>side</th><th>p</th><th>need</th><th>expect</th><th>reason</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <h3>Rejections, last 15 minutes</h3>
+      <div class="table-wrap short">
+        <table id="rejects">
+          <thead><tr><th>count</th><th>reason</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Trades <small id="trades-count"></small></h2>
+      <div class="table-wrap">
+        <table id="trades">
+          <thead><tr>
+            <th>closed</th><th>symbol</th><th>side</th><th>hold</th><th>gross</th>
+            <th>fees</th><th>slip</th><th>net</th><th>exit</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <div class="columns">
+    <section class="panel">
+      <h2>Model &amp; learning</h2>
+      <div class="kv" id="model"></div>
+      <div class="table-wrap short">
+        <table id="model-events">
+          <thead><tr><th>when</th><th>version</th><th>event</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Feed &amp; connections</h2>
+      <div class="kv" id="market"></div>
+      <div class="table-wrap short">
+        <table id="connections">
+          <thead><tr><th>name</th><th>state</th><th>topics</th><th>msgs</th><th>reconnects</th><th>age</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer>
+  <span id="footer-run"></span>
+  <span id="footer-db"></span>
+  <span id="footer-age"></span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
