@@ -1,0 +1,593 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AURUM EDGE DISCOVERY</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b0d12'/%3E%3Cpath d='M6 23 L16 8 L26 23' stroke='%23c8a028' stroke-width='3.4' fill='none' stroke-linejoin='round'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #0b0d12;
+    --panel: #141821;
+    --panel-2: #1b202b;
+    --line: #262c3a;
+    --text: #e8ecf4;
+    --muted: #8b95a9;
+    --dim: #5d6779;
+    --long: #17c07a;
+    --short: #f0525b;
+    --wait: #c8a028;
+    --accent: #4f8ff7;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 14px; line-height: 1.5;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 20px 16px 60px; }
+
+  /* ------------------------------------------------------------ testata */
+  header { display: flex; align-items: baseline; justify-content: space-between;
+           flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
+  .sym { font-size: 20px; font-weight: 700; letter-spacing: .12em; }
+  .sub { color: var(--muted); font-size: 12px; letter-spacing: .05em; }
+  .safety { font-size: 11px; color: var(--dim); border: 1px solid var(--line);
+            border-radius: 999px; padding: 3px 10px; }
+
+  /* ------------------------------------------------------------ verdetto */
+  .verdict-card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 14px; padding: 22px; margin-bottom: 16px;
+  }
+  .verdict-top { display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }
+  .verdict {
+    font-size: clamp(52px, 11vw, 104px); font-weight: 800; line-height: .95;
+    letter-spacing: -.02em;
+  }
+  .verdict.LONG { color: var(--long); }
+  .verdict.SHORT { color: var(--short); }
+  .verdict.WAIT { color: var(--wait); }
+  .verdict-side { flex: 1; min-width: 260px; }
+  .price { font-family: var(--mono); font-size: 30px; font-weight: 700; }
+  .price-label { color: var(--muted); font-size: 11px; text-transform: uppercase;
+                 letter-spacing: .1em; }
+
+  .probs { display: flex; gap: 8px; margin: 16px 0 4px; }
+  .prob { flex: 1; background: var(--panel-2); border-radius: 9px; padding: 10px 12px;
+          border: 1px solid transparent; }
+  .prob.lead { border-color: currentColor; }
+  .prob .k { font-size: 11px; letter-spacing: .1em; color: var(--muted); }
+  .prob .v { font-family: var(--mono); font-size: 24px; font-weight: 700; }
+  .prob.LONG .v { color: var(--long); } .prob.LONG.lead { color: var(--long); }
+  .prob.SHORT .v { color: var(--short); } .prob.SHORT.lead { color: var(--short); }
+  .prob.FLAT .v { color: var(--muted); } .prob.FLAT.lead { color: var(--muted); }
+  .bar { height: 4px; border-radius: 3px; background: #2a3040; margin-top: 8px; }
+  .bar > i { display: block; height: 100%; border-radius: 3px; background: currentColor; }
+
+  .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+           gap: 1px; background: var(--line); border: 1px solid var(--line);
+           border-radius: 10px; overflow: hidden; margin-top: 18px; }
+  .fact { background: var(--panel); padding: 11px 13px; }
+  .fact .k { font-size: 10px; letter-spacing: .09em; text-transform: uppercase;
+             color: var(--muted); }
+  .fact .v { font-family: var(--mono); font-size: 16px; font-weight: 600;
+             margin-top: 3px; overflow-wrap: anywhere; line-height: 1.25; }
+  /* Un regime come TREND_RIALZISTA/COMPRESSIONE non entra in 150px: va a capo
+     con un corpo piu' piccolo invece di essere tagliato a meta' parola. */
+  .fact .v.long { font-size: 12.5px; letter-spacing: -.01em; }
+
+  .blockers { margin-top: 16px; border-left: 3px solid var(--wait);
+              background: rgba(200,160,40,.07); padding: 11px 14px;
+              border-radius: 0 8px 8px 0; }
+  .blockers h4 { margin: 0 0 6px; font-size: 11px; letter-spacing: .1em;
+                 text-transform: uppercase; color: var(--wait); }
+  .blockers ul { margin: 0; padding-left: 18px; color: var(--muted); font-size: 13px; }
+
+  /* ------------------------------------------------------------- pannelli */
+  h2.section { font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
+               color: var(--muted); margin: 26px 0 10px; font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+          gap: 12px; }
+  .panel { background: var(--panel); border: 1px solid var(--line);
+           border-radius: 12px; padding: 14px 16px; }
+  .panel h3 { margin: 0 0 10px; font-size: 11px; letter-spacing: .12em;
+              text-transform: uppercase; color: var(--accent); font-weight: 600; }
+  .kv { display: flex; justify-content: space-between; gap: 12px;
+        padding: 4px 0; border-bottom: 1px dashed rgba(255,255,255,.05); }
+  .kv:last-child { border-bottom: 0; }
+  .kv .k { color: var(--muted); font-size: 12.5px; }
+  .kv .v { font-family: var(--mono); font-size: 12.5px; text-align: right;
+           overflow-wrap: anywhere; min-width: 0; }
+  .kv .k { flex: 1 1 auto; min-width: 0; }
+  .pos { color: var(--long); } .neg { color: var(--short); }
+  .na { color: var(--dim); font-style: italic; }
+  .note { color: var(--dim); font-size: 11.5px; margin-top: 9px; line-height: 1.45; }
+
+  /* --------------------------------------------------------------- edge */
+  .edge-card { background: linear-gradient(180deg, var(--panel), var(--panel-2));
+               border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+  .edge-none { color: var(--muted); }
+  .edge-title { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
+  .badge { display: inline-block; font-size: 10px; letter-spacing: .08em;
+           padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line);
+           color: var(--muted); }
+  .badge.VALIDATO { color: var(--long); border-color: var(--long); }
+  .badge.IN_OMBRA { color: var(--accent); border-color: var(--accent); }
+  .badge.IN_VALIDAZIONE { color: var(--wait); border-color: var(--wait); }
+  .badge.IN_DECADIMENTO { color: var(--wait); border-color: var(--wait); }
+  .badge.RIFIUTATO { color: var(--short); border-color: var(--short); }
+  .badge.SCOPERTO { color: var(--muted); }
+
+  .reasons li { margin-bottom: 7px; }
+  .reasons .d { color: var(--muted); font-size: 12px; }
+
+  /* ---------------------------------------------------------- ricerca */
+  .headline { font-size: 22px; font-weight: 700; letter-spacing: .02em; }
+  .headline.none { color: var(--wait); }
+  .headline.some { color: var(--long); }
+  .pipeline { display: flex; gap: 6px; flex-wrap: wrap; margin: 12px 0; }
+  .stage { flex: 1; min-width: 96px; background: var(--panel-2); border-radius: 8px;
+           padding: 9px 10px; border: 1px solid var(--line); }
+  .stage .n { font-family: var(--mono); font-size: 21px; font-weight: 700; }
+  .stage .l { font-size: 9.5px; letter-spacing: .07em; color: var(--muted);
+              text-transform: uppercase; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th { text-align: left; color: var(--muted); font-weight: 500; font-size: 10.5px;
+       letter-spacing: .08em; text-transform: uppercase; padding: 6px 8px;
+       border-bottom: 1px solid var(--line); }
+  td { padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,.04);
+       font-family: var(--mono); font-size: 12px; }
+  td.text { font-family: inherit; }
+  .news-item { padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,.05); }
+  .news-item:last-child { border-bottom: 0; }
+  .news-meta { color: var(--dim); font-size: 11px; }
+  footer { margin-top: 36px; color: var(--dim); font-size: 11.5px;
+           border-top: 1px solid var(--line); padding-top: 14px; line-height: 1.6; }
+  .err { background: rgba(240,82,91,.1); border: 1px solid var(--short);
+         border-radius: 10px; padding: 12px 14px; margin-bottom: 14px;
+         color: #ffbfc3; font-size: 13px; }
+  .stale { color: var(--wait); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <div class="sym" id="symbol">BTCUSDT PERPETUAL</div>
+      <div class="sub" id="subtitle">AURUM EDGE DISCOVERY &middot; previsione a 30 minuti</div>
+    </div>
+    <div class="safety">sola lettura &middot; nessun ordine, nessun wallet, nessuna leva</div>
+  </header>
+
+  <div id="error-box"></div>
+
+  <!-- ======================================================= VERDETTO -->
+  <section class="verdict-card">
+    <div class="verdict-top">
+      <div class="verdict WAIT" id="verdict">&mdash;</div>
+      <div class="verdict-side">
+        <div class="price-label">Prezzo attuale <span id="price-source"></span></div>
+        <div class="price" id="price">&mdash;</div>
+        <div class="probs" id="probs"></div>
+      </div>
+    </div>
+
+    <div class="facts" id="facts"></div>
+    <div id="blockers"></div>
+  </section>
+
+  <!-- =========================================================== EDGE -->
+  <h2 class="section">Current edge</h2>
+  <div class="edge-card" id="edge-card"><div class="edge-none">caricamento&hellip;</div></div>
+
+  <!-- ======================================================== MOTIVI -->
+  <h2 class="section">Motivazioni principali</h2>
+  <div class="panel"><ul class="reasons" id="reasons"><li>caricamento&hellip;</li></ul></div>
+
+  <!-- ====================================================== PANNELLI -->
+  <h2 class="section">Dettaglio di mercato</h2>
+  <div class="grid" id="panels"></div>
+
+  <!-- ======================================================= RICERCA -->
+  <h2 class="section">Research status</h2>
+  <div class="panel" id="research">caricamento&hellip;</div>
+
+  <h2 class="section">Previsioni recenti e loro esito</h2>
+  <div class="panel" id="history">caricamento&hellip;</div>
+
+  <footer id="footer"></footer>
+</div>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const NA = '<span class="na">n/d</span>';
+
+function num(v, digits = 2, suffix = "") {
+  if (v === null || v === undefined || Number.isNaN(v)) return NA;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return NA;
+  return n.toLocaleString("it-IT", { minimumFractionDigits: digits,
+                                     maximumFractionDigits: digits }) + suffix;
+}
+function signed(v, digits = 1, suffix = "") {
+  if (v === null || v === undefined || !Number.isFinite(Number(v))) return NA;
+  const n = Number(v);
+  const cls = n > 0 ? "pos" : n < 0 ? "neg" : "";
+  const s = (n > 0 ? "+" : "") + n.toLocaleString("it-IT",
+      { minimumFractionDigits: digits, maximumFractionDigits: digits }) + suffix;
+  return `<span class="${cls}">${s}</span>`;
+}
+function pct(v, digits = 1) {
+  if (v === null || v === undefined || !Number.isFinite(Number(v))) return NA;
+  return (Number(v) * 100).toFixed(digits) + "%";
+}
+function money(v) {
+  if (v === null || v === undefined || !Number.isFinite(Number(v))) return NA;
+  return Number(v).toLocaleString("it-IT",
+      { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function esc(s) {
+  return String(s === null || s === undefined ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+function kv(k, v) { return `<div class="kv"><span class="k">${esc(k)}</span><span class="v">${v}</span></div>`; }
+
+async function getJSON(path) {
+  const r = await fetch(path, { cache: "no-store" });
+  if (!r.ok) throw new Error(path + " -> HTTP " + r.status);
+  return r.json();
+}
+
+/* ------------------------------------------------------------- verdetto */
+function renderForecast(f) {
+  $("symbol").textContent = (f.symbol || "BTCUSDT") + " PERPETUAL";
+  $("subtitle").textContent =
+    `AURUM EDGE DISCOVERY · previsione a ${f.horizon_min} minuti · aggiornato ${f.at || "—"}`;
+
+  const v = $("verdict");
+  v.textContent = f.verdict || "—";
+  v.className = "verdict " + (f.verdict || "WAIT");
+
+  $("price").textContent = money(f.price);
+  const src = f.diagnostics && f.diagnostics.price_source;
+  const age = f.diagnostics && f.diagnostics.live_age_seconds;
+  let srcText = src ? `(${src})` : "";
+  if (age !== null && age !== undefined && age > 180) {
+    srcText = `<span class="stale">(${esc(src)} — fermo da ${Math.round(age)}s)</span>`;
+  }
+  $("price-source").innerHTML = srcText;
+
+  const p = f.probabilities || {};
+  const best = Math.max(p.LONG || 0, p.SHORT || 0, p.FLAT || 0);
+  $("probs").innerHTML = ["LONG", "SHORT", "FLAT"].map((k) => {
+    const val = p[k] || 0;
+    const lead = val === best ? " lead" : "";
+    return `<div class="prob ${k}${lead}">
+      <div class="k">${k}</div>
+      <div class="v">${pct(val)}</div>
+      <div class="bar"><i style="width:${(val * 100).toFixed(1)}%"></i></div>
+    </div>`;
+  }).join("");
+
+  const q = f.quality || {};
+  const target = (f.target_low !== null && f.target_high !== null)
+    ? `${money(f.target_low)} – ${money(f.target_high)}` : NA;
+  $("facts").innerHTML = [
+    ["Target range", target],
+    ["Expected move", f.expected_move_pct === null || f.expected_move_pct === undefined
+        ? NA : signed(f.expected_move_pct, 2, "%")],
+    ["Durata prevista", esc(f.expected_duration || "n/d")],
+    ["Invalidation", f.invalidation === null || f.invalidation === undefined
+        ? NA : money(f.invalidation)],
+    ["Signal quality", `${esc(q.label || "—")} · ${num(q.score, 2)}`],
+    ["Regime", esc((f.regime && f.regime.name) || "—")],
+  ].map(([k, val]) => {
+    const plain = String(val).replace(/<[^>]*>/g, "");
+    const long = plain.length > 16 ? " long" : "";
+    return `<div class="fact"><div class="k">${k}</div>` +
+           `<div class="v${long}">${val}</div></div>`;
+  }).join("");
+
+  const blk = (f.blockers || []).concat((q.warnings || []));
+  $("blockers").innerHTML = blk.length
+    ? `<div class="blockers"><h4>Perché non c'è una direzione (o perché fidarsi meno)</h4>
+       <ul>${blk.map((b) => `<li>${esc(b)}</li>`).join("")}</ul></div>`
+    : "";
+
+  /* ----------------------------------------------------------- motivi */
+  const reasons = f.reasons || [];
+  $("reasons").innerHTML = reasons.length
+    ? reasons.map((r) => `<li><strong>${esc(r.text)}</strong><br>
+        <span class="d">${esc(r.detail || "")}</span></li>`).join("")
+    : "<li class=\"na\">nessuna motivazione disponibile</li>";
+
+  renderPanels(f.panels || {});
+}
+
+/* ------------------------------------------------------------ pannelli */
+function renderPanels(p) {
+  const pa = p.price_action || {};
+  const vol = p.volume || {};
+  const of = p.order_flow || {};
+  const oi = p.open_interest || {};
+  const dv = p.derivatives || {};
+  const mc = p.market_context || {};
+  const nw = p.news || {};
+
+  const cards = [];
+
+  cards.push(`<div class="panel"><h3>Price action</h3>
+    ${kv("Ultimo close", money(pa.close))}
+    ${kv("5m / 15m", signed(pa.ret_5m_bps, 1, " bps") + " / " + signed(pa.ret_15m_bps, 1, " bps"))}
+    ${kv("30m / 60m", signed(pa.ret_30m_bps, 1, " bps") + " / " + signed(pa.ret_60m_bps, 1, " bps"))}
+    ${kv("RSI(14)", num(pa.rsi_14, 1))}
+    ${kv("MACD istogramma", signed(pa.macd_hist_bps, 2, " bps"))}
+    ${kv("ATR", num(pa.atr_bps, 1, " bps"))}
+    ${kv("Bollinger z / ampiezza", num(pa.bb_z, 2) + " / " + num(pa.bb_width_pct, 2, "%"))}
+    ${kv("Distanza VWAP", signed(pa.price_vs_vwap_bps, 1, " bps"))}
+    ${kv("Posizione nel range 60m", pct(pa.range_position))}
+    ${kv("Massimo / minimo 60m", money(pa.high_60) + " / " + money(pa.low_60))}
+  </div>`);
+
+  cards.push(`<div class="panel"><h3>Volume</h3>
+    ${kv("Scoppio (vs mediana)", num(vol.burst, 2, "×"))}
+    ${kv("Rapporto sulla media 60m", num(vol.ratio_60, 2, "×"))}
+    ${kv("Percentile", pct(vol.percentile))}
+    ${kv("Percentile del controvalore", pct(vol.turnover_percentile))}
+    ${kv("Pendenza 15m", signed(vol.slope_15, 3))}
+    ${kv("Volume 24h", num(vol.volume_24h, 0))}
+    ${kv("Controvalore 24h", num(vol.turnover_24h, 0))}
+  </div>`);
+
+  cards.push(`<div class="panel"><h3>Order flow</h3>
+    ${kv("Squilibrio taker 5m", signed(of.taker_imbalance_5m, 3))}
+    ${kv("Squilibrio taker 15m", signed(of.taker_imbalance_15m, 3))}
+    ${kv("Pendenza CVD 15m", signed(of.cvd_slope_15, 3))}
+    ${kv("CVD normalizzato", signed(of.cvd_z_60, 2))}
+    ${kv("Divergenza CVD/prezzo", of.cvd_price_divergence === 1 ? "sì" : of.cvd_price_divergence === 0 ? "no" : NA)}
+    ${kv("Squilibrio libro (25 liv.)", signed(of.book_imbalance, 3))}
+    ${kv("Squilibrio libro (5 liv.)", signed(of.book_imbalance_top, 3))}
+    ${kv("Spread", num(of.spread_bps, 2, " bps"))}
+    <div class="note">${esc(of.note || "")}</div>
+  </div>`);
+
+  cards.push(`<div class="panel"><h3>Open interest</h3>
+    ${kv("Open interest", num(oi.value, 0))}
+    ${kv("Valore in USD", num(oi.usd, 0))}
+    ${kv("Variazione 15m", signed(oi.change_15m_pct, 3, "%"))}
+    ${kv("Variazione 60m", signed(oi.change_60m_pct, 3, "%"))}
+    ${kv("Accelerazione", signed(oi.acceleration, 4))}
+    ${kv("Percentile", pct(oi.percentile))}
+    <div class="note">${esc(oi.reading || "")}</div>
+  </div>`);
+
+  const liq = dv.liquidations || {};
+  cards.push(`<div class="panel"><h3>Derivatives</h3>
+    ${kv("Funding", signed(dv.funding_bps, 3, " bps"))}
+    ${kv("Funding normalizzato", signed(dv.funding_z, 2))}
+    ${kv("Minuti al funding", num(dv.minutes_to_funding, 0))}
+    ${kv("Base mark/index", signed(dv.basis_bps, 2, " bps"))}
+    ${kv("Mark / Index", money(dv.mark_price) + " / " + money(dv.index_price))}
+    ${kv("Rapporto conti long/short", num(dv.long_short_ratio, 3))}
+    ${kv("Liquidazioni", liq.available ? num(liq.total, 0) : NA)}
+    <div class="note">${esc(liq.reason || "")}</div>
+  </div>`);
+
+  const br = mc.breadth || {};
+  cards.push(`<div class="panel"><h3>Market context</h3>
+    ${kv("ETH 15m", signed(mc.eth_ret_15m_bps, 1, " bps"))}
+    ${kv("SOL 15m", signed(mc.sol_ret_15m_bps, 1, " bps"))}
+    ${kv("ETH in anticipo (5m)", signed(mc.eth_lead_5m_bps, 1, " bps"))}
+    ${kv("SOL in anticipo (5m)", signed(mc.sol_lead_5m_bps, 1, " bps"))}
+    ${kv("Correlazione ETH 60m", num(mc.eth_correlation_60, 3))}
+    ${kv("Market breadth", br.available
+        ? `${br.advancing}/${br.symbols} in salita (${pct(br.breadth_ratio)})` : NA)}
+    ${kv("Sessione", esc(mc.session || "—"))}
+    ${kv("Regime", esc((mc.regime && mc.regime.name) || "—"))}
+  </div>`);
+
+  const items = nw.items || [];
+  cards.push(`<div class="panel"><h3>News</h3>
+    ${kv("Impatto ultima ora", num(nw.impact_1h, 2))}
+    ${kv("Direzione ultima ora", signed(nw.direction_1h, 2))}
+    ${items.length ? items.slice(0, 5).map((n) => `<div class="news-item">
+        <div>${n.link ? `<a href="${esc(n.link)}" target="_blank" rel="noopener">${esc(n.title)}</a>` : esc(n.title)}</div>
+        <div class="news-meta">${esc(n.source)} · ${esc(n.at)} · impatto ${num(n.impact, 2)} · ${esc(n.direction || "NEUTRAL")}</div>
+      </div>`).join("") : '<div class="note">Nessuna notizia in archivio.</div>'}
+  </div>`);
+
+  $("panels").innerHTML = cards.join("");
+}
+
+/* ---------------------------------------------------------------- edge */
+function renderEdge(f, research) {
+  const e = f.edge;
+  const box = $("edge-card");
+  if (!e) {
+    const shadow = ((research && research.counts) || {})["IN_OMBRA"] || 0;
+    box.innerHTML = `<div class="edge-none">
+      <div class="edge-title">Nessun edge validato attivo in questo momento</div>
+      <div class="note">Nessun pattern validato risulta attivo sulle condizioni correnti.
+      ${shadow ? `Ci sono ${shadow} edge in osservazione in ombra: hanno superato lo storico
+       e devono ancora dimostrare di funzionare su previsioni fatte in avanti.` :
+       "Il motore di ricerca non ha ancora promosso alcun pattern."}
+      La previsione, se c'è, viene dal modello.</div></div>`;
+    return;
+  }
+  box.innerHTML = `
+    <div class="edge-title">${esc(e.label)}</div>
+    <div><span class="badge ${esc(e.state)}">${esc(e.state)}</span>
+         <span class="badge">${esc(e.family)}</span>
+         <span class="badge">${esc(e.direction)}</span></div>
+    <div style="margin-top:12px">
+      ${kv("Condizione attiva", esc(e.description || "—"))}
+      ${kv("Accuratezza storica", pct(e.historical_accuracy))}
+      ${kv("Osservazioni indipendenti", num(e.historical_n, 0))}
+      ${kv("AUC direzionale", num(e.auc_directional, 3))}
+      ${kv("Movimento mediano", e.path ? signed(e.path.median_move_bps, 1, " bps") : NA)}
+      ${kv("MFE / MAE mediani", e.path
+          ? signed(e.path.median_mfe_bps, 1, " bps") + " / " + signed(e.path.median_mae_bps, 1, " bps") : NA)}
+    </div>`;
+}
+
+/* ------------------------------------------------------------- ricerca */
+function renderResearch(r) {
+  const counts = r.counts || {};
+  const rep = r.report || {};
+  const wf = ((rep.model || {}).walk_forward) || {};
+  const ho = (rep.model || {}).holdout || {};
+  const power = rep.power || {};
+  const lp = r.live_performance || {};
+  const cov = r.coverage || {};
+  const validated = counts["VALIDATO"] || 0;
+
+  const stages = (r.states_order || []).map((s) =>
+    `<div class="stage"><div class="n">${counts[s] || 0}</div><div class="l">${esc(s.replace(/_/g, " "))}</div></div>`
+  ).join("");
+
+  const champ = r.champion;
+  const champHtml = champ ? `
+    ${kv("Modello in carica", esc(champ.model_id))}
+    ${kv("Accuratezza bilanciata (OOS)", num((champ.holdout || {}).balanced_accuracy, 3))}
+    ${kv("AUC direzionale (OOS)", num((champ.holdout || {}).auc_directional, 3))}
+    ${kv("Accuratezza direzionale (OOS)", pct(((champ.holdout || {}).directional || {}).accuracy))}
+    ${kv("Calibrazione (ECE)", num((champ.holdout || {}).calibration_ece, 3))}
+    ${kv("Righe di addestramento", num(champ.rows, 0))}
+  ` : `<div class="note">Nessun modello promosso a campione.</div>`;
+
+  const chal = r.challenger;
+  const chalHtml = chal ? `
+    ${kv("Sfidante", esc(chal.model_id))}
+    ${kv("AUC direzionale (OOS)", num((chal.holdout || {}).auc_directional, 3))}
+    ${kv("Accuratezza bilanciata (OOS)", num((chal.holdout || {}).balanced_accuracy, 3))}
+  ` : `<div class="note">Nessuno sfidante in attesa.</div>`;
+
+  const lpHtml = lp.available ? `
+    ${kv("Previsioni giudicate", num(lp.scored, 0))}
+    ${kv("Direzionali risolte", num(lp.resolved, 0))}
+    ${kv("Corrette", `${num(lp.correct, 0)} (${pct(lp.accuracy)})`)}
+    ${kv("Intervallo 95%", `${pct(lp.ci95 && lp.ci95[0])} – ${pct(lp.ci95 && lp.ci95[1])}`)}
+    ${kv("Quota di WAIT", pct(lp.wait_share))}
+  ` : `<div class="note">${esc(lp.note || "Nessuna previsione ancora giudicata.")}</div>`;
+
+  $("research").innerHTML = `
+    <div class="headline ${validated ? "some" : "none"}">${esc(r.headline)}</div>
+    <div class="pipeline">${stages}</div>
+    <div class="note">${esc(rep.conclusion || "La ricerca non è ancora stata eseguita.")}</div>
+
+    <div class="grid" style="margin-top:14px">
+      <div class="panel"><h3>Modello campione</h3>${champHtml}${chalHtml}</div>
+      <div class="panel"><h3>Ultima validazione</h3>
+        ${kv("Osservazioni indipendenti", num(wf.independent, 0))}
+        ${kv("Accuratezza bilanciata", num(wf.balanced_accuracy, 3))}
+        ${kv("AUC direzionale", num(wf.auc_directional, 3))}
+        ${kv("Accuratezza direzionale", pct((wf.directional || {}).accuracy))}
+        ${kv("Base rate di confronto", pct(wf.base_rate))}
+        ${kv("Coerenza fra i fold", num(wf.consistency, 2))}
+        ${kv("Calibrazione (ECE)", num(wf.calibration, 3))}
+        ${kv("Controllo fuga dati", esc((rep.leakage || {}).status || "—"))}
+      </div>
+      <div class="panel"><h3>Potenza statistica</h3>
+        ${kv("Osservazioni indipendenti", num(power.n, 0))}
+        ${kv("Vantaggio rilevabile", pct(power.detectable_lift))}
+        ${kv("Righe di selezione", num(power.selection_rows, 0))}
+        ${kv("Righe di holdout", num(power.holdout_rows, 0))}
+        <div class="note">${esc(power.note || "")}</div>
+      </div>
+      <div class="panel"><h3>Previsioni giudicate dal vivo</h3>${lpHtml}</div>
+      <div class="panel"><h3>Archivio</h3>
+        ${kv("Barre", num(cov.bars, 0))}
+        ${kv("Giorni di storia", num(cov.days, 1))}
+        ${kv("Da", esc(cov.bars_from ? new Date(cov.bars_from).toISOString().slice(0, 16) : "—"))}
+        ${kv("A", esc(cov.bars_to ? new Date(cov.bars_to).toISOString().slice(0, 16) : "—"))}
+        ${kv("Previsioni salvate", num((cov.tables || {}).forecasts, 0))}
+        ${kv("Osservazioni edge", num((cov.tables || {}).edge_observations, 0))}
+      </div>
+      <div class="panel"><h3>Candidati provati</h3>
+        ${kv("Pattern generati", num((rep.catalogue || {}).candidates, 0))}
+        ${kv("Oltre le soglie", num((rep.edges || {}).passed_thresholds, 0))}
+        ${kv("Dopo correzione test multipli", num((rep.edges || {}).survived_fdr, 0))}
+        <div class="note">${esc((rep.catalogue || {}).note || "")}</div>
+        ${((rep.catalogue || {}).unavailable || []).map((u) =>
+            `<div class="note"><strong>${esc(u.label)}</strong>: ${esc(u.reason)}</div>`).join("")}
+      </div>
+    </div>`;
+}
+
+/* ------------------------------------------------------------- storico */
+function renderHistory(h) {
+  const items = h.items || [];
+  if (!items.length) {
+    $("history").innerHTML = '<div class="note">Nessuna previsione registrata.</div>';
+    return;
+  }
+  $("history").innerHTML = `<table>
+    <thead><tr><th>Istante</th><th>Verdetto</th><th>LONG</th><th>SHORT</th>
+      <th>FLAT</th><th>Prezzo</th><th>Esito</th><th>Movimento</th><th>Giusta?</th></tr></thead>
+    <tbody>${items.slice(0, 40).map((r) => `<tr>
+      <td class="text">${esc((r.at || "").replace("T", " ").slice(0, 16))}</td>
+      <td class="text"><strong style="color:var(--${(r.verdict || "").toLowerCase()})">${esc(r.verdict)}</strong></td>
+      <td>${pct(r.p_long)}</td><td>${pct(r.p_short)}</td><td>${pct(r.p_flat)}</td>
+      <td>${money(r.price)}</td>
+      <td class="text">${r.resolved ? esc(r.outcome_label || "—") : '<span class="na">in corso</span>'}</td>
+      <td>${signed(r.outcome_return_bps, 1, " bps")}</td>
+      <td class="text">${r.outcome_correct === 1 ? '<span class="pos">sì</span>'
+          : r.outcome_correct === 0 ? '<span class="neg">no</span>' : NA}</td>
+    </tr>`).join("")}</tbody></table>`;
+}
+
+/* -------------------------------------------------------------- stato */
+function renderFooter(s) {
+  const db = s.database || {};
+  const col = s.collector || {};
+  const live = s.live || {};
+  $("footer").innerHTML = `
+    <div><strong>${esc((s.safety || {}).note || "")}</strong></div>
+    <div style="margin-top:8px">
+      Archivio: ${esc(db.path)} · ${num(db.bars, 0)} barre · ${num(db.days, 1)} giorni ·
+      ultimo dato live ${esc(live.last_snapshot || "mai")}
+      ${live.fresh ? "" : '<span class="stale">(non fresco)</span>'} ·
+      collector: giri ${num(col.polls, 0)}, errori ${num(col.failures, 0)}${
+        col.blocked ? ` · <span class="stale">BLOCCATO: ${esc(col.blocked_reason)}</span>` : ""}
+    </div>
+    <div style="margin-top:8px">Soglie attive: probabilità minima
+      ${pct((s.config || {}).min_prob)} · margine minimo ${pct((s.config || {}).min_margin)} ·
+      qualità minima ${num((s.config || {}).min_quality, 2)} ·
+      orizzonte ${num((s.config || {}).horizon_min, 0)} minuti.</div>`;
+}
+
+/* ------------------------------------------------------------ aggiorna */
+let failures = 0;
+async function refresh() {
+  try {
+    const [f, r, h, s] = await Promise.all([
+      getJSON("/api/forecast"), getJSON("/api/research"),
+      getJSON("/api/history"), getJSON("/api/status"),
+    ]);
+    $("error-box").innerHTML = "";
+    failures = 0;
+    renderForecast(f);
+    renderEdge(f, r);
+    renderResearch(r);
+    renderHistory(h);
+    renderFooter(s);
+  } catch (err) {
+    failures += 1;
+    $("error-box").innerHTML =
+      `<div class="err"><strong>Errore nel caricamento</strong><br>${esc(err.message)}
+       ${failures > 1 ? `<br>Tentativi falliti: ${failures}` : ""}</div>`;
+  }
+}
+
+refresh();
+setInterval(refresh, 20000);
+</script>
+</body>
+</html>
