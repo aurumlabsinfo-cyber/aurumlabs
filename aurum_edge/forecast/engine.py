@@ -35,7 +35,6 @@ from typing import Any
 from .. import config
 from ..data.store import Store
 from ..features import builder
-from ..features.dataset import Dataset
 from ..features.labels import band_bps, horizon_sigma_bps
 from ..model.logistic import LogisticModel
 from ..research import edges as edges_mod
@@ -205,19 +204,38 @@ class ForecastEngine:
         contributions: list[dict[str, Any]] = []
         model_holdout_ok = False
 
+        model_usable = model is not None
+        missing_features: list[str] = []
+
         if model is None:
             blockers.append(
                 "nessun modello addestrato: la ricerca non ha ancora prodotto "
                 "un campione")
         else:
-            dense = self._dense_row(model, row)
-            probs = model.predict_row(dense)
-            contributions = model.contributions(dense)[:6]
-            model_holdout_ok = self._holdout_ok()
-            if not model_holdout_ok:
+            missing_features = model.missing_features(list(row.keys()))
+            if missing_features:
+                # Un modello a cui mancano variabili con un peso continuerebbe
+                # a rispondere, riempiendo i buchi con la mediana e senza
+                # sollevare alcun errore. Sarebbe il guasto peggiore: silenzioso
+                # e plausibile. Meglio dichiararlo inutilizzabile e dire quali
+                # variabili mancano.
+                model_usable = False
                 blockers.append(
-                    "il modello in carica non ha superato l'holdout fresco: le "
-                    "sue probabilita' non sono confermate fuori campione")
+                    "il modello in carica e' stato addestrato su variabili che "
+                    "il costruttore non produce piu' ("
+                    + ", ".join(missing_features[:4])
+                    + (f" e altre {len(missing_features) - 4}"
+                       if len(missing_features) > 4 else "")
+                    + "): va riaddestrato con `ricerca` prima di poterlo usare")
+            else:
+                dense = self._dense_row(model, row)
+                probs = model.predict_row(dense)
+                contributions = model.contributions(dense)[:6]
+                model_holdout_ok = self._holdout_ok()
+                if not model_holdout_ok:
+                    blockers.append(
+                        "il modello in carica non ha superato l'holdout fresco: "
+                        "le sue probabilita' non sono confermate fuori campione")
 
         # --------------------------------------------------------- 2. edge
         active_edges = self._active_edges(row)
@@ -230,7 +248,7 @@ class ForecastEngine:
             data_age_seconds=data_age,
             feature_coverage=coverage,
             regime_confidence=regime.confidence,
-            model_available=model is not None,
+            model_available=model_usable,
             model_holdout_ok=model_holdout_ok,
             spread_bps=(snapshot["spread_bps"] if snapshot else None),
             bars_available=len(frame),
@@ -264,7 +282,7 @@ class ForecastEngine:
             blockers.append(
                 f"qualita' del segnale {q.score:.2f} sotto "
                 f"{config.MIN_SIGNAL_QUALITY:.2f}")
-        if model is None and not edge_support:
+        if not model_usable and not edge_support:
             blockers.append(
                 "nessuna base validata: ne' un modello promosso ne' un edge "
                 "validato attivo")
@@ -313,12 +331,14 @@ class ForecastEngine:
                 "active_edges": len(active_edges),
                 "analogues": analogues,
                 "model_metrics": self._model_metrics.get("holdout"),
+                "model_usable": model_usable,
+                "model_missing_features": missing_features,
                 "execution_enabled": config.EXECUTION_ENABLED,
             })
 
         if persist:
             self.store.add_forecast(forecast.to_row())
-            self._record_edge_observations(forecast, active_edges)
+            self._record_edge_observations(forecast)
         return forecast
 
     # ------------------------------------------------------------- aiutanti
@@ -368,8 +388,6 @@ class ForecastEngine:
         out: list[dict[str, Any]] = []
         names = sorted(row.keys())
         values = [row.get(n) for n in names]
-        pseudo = Dataset(names=names, rows=[values], ts=[0], labels=[None],
-                         prices=[0.0])
         index = {n: j for j, n in enumerate(names)}
 
         for db_row in self.store.edges([lifecycle.VALIDATED]):
@@ -404,7 +422,6 @@ class ForecastEngine:
                 "auc_directional": wf.get("auc_directional"),
                 "path": wf.get("path"),
             })
-        _ = pseudo
         out.sort(key=lambda e: -(e.get("historical_accuracy") or 0.0))
         return out
 
@@ -453,6 +470,7 @@ class ForecastEngine:
         if len(hist) < 500:
             result = {"status": "STORIA INSUFFICIENTE", "n": 0}
             self._analogues_cache[key] = result
+            self._analogues_ts = now
             return result
 
         ds = builder.build_dataset(hist, horizon_min=horizon_min, step=5)
@@ -608,8 +626,12 @@ class ForecastEngine:
             out.append({
                 "kind": "feature",
                 "text": f"{_pretty(c['feature'])}: {_fmt(value)}",
-                "detail": (f"spinge verso {c['direction']} "
-                           f"({c['value_z']:+.2f} deviazioni dalla norma)"),
+                # Il valore grezzo e quello normalizzato sono in due unita'
+                # diverse: affiancarli senza dirlo fa sembrare che uno dei due
+                # sia sbagliato.
+                "detail": (f"spinge verso {c['direction']}; il valore e' a "
+                           f"{c['value_z']:+.2f} deviazioni standard dalla sua "
+                           "media recente"),
                 "direction": c["direction"],
                 "weight": abs(c["push"]),
             })
@@ -660,7 +682,8 @@ class ForecastEngine:
                 "close": frame.closes[i] if len(frame) else None,
                 "ret_5m_bps": g("ret_5m"), "ret_15m_bps": g("ret_15m"),
                 "ret_30m_bps": g("ret_30m"), "ret_60m_bps": g("ret_60m"),
-                "rsi_14": g("rsi_14"), "macd_hist_bps": g("macd_hist_bps"),
+                "rsi_14": frame.s("rsi_14", i),
+                "macd_hist_bps": g("macd_hist_bps"),
                 "atr_bps": g("atr_bps"), "bb_z": g("bb_z"),
                 "bb_width_pct": g("bb_width_pct"),
                 "price_vs_vwap_bps": g("price_vs_vwap_bps"),
@@ -703,7 +726,7 @@ class ForecastEngine:
                 "reading": _oi_reading(g("oi_chg_15m_pct"), g("ret_15m")),
             },
             "derivatives": {
-                "funding_rate": g("funding_rate"),
+                "funding_rate": frame.s("funding", i),
                 "funding_bps": g("funding_bps"),
                 "funding_z": g("funding_z"),
                 "minutes_to_funding": g("mins_to_funding"),
@@ -742,8 +765,7 @@ class ForecastEngine:
         }
 
     # -------------------------------------------------- osservazioni in ombra
-    def _record_edge_observations(self, forecast: Forecast,
-                                  active: list[dict[str, Any]]) -> None:
+    def _record_edge_observations(self, forecast: Forecast) -> None:
         """Registra ogni attivazione di edge, anche di quelli non validati.
 
         E' il meccanismo che permette a un edge di maturare in ombra senza che
@@ -783,7 +805,6 @@ class ForecastEngine:
                 "mae_bps": None, "time_to_mfe_min": None, "correct": None,
                 "is_live": 1,
             })
-        _ = active
         if rows:
             self.store.add_edge_observations(rows)
 
@@ -806,7 +827,7 @@ def _oi_reading(oi_change: float | None, ret: float | None) -> str:
 _LABELS = {
     "ret_5m": "Rendimento 5m", "ret_15m": "Rendimento 15m",
     "ret_30m": "Rendimento 30m", "ret_60m": "Rendimento 60m",
-    "rsi_14": "RSI(14)", "rsi_14_dev": "RSI(14) scostamento da 50",
+    "rsi_14": "RSI(14)", "rsi_14_dev": "RSI(14), scostamento da 50",
     "macd_hist_bps": "Istogramma MACD", "atr_bps": "ATR",
     "bb_z": "Posizione nelle Bollinger", "bb_width_pct": "Ampiezza Bollinger",
     "price_vs_vwap_bps": "Distanza dalla VWAP",
@@ -823,6 +844,44 @@ _LABELS = {
     "eth_ret_15m": "ETH 15m", "sol_ret_15m": "SOL 15m",
     "eth_lead_5m": "ETH in anticipo su BTC",
     "compression": "Compressione di volatilita'",
+    "ema_fast_mid_bps": "EMA veloce contro media",
+    "ema_mid_slow_bps": "EMA media contro lenta",
+    "price_vs_ema_slow_bps": "Prezzo contro EMA lenta",
+    "macd_hist_slope": "Pendenza dell'istogramma MACD",
+    "bb_width_pctile": "Percentile ampiezza Bollinger",
+    "atr_pctile": "Percentile dell'ATR",
+    "rv_15_bps": "Volatilita' realizzata 15m",
+    "rv_60_bps": "Volatilita' realizzata 60m",
+    "rv_pctile": "Percentile di volatilita'",
+    "oi_chg_60m_pct": "Variazione open interest 60m",
+    "oi_pctile": "Percentile open interest",
+    "oi_price_agree": "Accordo open interest / prezzo",
+    "oi_price_impulse": "Impulso open interest x prezzo",
+    "dist_high_60_bps": "Distanza dal massimo 60m",
+    "dist_low_60_bps": "Distanza dal minimo 60m",
+    "turnover_pctile": "Percentile del controvalore",
+    "vol_ratio_60": "Volume sulla media 60m",
+    "vol_slope_15": "Pendenza del volume 15m",
+    "trades_pctile": "Percentile numero scambi",
+    "cvd_price_div": "Divergenza CVD / prezzo",
+    "book_imbalance_top": "Squilibrio libro, primi livelli",
+    "spread_bps": "Spread",
+    "mins_to_funding": "Minuti al funding",
+    "ls_ratio": "Rapporto conti long/short",
+    "ls_z": "Rapporto long/short normalizzato",
+    "sol_lead_5m": "SOL in anticipo su BTC",
+    "eth_corr_60": "Correlazione con ETH",
+    "breadth_ratio": "Ampiezza del mercato",
+    "news_impact_1h": "Impatto notizie ultima ora",
+    "news_direction_1h": "Verso delle notizie",
+    "ret_1m": "Rendimento 1m",
+    "hour_sin": "Ora del giorno (seno)",
+    "hour_cos": "Ora del giorno (coseno)",
+    "is_weekend": "Fine settimana",
+    "session_asia": "Sessione asiatica",
+    "session_london": "Sessione di Londra",
+    "session_newyork": "Sessione di New York",
+    "session_overlap": "Sovrapposizione Londra/New York",
     "range_position": "Posizione nel range",
     "streak": "Serie consecutiva",
 }

@@ -91,9 +91,13 @@ class Frame:
             out[name] = (((close / self.closes[j]) - 1.0) * 10_000.0
                          if j >= 0 and self.closes[j] > 0 else None)
 
-        out["rsi_14"] = self.s("rsi_14", i)
-        out["rsi_14_dev"] = (None if out["rsi_14"] is None
-                             else out["rsi_14"] - 50.0)
+        # Solo lo scostamento da 50, non l'RSI grezzo: le due grandezze
+        # differiscono per una costante e dopo la standardizzazione sono la
+        # stessa colonna. Tenerle entrambe occupa due posti nella selezione
+        # delle variabili e fa comparire due volte lo stesso motivo nella
+        # spiegazione. Il valore grezzo resta nella serie, per il pannello.
+        rsi = self.s("rsi_14", i)
+        out["rsi_14_dev"] = None if rsi is None else rsi - 50.0
         out["macd_hist_bps"] = self.s("macd_hist_bps", i)
         out["macd_hist_slope"] = self.s("macd_hist_slope", i)
 
@@ -171,9 +175,9 @@ class Frame:
                                    else oi_chg * ret15)
 
         # ------------------------------------------------------ derivatives
-        out["funding_rate"] = self.s("funding", i)
-        out["funding_bps"] = (None if out["funding_rate"] is None
-                              else out["funding_rate"] * 10_000.0)
+        # Stesso discorso: il funding in bps e' il tasso per diecimila.
+        funding = self.s("funding", i)
+        out["funding_bps"] = None if funding is None else funding * 10_000.0
         out["funding_z"] = self.s("funding_z", i)
         out["basis_bps"] = self.s("basis_bps", i)
         out["mins_to_funding"] = self.s("mins_to_funding", i)
@@ -507,7 +511,6 @@ def _attach_context(store: Store, frame: Frame) -> None:
                      (config.CONTEXT_SYMBOLS[1], "sol")):
         rows = store.bars(sym, start_ms=frame.ts[0] - timeutil.HOUR_MS,
                           end_ms=frame.ts[-1])
-        by_ts = {r["ts"]: r["close"] for r in rows}
         closes = rolling.align_step_series(
             frame.ts, [r["ts"] for r in rows], [r["close"] for r in rows],
             max_age_ms=10 * timeutil.MINUTE_MS)
@@ -536,7 +539,6 @@ def _attach_context(store: Store, frame: Frame) -> None:
                     [frame.closes[j] for j in range(i - W_MED, i + 1)],
                     [closes[j] for j in range(i - W_MED, i + 1)])
             S["eth_corr_60"] = corr
-        _ = by_ts
 
 
 def _attach_snapshots(store: Store, symbol: str, frame: Frame) -> None:

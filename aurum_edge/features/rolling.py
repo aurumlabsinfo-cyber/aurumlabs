@@ -260,7 +260,6 @@ def rolling_slope(values: Sequence[float | None], window: int) -> list[float | N
     if window < 3:
         return out
     sum_y = 0.0
-    sum_iy = 0.0
     count = 0
     buf: list[float | None] = []
     for i, v in enumerate(values):
@@ -284,7 +283,6 @@ def rolling_slope(values: Sequence[float | None], window: int) -> list[float | N
             num = sum((p[0] - mx) * (p[1] - my) for p in pts)
             den = sum((p[0] - mx) ** 2 for p in pts)
             out[i] = num / den if den > 0 else None
-        sum_iy += 0.0
     return out
 
 

@@ -452,34 +452,55 @@ class ResearchEngine:
 
     def _edge_on_holdout(self, fitted: edges_mod.FittedEdge,
                          holdout: Dataset) -> dict[str, Any]:
-        """L'holdout fresco. Si guarda una volta, e la risposta e' vincolante."""
+        """L'holdout fresco. Si guarda una volta, e la risposta e' vincolante.
+
+        Il riferimento e' la base rate dell'**intero** holdout, non quella del
+        sottoinsieme in cui l'edge si e' attivato. Calcolarla sul sottoinsieme
+        e' un confronto perso in partenza: un edge che dichiara sempre la stessa
+        direzione prende, su quel sottoinsieme, esattamente la quota di quella
+        direzione — cioe' la base rate stessa, o il suo complemento. Il
+        vantaggio risulterebbe zero per costruzione, qualunque cosa faccia
+        l'edge, e nessun candidato potrebbe mai essere confermato.
+        """
         if len(holdout) == 0:
             return {"status": "HOLDOUT VUOTO"}
+        independent = validation.independent_indices(
+            holdout.ts, holdout.horizon_min * 60_000)
         mask = edges_mod.activation_mask(fitted, holdout)
-        idx = [i for i in validation.independent_indices(
-            holdout.ts, holdout.horizon_min * 60_000) if mask[i]]
+        idx = [i for i in independent if mask[i]]
         if len(idx) < 20:
             return {"status": "ATTIVAZIONI INSUFFICIENTI",
                     "activations": len(idx),
                     "note": ("Nell'holdout l'edge si e' attivato troppo poco "
                              "per essere confermato o smentito.")}
         direction = fitted.direction
-        labels = [holdout.labels[i] for i in idx]
-        resolved = [l for l in labels if l in (metrics.LONG, metrics.SHORT)]
+        resolved = [holdout.labels[i] for i in idx
+                    if holdout.labels[i] in (metrics.LONG, metrics.SHORT)]
         hits = sum(1 for l in resolved if l == direction)
+
+        # La base rate di tutto il periodo: quanto prenderebbe, sull'holdout
+        # intero, chi dicesse sempre la direzione piu' frequente.
+        all_resolved = [holdout.labels[i] for i in independent
+                        if holdout.labels[i] in (metrics.LONG, metrics.SHORT)]
+        base = (max(all_resolved.count(metrics.LONG),
+                    all_resolved.count(metrics.SHORT)) / len(all_resolved)
+                if all_resolved else None)
+
         from ..util.numeric import wilson_interval
         lo, hi = wilson_interval(hits, len(resolved)) if resolved else (0.0, 1.0)
-        base = (max(resolved.count(metrics.LONG), resolved.count(metrics.SHORT))
-                / len(resolved)) if resolved else None
+        accuracy = hits / len(resolved) if resolved else None
         return {
             "status": "OK",
             "activations": len(idx),
             "resolved": len(resolved),
-            "accuracy": round(hits / len(resolved), 4) if resolved else None,
+            "accuracy": round(accuracy, 4) if accuracy is not None else None,
             "ci95": [round(lo, 4), round(hi, 4)],
             "base_rate": round(base, 4) if base is not None else None,
-            "confirms": bool(resolved and base is not None
-                             and hits / len(resolved) > base),
+            "base_rate_sample": len(all_resolved),
+            # Non basta che la stima puntuale superi la base rate: su ottanta
+            # casi la stima puntuale supera qualunque cosa una volta su due.
+            "confirms": bool(accuracy is not None and base is not None
+                             and accuracy > base and lo > base * 0.94),
         }
 
     def _record_edge(self, rule: edges_mod.EdgeRule,
@@ -538,12 +559,37 @@ class ResearchEngine:
                     f"holdout fresco conferma: {holdout.get('accuracy')} contro "
                     f"una base rate di {holdout.get('base_rate')} su "
                     f"{holdout.get('resolved')} casi risolti", now)
+            elif record.state == lifecycle.REJECTED:
+                # Un edge bocciato non rientra perche' ripassa oggi. Se la
+                # ricerca gira ogni mezz'ora e ogni volta si concede una nuova
+                # possibilita' sugli stessi dati, prima o poi passa: sarebbe
+                # p-hacking distribuito nel tempo invece che fra i candidati.
+                # Rientra solo quando esistono dati davvero nuovi — sette
+                # giorni, cioe' qualche centinaio di osservazioni indipendenti
+                # che al momento della bocciatura non erano ancora accadute.
+                since_h = record.state_age_hours
+                if since_h >= 7 * 24:
+                    record.transition(
+                        lifecycle.VALIDATING,
+                        f"riesaminato dopo {since_h / 24:.1f} giorni di dati "
+                        f"nuovi: l'holdout ora conferma "
+                        f"({holdout.get('accuracy')} contro "
+                        f"{holdout.get('base_rate')})", now)
+                else:
+                    record.metrics["reconsidered"] = {
+                        "confirms_now": True,
+                        "hours_since_rejection": round(since_h, 1),
+                        "note": ("L'holdout conferma, ma la bocciatura e' "
+                                 "troppo recente: servono sette giorni di dati "
+                                 "nuovi perche' il riesame non sia solo un "
+                                 "nuovo tentativo sugli stessi dati."),
+                    }
         elif holdout.get("status") == "OK" and not holdout.get("confirms"):
             record.transition(
                 lifecycle.REJECTED,
                 f"l'holdout fresco smentisce: {holdout.get('accuracy')} contro "
                 f"una base rate di {holdout.get('base_rate')}", now)
-        else:
+        elif record.state != lifecycle.REJECTED:
             record.transition(
                 lifecycle.VALIDATING,
                 f"holdout non concludente: {holdout.get('status')}", now)

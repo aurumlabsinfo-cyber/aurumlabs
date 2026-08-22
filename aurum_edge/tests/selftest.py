@@ -848,6 +848,95 @@ def test_edge_catalogue(r: Results) -> None:
 
 
 # --------------------------------------------------------------------------
+# 12. Regressioni: i due guasti silenziosi trovati costruendo il sistema
+# --------------------------------------------------------------------------
+def test_regressions(r: Results) -> None:
+    from ..features.dataset import Dataset
+    from ..model import logistic
+    from ..research import metrics
+    from ..research import validation
+
+    r.section("12. REGRESSIONI — i guasti silenziosi gia' visti una volta")
+
+    # --- A. Un modello a cui mancano variabili non deve rispondere lo stesso.
+    #
+    # Trovato per caso: togliendo dal costruttore due colonne duplicate, un
+    # modello addestrato prima continuava a produrre probabilita' diverse dalle
+    # sue, senza errori, perche' i valori mancanti venivano riempiti con la
+    # mediana. Nessuna eccezione, nessun avviso, numeri leggermente falsi.
+    names = ["a", "b", "c", "d"]
+    rows = [[float(i % 5), float(i % 3), float(i % 7), 1.0] for i in range(400)]
+    labels = ["LONG" if row[0] > 2 else "SHORT" if row[1] > 1 else "FLAT"
+              for row in rows]
+    ds = Dataset(names=names, rows=rows, ts=[i * 60_000 for i in range(400)],
+                 labels=labels, prices=[100.0] * 400)
+    model = logistic.fit(ds, epochs=15, max_rows=400, top_k=4)
+
+    r.check("il modello sa quali variabili ha davvero pesato",
+            set(model.selected_names) <= set(names) and model.selected_names)
+    r.check("con tutte le variabili presenti non manca niente",
+            model.missing_features(names) == [])
+    missing = model.missing_features(["a", "b"])
+    r.check("una variabile sparita viene rilevata",
+            bool(missing) and set(missing) <= {"c", "d"}, str(missing))
+
+    # --- B. Un predittore che si astiene va misurato contro il periodo intero.
+    #
+    # Un edge dichiara sempre la stessa direzione. Se la base rate si calcola
+    # sulle sole righe in cui si e' attivato, l'accuratezza coincide con la
+    # base rate per costruzione e il vantaggio e' zero qualunque cosa faccia:
+    # nessun edge potrebbe MAI essere promosso, e il motore sembrerebbe solo
+    # molto severo.
+    actual = ["LONG"] * 8 + ["SHORT"] * 2          # sottoinsieme attivato
+    predicted = ["LONG"] * 10
+    whole = ["LONG"] * 50 + ["SHORT"] * 50         # periodo intero, 50/50
+    probs = [{"LONG": 0.8, "SHORT": 0.1, "FLAT": 0.1}] * 10
+
+    naive = metrics.score(probs, predicted, actual)
+    fair = metrics.score(probs, predicted, actual, baseline_labels=whole)
+    r.check("senza baseline il confronto e' tautologico",
+            abs((naive.directional.get("accuracy") or 0)
+                - (naive.notes.get("directional_base_rate") or 0)) < 1e-9,
+            f"acc={naive.directional.get('accuracy')} "
+            f"base={naive.notes.get('directional_base_rate')}")
+    r.check("con la baseline del periodo il vantaggio si vede",
+            abs((fair.notes.get("directional_base_rate") or 0) - 0.5) < 1e-9
+            and (fair.directional.get("accuracy") or 0) > 0.79,
+            f"acc={fair.directional.get('accuracy')} "
+            f"base={fair.notes.get('directional_base_rate')}")
+
+    # --- C. I cancelli impossibili per un edge devono essere spenti.
+    walk_model = {
+        "status": "COMPLETO", "abstaining": False,
+        "fold_consistency": 1.0, "p_value_vs_base": 0.001,
+        "overall": {
+            "balanced_accuracy": 1 / 3, "auc_directional": 0.50,
+            "directional_base_rate": 0.50,
+            "directional_base_rate_on_calls": 0.80,
+            "directional": {"n": 300, "accuracy": 0.80, "ci95": [0.75, 0.85],
+                            "long_calls": 300, "short_calls": 0,
+                            "flat_rate": 0.1},
+            "calibration": {"ece": 0.02},
+        },
+    }
+    walk_edge = dict(walk_model, abstaining=True)
+    v_model = validation.judge(walk_model)
+    v_edge = validation.judge(walk_edge)
+    r.check("gli stessi numeri bocciano un modello",
+            not v_model.passed, "avrebbe dovuto fallire")
+    r.check("...e promuovono un edge, perche' li' quei cancelli sono murati",
+            v_edge.passed, "; ".join(v_edge.reasons[:3]))
+    r.check("un edge senza vantaggio reale resta bocciato",
+            not validation.judge(dict(
+                walk_edge,
+                overall=dict(walk_edge["overall"],
+                             directional={"n": 300, "accuracy": 0.50,
+                                          "ci95": [0.44, 0.56],
+                                          "long_calls": 300, "short_calls": 0,
+                                          "flat_rate": 0.1}))).passed)
+
+
+# --------------------------------------------------------------------------
 # Esecuzione
 # --------------------------------------------------------------------------
 ALL_TESTS: list[tuple[str, Callable[[Results], None], bool]] = [
@@ -862,6 +951,7 @@ ALL_TESTS: list[tuple[str, Callable[[Results], None], bool]] = [
     ("ciclo_vita", test_lifecycle, False),
     ("http", test_http, False),
     ("catalogo", test_edge_catalogue, False),
+    ("regressioni", test_regressions, False),
 ]
 
 

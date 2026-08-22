@@ -190,6 +190,29 @@ class LogisticModel:
     def from_json(cls, text: str) -> "LogisticModel":
         return cls.from_dict(json.loads(text))
 
+    # ------------------------------------------------------ compatibilita'
+    @property
+    def selected_names(self) -> list[str]:
+        """I nomi delle variabili che hanno davvero un peso."""
+        return [self.feature_names[j] for j in self.selected
+                if 0 <= j < len(self.feature_names)]
+
+    def missing_features(self, available: Sequence[str]) -> list[str]:
+        """Le variabili con un peso che il costruttore attuale non produce piu'.
+
+        Serve contro un guasto silenzioso e sgradevole: se il costruttore di
+        feature cambia — una colonna rinominata, una tolta perche' duplicata —
+        un modello addestrato prima continua a funzionare senza errori, perche'
+        i valori mancanti vengono riempiti con la mediana. Le probabilita'
+        cambiano, nessuna eccezione viene sollevata, e il numero sulla
+        dashboard e' semplicemente un po' meno vero di prima.
+
+        Un modello che ha perso una delle sue variabili non e' un modello
+        leggermente degradato: e' un modello diverso, che nessuno ha validato.
+        """
+        present = set(available)
+        return [name for name in self.selected_names if name not in present]
+
     # ---------------------------------------------------------- spiegazione
     def contributions(self, dense_row: Sequence[float]) -> list[dict[str, Any]]:
         """Quanto ogni variabile spinge verso LONG contro SHORT, in questo istante.
