@@ -198,6 +198,18 @@ def _judge(report: ArchiveReport, target_symbol: str) -> None:
         for s in report.symbols)
 
     if fact_rows == 0:
+        # Un file di testo, CSV o JSONL non ha tabelle riconoscibili: la
+        # scansione ne conta solo le righe. Dirgli che contiene "opinioni del
+        # vecchio motore" e' falso — puo' essere un registro di WhatsApp o
+        # l'export di un cliente — e un verdetto falso e' peggio di un verdetto
+        # vago, perche' sembra un'analisi.
+        if opinion_rows == 0:
+            report.verdict = "NON PERTINENTE"
+            report.reason = (
+                f"{rows} righe di testo senza tabelle di mercato riconoscibili. "
+                "La scansione sa contarle ma non sa interpretarle: questo file "
+                "non riguarda il problema.")
+            return
         report.verdict = "SOLO DIAGNOSTICA"
         report.reason = (
             f"{opinion_rows} righe di sole opinioni del vecchio motore "
@@ -306,12 +318,26 @@ def _conclusion(reports: list[ArchiveReport], usable: list[ArchiveReport],
             f"Trovati {len(reports)} archivi, nessuno riutilizzabile per "
             f"{symbol} a 30 minuti. Lo storico utile va costruito da zero "
             "dagli endpoint pubblici di Bybit.")
-    total = sum(sum(c for c in r.tables.values() if c > 0) for r in usable)
+    # Il totale deve contare SOLO i fatti di mercato. Sommare tutte le tabelle
+    # gonfia il numero di ordini di grandezza — le decisioni di un vecchio
+    # motore sono centinaia di migliaia, i prezzi che ha registrato qualche
+    # centinaio — e il titolo finirebbe per contraddire i verdetti riga per
+    # riga, promettendo una miniera dove ci sono duecento righe.
+    total = sum(sum(c for t, c in r.tables.items()
+                    if t in FACT_TABLES and c > 0) for r in usable)
+    span = max((r.time_span.get("days", 0.0) for r in usable), default=0.0)
+    # A trenta minuti di orizzonte, un giorno di storia vale 48 osservazioni
+    # indipendenti. E' il numero che decide se serve, non le righe.
+    independent = int(span * 48)
+    verdict = ("Puo' bastare per un primo studio."
+               if independent >= 200 else
+               "NON basta: serve comunque il backfill da Bybit.")
     return (
         f"{len(usable)} archivi su {len(reports)} contengono fatti di mercato "
-        f"compatibili ({total} righe complessive). Vanno riallineati sulla "
-        "griglia al minuto e le vecchie confidence vanno ricalcolate: quello "
-        "che si eredita sono i prezzi, non i giudizi.")
+        f"compatibili: {total} righe di prezzo/scambi su {span} giorni, cioe' "
+        f"circa {independent} osservazioni indipendenti a 30 minuti. {verdict} "
+        "Quello che si eredita sono i prezzi, non i giudizi: ogni confidence "
+        "storica andrebbe comunque ricalcolata contro l'esito reale.")
 
 
 def render(result: dict[str, Any]) -> str:
