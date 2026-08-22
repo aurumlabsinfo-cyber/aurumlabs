@@ -161,8 +161,8 @@ vantaggio:
    confidenza di un fattore cinque;
 4. **holdout fresco** del 25%, tagliato con la purga prima di ogni selezione,
    guardato una volta sola;
-5. **Benjamini-Hochberg** su tutti i candidati provati: con 208 pattern e soglia
-   0,05, dieci passano per caso.
+5. **Benjamini-Hochberg** su tutti i candidati provati: con 268 pattern e soglia
+   0,05, tredici passano per caso.
 
 E la prova che serve davvero: **il motore viene messo alla prova su dati senza
 alcun vantaggio.** Su 12 cammini casuali indipendenti:
@@ -176,6 +176,16 @@ AUC direzionale media: 0.5110  (min 0.4614  max 0.5495)
 E su dati con un vantaggio piantato dentro, **lo trova**: AUC direzionale
 0,91–0,93, coerenza fra i fold 1,0. Servono entrambe le prove — un validatore che
 boccia sempre e' inutile quanto uno che promuove sempre.
+
+La stessa coppia di prove sulla ricerca degli edge, su 268 candidati per giro:
+
+| Dati | Oltre le soglie | Dopo Benjamini-Hochberg | Confermati dall'holdout |
+|---|---|---|---|
+| cammino casuale (3 semi) | **0** | **0** | — |
+| vantaggio piantato | 87 | 5 | 1 (→ IN_OMBRA, non VALIDATO) |
+
+L'unico sopravvissuto non diventa VALIDATO: va in ombra, e deve dimostrarsi su
+previsioni fatte in avanti prima di poter contribuire al numero mostrato.
 
 ### 3. Ogni previsione viene giudicata dopo
 
@@ -319,7 +329,7 @@ aurum_edge/
 │   └── quality.py         quanto fidarsi di QUESTA previsione
 ├── news/feeds.py          RSS, lessico dichiarato per quello che e'
 ├── web/                   server sola lettura + dashboard
-└── tests/selftest.py      103 prove offline
+└── tests/selftest.py      124 prove offline
 ```
 
 ---
@@ -365,6 +375,46 @@ Tutte in sola lettura.
 | `GET /healthz` | vivo o no |
 
 Qualunque `POST`, `PUT`, `DELETE`, `PATCH` → **405**.
+
+---
+
+## Cosa e' stato verificato, e cosa no
+
+Il progetto e' stato costruito in un ambiente **senza accesso a Bybit**: la
+policy di rete blocca `api.bybit.com` e ogni altro exchange (403 dal proxy).
+Conviene sapere esattamente cosa questo comporta.
+
+**Verificato davvero, e riproducibile con `selftest`:**
+
+* causalita' delle feature, confrontando le stesse righe costruite su archivi di
+  lunghezza diversa;
+* validazione statistica, su dodici cammini casuali e su vantaggi piantati;
+* ricerca degli edge, con lo stesso metodo: 0 falsi positivi su 268 candidati
+  per tre cammini casuali;
+* archivio, ciclo di vita, API HTTP, dashboard nel browser;
+* parser delle risposte Bybit e dei feed RSS, contro risposte finte costruite
+  sul formato reale;
+* collector completo — deduplica degli scambi, accumulo del CVD, market
+  breadth — contro un exchange finto.
+
+**Non verificabile senza rete, e quindi da controllare al primo avvio:**
+
+* che gli endpoint pubblici Bybit rispondano nel formato atteso;
+* i tempi reali del backfill e i limiti di frequenza;
+* la profondita' effettiva dell'archivio di open interest e long/short;
+* la raggiungibilita' dei feed RSS.
+
+Il primo comando da lanciare e' quindi:
+
+```bash
+python3 -m aurum_edge backfill --days 7    # una prova corta
+python3 -m aurum_edge stato                # quante barre sono arrivate
+python3 -m aurum_edge collect --once       # un giro live, stampato
+```
+
+Se un host e' bloccato, il programma lo dice e si ferma su quella fonte, senza
+cercare strade alternative: dati di mercato presi da un altro exchange non sono
+gli stessi dati.
 
 ---
 

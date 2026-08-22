@@ -937,6 +937,163 @@ def test_regressions(r: Results) -> None:
 
 
 # --------------------------------------------------------------------------
+# 13. Il collector, contro un exchange finto
+# --------------------------------------------------------------------------
+class _FakeBybit:
+    """Un Bybit finto che risponde come quello vero, offline.
+
+    Serve perche' il collector e' l'unico pezzo che non si puo' provare contro
+    l'API reale in un ambiente senza rete, ed e' anche quello con la logica piu'
+    facile da sbagliare in silenzio: la deduplica degli scambi. `recent-trade`
+    restituisce sempre l'ultimo migliaio, quindi fra un giro e il successivo la
+    sovrapposizione e' quasi totale. Contarla due volte gonfia il CVD di un
+    fattore pari al numero di giri — e un CVD gonfiato non sembra un errore,
+    sembra un segnale fortissimo.
+    """
+
+    def __init__(self) -> None:
+        from ..data.bybit import OrderBook, Ticker, Trade
+        from ..util import timeutil
+
+        self._Trade = Trade
+        now = timeutil.floor_ms(timeutil.now_ms(), 60_000)
+        self.base_ts = now
+        self.calls: dict[str, int] = {}
+        self._tick = 0
+
+        def ticker(sym: str, price: float) -> Ticker:
+            return Ticker(symbol=sym, ts_ms=now, last_price=price,
+                          mark_price=price * 1.0001, index_price=price,
+                          bid1=price - 0.5, ask1=price + 0.5,
+                          bid1_size=2.0, ask1_size=1.0,
+                          volume_24h=1000.0, turnover_24h=price * 1000,
+                          open_interest=50_000.0,
+                          open_interest_value=price * 50_000,
+                          funding_rate=0.0001,
+                          next_funding_ms=now + 3_600_000,
+                          price_24h_pcnt=0.01 if sym != "XRPUSDT" else -0.02,
+                          high_24h=price * 1.02, low_24h=price * 0.98)
+
+        self._tickers = {
+            "BTCUSDT": ticker("BTCUSDT", 60_000.0),
+            "ETHUSDT": ticker("ETHUSDT", 3_000.0),
+            "SOLUSDT": ticker("SOLUSDT", 150.0),
+            "XRPUSDT": ticker("XRPUSDT", 0.5),
+            "BNBUSDT": ticker("BNBUSDT", 500.0),
+        }
+        self._book = OrderBook(
+            now, [(59_999.5, 3.0), (59_999.0, 2.0)],
+            [(60_000.5, 1.0), (60_001.0, 1.0)])
+
+    def _count(self, name: str) -> None:
+        self.calls[name] = self.calls.get(name, 0) + 1
+
+    def tickers(self, symbols=None):
+        self._count("tickers")
+        if symbols is None:
+            return dict(self._tickers)
+        return {s: t for s, t in self._tickers.items() if s in set(symbols)}
+
+    def orderbook(self, symbol, limit=200):
+        self._count("orderbook")
+        return self._book
+
+    def recent_trades(self, symbol, limit=1000):
+        """Ogni giro aggiunge due scambi nuovi e ripete tutti i precedenti."""
+        self._count("recent_trades")
+        self._tick += 1
+        out = []
+        for k in range(self._tick):
+            out.append(self._Trade(self.base_ts + k * 1000, 60_000.0, 1.0, "Buy"))
+            out.append(self._Trade(self.base_ts + k * 1000 + 500, 60_000.0,
+                                   0.4, "Sell"))
+        return out
+
+    def klines(self, symbol, interval="1", **kw):
+        from ..data.bybit import Kline
+        self._count("klines")
+        return [Kline(self.base_ts - (60 - i) * 60_000, 60_000.0, 60_010.0,
+                      59_990.0, 60_005.0, 5.0, 300_000.0) for i in range(60)]
+
+    def open_interest(self, symbol, interval="5min", **kw):
+        from ..data.bybit import OpenInterestPoint
+        self._count("open_interest")
+        return [OpenInterestPoint(self.base_ts - i * 300_000, 50_000.0 + i)
+                for i in range(10)]
+
+    def account_ratio(self, symbol, period="5min", limit=50):
+        from ..data.bybit import AccountRatioPoint
+        self._count("account_ratio")
+        return [AccountRatioPoint(self.base_ts, 0.55, 0.45)]
+
+
+def test_collector(r: Results) -> None:
+    from ..data.collector import Collector
+    from ..data.store import Store
+
+    r.section("13. COLLECTOR — contro un exchange finto, senza rete")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Store(os.path.join(tmp, "collect.db"))
+        fake = _FakeBybit()
+        collector = Collector(store=store, client=fake)
+
+        first = collector.poll_once()
+        r.check("il primo giro registra tutti gli scambi visti",
+                first["trades_new"] == 2, str(first.get("trades_new")))
+
+        snapshot = store.latest_snapshot("BTCUSDT")
+        r.check("la fotografia live viene scritta", snapshot is not None)
+        if snapshot:
+            r.check("prezzo, spread e squilibrio del libro sono presenti",
+                    snapshot["last_price"] == 60_000.0
+                    and snapshot["spread_bps"] is not None
+                    and snapshot["book_imbalance"] is not None,
+                    f"spread={snapshot['spread_bps']} "
+                    f"imb={snapshot['book_imbalance']}")
+            r.check("lo squilibrio ha il segno del lato piu' pesante",
+                    snapshot["book_imbalance"] > 0,
+                    str(snapshot["book_imbalance"]))
+            payload = json.loads(snapshot["payload"] or "{}")
+            breadth = payload.get("breadth") or {}
+            r.check("la market breadth viene calcolata sul paniere",
+                    breadth.get("available") and breadth.get("symbols", 0) >= 4,
+                    str(breadth))
+            r.check("le liquidazioni sono dichiarate non disponibili",
+                    (payload.get("liquidations") or {}).get("available") is False)
+
+        flow_before = store.flow("BTCUSDT")
+        cvd_before = flow_before[-1]["cvd"] if flow_before else None
+
+        # Il secondo giro ripete gli scambi del primo e ne aggiunge due.
+        second = collector.poll_once()
+        r.check("il secondo giro conta solo gli scambi nuovi",
+                second["trades_new"] == 2,
+                f"trovati {second['trades_new']} (la deduplica non ha retto)")
+
+        flow_after = store.flow("BTCUSDT")
+        cvd_after = flow_after[-1]["cvd"] if flow_after else None
+        # Ogni giro aggiunge +1.0 comprato e -0.4 venduto: delta atteso +0.6.
+        r.check("il CVD cresce del delta vero, non del doppio",
+                cvd_before is not None and cvd_after is not None
+                and abs((cvd_after - cvd_before) - 0.6) < 1e-6,
+                f"{cvd_before} -> {cvd_after}")
+
+        totals = sum(f["taker_buy"] for f in flow_after)
+        r.check("il volume taker accumulato corrisponde agli scambi unici",
+                abs(totals - 2.0) < 1e-6, f"totale {totals}")
+
+        health = collector.health.to_dict()
+        r.check("il collector riporta due giri riusciti e nessun errore",
+                health["polls"] == 2 and health["failures"] == 0, str(health))
+        r.check("...e si dichiara fresco", health["fresh"] is True)
+        r.check("un solo giro basta per tutti i simboli del contesto",
+                fake.calls.get("tickers") == 2,
+                f"chiamate ticker: {fake.calls.get('tickers')}")
+        store.close()
+
+
+# --------------------------------------------------------------------------
 # Esecuzione
 # --------------------------------------------------------------------------
 ALL_TESTS: list[tuple[str, Callable[[Results], None], bool]] = [
@@ -952,6 +1109,7 @@ ALL_TESTS: list[tuple[str, Callable[[Results], None], bool]] = [
     ("http", test_http, False),
     ("catalogo", test_edge_catalogue, False),
     ("regressioni", test_regressions, False),
+    ("collector", test_collector, False),
 ]
 
 
